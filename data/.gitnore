@@ -1,0 +1,5 @@
+log.*
+tmp*
+graph
+icosahedral_grid
+regular_grid

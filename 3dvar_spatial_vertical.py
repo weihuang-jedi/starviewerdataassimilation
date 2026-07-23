@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-3D Spatial-Vertical 3D-Var Data Assimilation Script
----------------------------------------------------
+3D Spatial-Vertical 3D-Var Data Assimilation Pipeline
+-----------------------------------------------------
 - Observations: NNJA-AI Radiosonde Upper-Air Data (conv-adpupa-NC002001)
 - Method: Preconditioned 3D-Var in v-control space (dx = L_3D * v)
 - Localization: Gaspari-Cohn horizontal and vertical log-pressure tapering
@@ -9,6 +9,7 @@
 - Output: CF-compliant NetCDF dataset via xarray
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -16,105 +17,125 @@ from scipy.optimize import minimize
 from scipy.spatial.distance import cdist
 from nnja_ai import DataCatalog
 
-# ==============================================================================
-# 1. FETCH RADIOSONDE UPPER-AIR OBS FROM NNJA-AI
-# ==============================================================================
-print("Fetching NNJA-AI upper-air (radiosonde) observations...")
-catalog = DataCatalog(mirror="gcp_brightband")
 
-ds_upr = catalog["conv-adpupa-NC002001"]
-subset = ds_upr.sel(time="2021-01-01")
-df_upr = subset.load_dataset(backend="pandas")
-
-# Normalize Longitudes to [-180, 180]
-df_upr["LON"] = np.where(df_upr["LON"] > 180, df_upr["LON"] - 360, df_upr["LON"])
-
-# Detect temperature columns in dataset
-temp_cols = [c for c in df_upr.columns if "TMDB" in c or "TMP" in c]
-
-# Extract Multi-Level Profiles
-obs_records = []
-for idx, row in df_upr.iterrows():
-    lat, lon = row["LAT"], row["LON"]
-    for col in temp_cols:
-        val = row[col]
-        # Keep physically plausible temperatures in Celsius or Kelvin
-        if pd.notna(val) and -100.0 < val < 350.0:
-            p_level = 850.0  # Default fallback
-            for p in [1000, 925, 850, 700, 500, 300, 250, 200, 100]:
-                if str(p) in col:
-                    p_level = float(p)
-                    break
-            obs_records.append({"LAT": lat, "LON": lon, "p_hpa": p_level, "y_obs": val})
-
-obs_df = pd.DataFrame(obs_records)
-
-# Filter spatial domain (CONUS bounding box)
-if not obs_df.empty:
-    spatial_mask = (
-        (obs_df["LAT"] >= 30.0) & (obs_df["LAT"] <= 45.0) &
-        (obs_df["LON"] >= -100.0) & (obs_df["LON"] <= -80.0)
+def parse_args():
+    """Parse command line arguments for time window and output filename."""
+    parser = argparse.ArgumentParser(
+        description="Run 3D-Var Spatial-Vertical Temperature Assimilation using NNJA-AI."
     )
-    obs_filtered = obs_df[spatial_mask].copy()
-    if not obs_filtered.empty:
-        obs_df = obs_filtered
+    parser.add_argument(
+        "--time",
+        type=str,
+        default="2021-01-01",
+        help="Assimilation time string (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS). Default: 2021-01-01",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="3dvar_analysis_output.nc",
+        help="Path for output NetCDF file. Default: 3dvar_analysis_output.nc",
+    )
+    return parser.parse_args()
 
-# Fallback: Generate synthetic observations if no real data retrieved
-if obs_df.empty:
-    print("Warning: No matching observations found in domain. Using synthetic profiles...")
+
+# ==============================================================================
+# MODULE 1: DATA INGESTION & CLEANING
+# ==============================================================================
+def fetch_and_clean_obs(time_str: str, domain_bbox: dict = None) -> pd.DataFrame:
+    """Fetches upper-air observations from NNJA-AI catalog and applies basic cleaning."""
+    print(f"Fetching NNJA-AI upper-air (radiosonde) observations for {time_str}...")
+    catalog = DataCatalog(mirror="gcp_brightband")
+
+    ds_upr = catalog["conv-adpupa-NC002001"]
+    subset = ds_upr.sel(time=time_str)
+    df_upr = subset.load_dataset(backend="pandas")
+
+    if df_upr.empty:
+        print("Warning: Retrieved empty dataset from catalog.")
+        return generate_synthetic_obs()
+
+    # Normalize Longitudes to [-180, 180]
+    df_upr["LON"] = np.where(df_upr["LON"] > 180, df_upr["LON"] - 360, df_upr["LON"])
+
+    # Detect temperature columns in dataset
+    temp_cols = [c for c in df_upr.columns if "TMDB" in c or "TMP" in c]
+
+    # Extract Multi-Level Profiles
+    obs_records = []
+    for _, row in df_upr.iterrows():
+        lat, lon = row["LAT"], row["LON"]
+        for col in temp_cols:
+            val = row[col]
+            if pd.notna(val) and -100.0 < val < 350.0:
+                p_level = 850.0  # Default fallback
+                for p in [1000, 925, 850, 700, 500, 300, 250, 200, 100]:
+                    if str(p) in col:
+                        p_level = float(p)
+                        break
+                obs_records.append({"LAT": lat, "LON": lon, "p_hpa": p_level, "y_obs": val})
+
+    obs_df = pd.DataFrame(obs_records)
+
+    # Filter spatial domain (CONUS bounding box by default)
+    if not obs_df.empty and domain_bbox:
+        spatial_mask = (
+            (obs_df["LAT"] >= domain_bbox["lat_min"]) & (obs_df["LAT"] <= domain_bbox["lat_max"]) &
+            (obs_df["LON"] >= domain_bbox["lon_min"]) & (obs_df["LON"] <= domain_bbox["lon_max"])
+        )
+        obs_df = obs_df[spatial_mask].copy()
+
+    if obs_df.empty:
+        print("Warning: No matching observations found in domain. Falling back to synthetic profiles...")
+        return generate_synthetic_obs()
+
+    # Unit Conversion: Celsius -> Kelvin
+    celsius_mask = obs_df["y_obs"] < 150.0
+    if celsius_mask.any():
+        n_converted = celsius_mask.sum()
+        obs_df.loc[celsius_mask, "y_obs"] += 273.15
+        print(f"Unit Correction: Converted {n_converted} observations from Celsius to Kelvin.")
+
+    # Subsample dataset for efficiency
+    n_sample = min(40, len(obs_df))
+    obs_df = obs_df.sample(n=n_sample, random_state=42).reset_index(drop=True)
+    print(f"Extracted {len(obs_df)} multi-level observation points.")
+    return obs_df
+
+
+def generate_synthetic_obs() -> pd.DataFrame:
+    """Fallback function to generate dummy profiles for verification."""
     synth_records = []
     for la, lo in zip([35.0, 38.0, 41.0], [-90.0, -85.0, -88.0]):
         for p in [1000.0, 850.0, 700.0, 500.0, 300.0]:
             t_synth = 288.15 * (p / 1000.0)**0.1903 + np.random.normal(0, 1.0)
             synth_records.append({"LAT": la, "LON": lo, "p_hpa": p, "y_obs": t_synth})
-    obs_df = pd.DataFrame(synth_records)
+    return pd.DataFrame(synth_records)
 
-# ------------------------------------------------------------------------------
-# STEP A: UNIT CONVERSION (CELSIUS -> KELVIN)
-# ------------------------------------------------------------------------------
-# Convert Celsius temperatures (< 150 K) to Kelvin
-celsius_mask = obs_df["y_obs"] < 150.0
-if celsius_mask.any():
-    n_converted = celsius_mask.sum()
-    obs_df.loc[celsius_mask, "y_obs"] += 273.15
-    print(f"Unit Correction: Converted {n_converted} observations from Celsius to Kelvin.")
-
-# Subsample dataset for fast execution
-n_sample = min(40, len(obs_df))
-obs_df = obs_df.sample(n=n_sample, random_state=42).reset_index(drop=True)
-n_obs = len(obs_df)
-
-print(f"Extracted {n_obs} multi-level observation points.")
 
 # ==============================================================================
-# 2. DEFINE 3D SPATIAL & VERTICAL GRID
+# MODULE 2: GRID & COVARIANCE CONSTRUCTORS
 # ==============================================================================
-lats = np.linspace(32.0, 42.0, 5)
-lons = np.linspace(-95.0, -85.0, 5)
-p_levels = np.array([1000.0, 850.0, 700.0, 500.0, 300.0])  # hPa
+def create_3d_grid():
+    """Generates 3D coordinates (Lat, Lon, Level) and background state x_b."""
+    lats = np.linspace(32.0, 42.0, 5)
+    lons = np.linspace(-95.0, -85.0, 5)
+    p_levels = np.array([1000.0, 850.0, 700.0, 500.0, 300.0])  # hPa
 
-n_lat, n_lon, n_lev = len(lats), len(lons), len(p_levels)
-grid_lon, grid_lat, grid_p = np.meshgrid(lons, lats, p_levels, indexing="ij")
+    n_lat, n_lon, n_lev = len(lats), len(lons), len(p_levels)
+    grid_lon, grid_lat, grid_p = np.meshgrid(lons, lats, p_levels, indexing="ij")
 
-grid_coords = np.column_stack([
-    grid_lat.ravel(), 
-    grid_lon.ravel(), 
-    grid_p.ravel()
-])
-n_grid_2d = n_lat * n_lon
-n_grid_3d = len(grid_coords)
+    grid_coords = np.column_stack([grid_lat.ravel(), grid_lon.ravel(), grid_p.ravel()])
+    coords_2d = np.column_stack([grid_lat[:, :, 0].ravel(), grid_lon[:, :, 0].ravel()])
 
-coords_2d = np.column_stack([grid_lat[:, :, 0].ravel(), grid_lon[:, :, 0].ravel()])
+    # Standard atmosphere background state x_b
+    x_b_1d = 288.15 * (p_levels / 1000.0) ** 0.1903
+    x_b = np.tile(x_b_1d, n_lat * n_lon)
 
-# Standard atmosphere background state x_b
-p_ref = 1000.0
-x_b_1d = 288.15 * (p_levels / p_ref) ** 0.1903
-x_b = np.tile(x_b_1d, n_grid_2d)
+    return lats, lons, p_levels, grid_coords, coords_2d, x_b
 
-# ==============================================================================
-# 3. GASPARI-COHN LOCALIZATION FUNCTION
-# ==============================================================================
-def gaspari_cohn(r):
+
+def gaspari_cohn(r: np.ndarray) -> np.ndarray:
+    """Gaspari-Cohn compact support localization function."""
     c = np.zeros_like(r)
     m1 = (r >= 0) & (r < 1)
     c[m1] = 1.0 - 5/3*r[m1]**2 + 5/8*r[m1]**3 + 0.5*r[m1]**4 - 0.25*r[m1]**5
@@ -125,166 +146,178 @@ def gaspari_cohn(r):
     )
     return np.clip(c, 0.0, 1.0)
 
-# ==============================================================================
-# 4. CONSTRUCT HORIZONTAL & VERTICAL B MATRICES
-# ==============================================================================
-# Horizontal Covariance (B_H) + Localization
-dists_2d = cdist(coords_2d, coords_2d) * 111.0  # km
-sigma_b_h = 2.0
-L_h = 250.0      # Spatial correlation length (km)
-L_loc_h = 200.0  # Horizontal localization radius (km)
 
-B_H_raw = (sigma_b_h**2) * np.exp(-0.5 * (dists_2d / L_h)**2)
-C_H = gaspari_cohn(dists_2d / L_loc_h)
-B_H_loc = B_H_raw * C_H + 1e-4 * np.eye(n_grid_2d)
-L_H = np.linalg.cholesky(B_H_loc)
+def build_background_covariance_cholesky(coords_2d, p_levels, sigma_b_h=2.0, sigma_b_v=1.0):
+    """Builds horizontal and vertical localized B matrices and returns 3D Cholesky L_3D."""
+    # Horizontal Covariance & Localization
+    dists_2d = cdist(coords_2d, coords_2d) * 111.0  # km
+    B_H_raw = (sigma_b_h**2) * np.exp(-0.5 * (dists_2d / 250.0)**2)
+    C_H = gaspari_cohn(dists_2d / 200.0)
+    B_H_loc = B_H_raw * C_H + 1e-4 * np.eye(len(coords_2d))
+    L_H = np.linalg.cholesky(B_H_loc)
 
-# Vertical Covariance (B_V) + Log-Pressure Localization
-ln_p = np.log(p_levels)
-dists_v = np.abs(ln_p[:, None] - ln_p[None, :])
-sigma_b_v = 1.0
-L_v = 0.8       # Vertical correlation scale (log-pressure)
-L_loc_v = 0.6   # Vertical localization radius (log-pressure)
+    # Vertical Covariance & Log-Pressure Localization
+    ln_p = np.log(p_levels)
+    dists_v = np.abs(ln_p[:, None] - ln_p[None, :])
+    B_V_raw = (sigma_b_v**2) * np.exp(-0.5 * (dists_v / 0.8)**2)
+    C_V = gaspari_cohn(dists_v / 0.6)
+    B_V_loc = B_V_raw * C_V + 1e-4 * np.eye(len(p_levels))
+    L_V = np.linalg.cholesky(B_V_loc)
 
-B_V_raw = (sigma_b_v**2) * np.exp(-0.5 * (dists_v / L_v)**2)
-C_V = gaspari_cohn(dists_v / L_loc_v)
-B_V_loc = B_V_raw * C_V + 1e-4 * np.eye(n_lev)
-L_V = np.linalg.cholesky(B_V_loc)
+    # 3D Kronecker Product Cholesky Factor: L_3D = L_H (x) L_V
+    return np.kron(L_H, L_V)
 
-# 3D Cholesky Factor via Kronecker Product: L_3D = L_H (x) L_V
-L_3D = np.kron(L_H, L_V)
 
 # ==============================================================================
-# 5. FORWARD OPERATOR H & 3-SIGMA QC FILTER
+# MODULE 3: OBSERVATION OPERATOR & QUALITY CONTROL
 # ==============================================================================
-obs_coords = obs_df[["LAT", "LON", "p_hpa"]].values
-obs_latlon = obs_coords[:, :2]
-obs_p = obs_coords[:, 2]
+def apply_forward_operator_and_qc(obs_df, grid_coords, x_b, sigma_r=1.5, sigma_b_total=2.236):
+    """Builds operator H, computes innovations, and screens observations using 3-sigma QC."""
+    obs_coords = obs_df[["LAT", "LON", "p_hpa"]].values
+    obs_latlon, obs_p = obs_coords[:, :2], obs_coords[:, 2]
 
-grid_latlon = grid_coords[:, :2]
-grid_p_vals = grid_coords[:, 2]
+    grid_latlon, grid_p_vals = grid_coords[:, :2], grid_coords[:, 2]
 
-h_dists = cdist(obs_latlon, grid_latlon) * 111.0
-v_dists = np.abs(np.log(obs_p[:, None]) - np.log(grid_p_vals[None, :]))
+    h_dists = cdist(obs_latlon, grid_latlon) * 111.0
+    v_dists = np.abs(np.log(obs_p[:, None]) - np.log(grid_p_vals[None, :]))
 
-# Distance-weighted 3D forward operator
-weights = np.exp(-0.5 * (h_dists / 60.0)**2 - 0.5 * (v_dists / 0.3)**2)
-H = weights / weights.sum(axis=1, keepdims=True)
+    weights = np.exp(-0.5 * (h_dists / 60.0)**2 - 0.5 * (v_dists / 0.3)**2)
+    H = weights / weights.sum(axis=1, keepdims=True)
 
-y = obs_df["y_obs"].values
-sigma_r = 1.5  # Observation error standard deviation (K)
+    y = obs_df["y_obs"].values
+    d_raw = y - H @ x_b
 
-# Compute raw innovations: d_raw = y - H(x_b)
-d_raw = y - H @ x_b
+    # 3-Sigma Innovation Quality Control
+    # sigma_total = np.sqrt(sigma_b_total**2 + sigma_r**2)
+    # qc_threshold = 3.0 * sigma_total
 
-# ------------------------------------------------------------------------------
-# STEP B: 3-SIGMA INNOVATION QUALITY CONTROL (QC)
-# ------------------------------------------------------------------------------
-sigma_b_total = np.sqrt(sigma_b_h**2 + sigma_b_v**2)
-sigma_total = np.sqrt(sigma_b_total**2 + sigma_r**2)
-qc_threshold = 3.0 * sigma_total  # ~8.08 K threshold
+    sigma_control_factor = 5.0
+    # Sigma Innovation Quality Control
+    sigma_total = np.sqrt(sigma_b_total**2 + sigma_r**2)
+    qc_threshold = sigma_control_factor * sigma_total
 
-qc_mask = np.abs(d_raw) <= qc_threshold
-n_rejected = np.sum(~qc_mask)
+    qc_mask = np.abs(d_raw) <= qc_threshold
+    print(f"QC Filter ({sigma_control_factor}-Sigma = {qc_threshold:.2f} K): Kept {np.sum(qc_mask)}/{len(y)} obs (Rejected {np.sum(~qc_mask)}).")
 
-print(f"QC Filter (3-Sigma = {qc_threshold:.2f} K): Kept {np.sum(qc_mask)}/{n_obs} obs (Rejected {n_rejected}).")
+    y_qc = y[qc_mask]
+    H_qc = H[qc_mask, :]
+    d_qc = d_raw[qc_mask]
+    R_inv = (1.0 / sigma_r**2) * np.eye(len(y_qc))
 
-# Apply QC mask to filter observations, forward operator, and innovations
-y = y[qc_mask]
-H = H[qc_mask, :]
-d = d_raw[qc_mask]
-n_obs_passed = len(y)
+    return H_qc, d_qc, R_inv
 
-R_inv = (1.0 / sigma_r**2) * np.eye(n_obs_passed)
 
 # ==============================================================================
-# 6. INCREMENTAL 3D-VAR IN v-SPACE
+# MODULE 4: 3D-VAR OPTIMIZER
 # ==============================================================================
-G = H @ L_3D
+def run_3dvar_solver(H, d, L_3D, R_inv, n_grid_3d):
+    """Solves incremental 3D-Var in v-space using L-BFGS-B optimization."""
+    G = H @ L_3D
 
-def cost_function_v(v):
-    residual = d - G @ v
-    return 0.5 * np.dot(v, v) + 0.5 * residual.T @ R_inv @ residual
+    def cost_function_v(v):
+        residual = d - G @ v
+        return 0.5 * np.dot(v, v) + 0.5 * residual.T @ R_inv @ residual
 
-def cost_gradient_v(v):
-    residual = d - G @ v
-    return v - G.T @ R_inv @ residual
+    def cost_gradient_v(v):
+        residual = d - G @ v
+        return v - G.T @ R_inv @ residual
 
-v0 = np.zeros(n_grid_3d)
+    v0 = np.zeros(n_grid_3d)
 
-print("\nSolving 3D Spatial-Vertical 3D-Var...")
-res = minimize(
-    fun=cost_function_v,
-    x0=v0,
-    jac=cost_gradient_v,
-    method="L-BFGS-B",
-    options={"gtol": 1e-5, "maxiter": 100}
-)
+    print("\nSolving 3D Spatial-Vertical 3D-Var...")
+    res = minimize(
+        fun=cost_function_v,
+        x0=v0,
+        jac=cost_gradient_v,
+        method="L-BFGS-B",
+        options={"gtol": 1e-5, "maxiter": 100}
+    )
 
-# Convert v back to physical state increment (dx = L_3D * v)
-v_opt = res.x
-dx_3d = L_3D @ v_opt
-x_a_3d = x_b + dx_3d
+    dx_3d = L_3D @ res.x
+    return dx_3d, res
 
-# ==============================================================================
-# 7. SUMMARY PRINT
-# ==============================================================================
-grid_df = pd.DataFrame({
-    "Lat": grid_coords[:, 0],
-    "Lon": grid_coords[:, 1],
-    "p_hPa": grid_coords[:, 2],
-    "x_b (K)": np.round(x_b, 2),
-    "x_a (K)": np.round(x_a_3d, 2),
-    "dx (K)": np.round(dx_3d, 2)
-})
-
-print(f"\n3D-Var Converged: {res.success} in {res.nit} iterations.")
-print(f"Final Cost J: {res.fun:.3f}")
-print(f"Overall Mean Abs Increment: {np.mean(np.abs(dx_3d)):.3f} K")
-
-print("\n--- Average Increments across Pressure Levels ---")
-vertical_summary = grid_df.groupby("p_hPa")[["x_b (K)", "dx (K)"]].mean().reset_index()
-print(vertical_summary.to_string(index=False))
-
-print("\nSample 3D Grid Points at 850 hPa:")
-print(grid_df[grid_df["p_hPa"] == 850.0].head(8).to_string(index=False))
 
 # ==============================================================================
-# 8. EXPORT 3D ANALYSIS TO STRUCTURED NETCDF
+# MODULE 5: NETCDF EXPORTER
 # ==============================================================================
-print("\nExporting 3D Analysis state to NetCDF...")
+def export_to_netcdf(output_path: str, time_str: str, lats, lons, p_levels, x_b, x_a, dx):
+    """Exports structured 3D Analysis output to a CF-compliant NetCDF file."""
+    n_lat, n_lon, n_lev = len(lats), len(lons), len(p_levels)
 
-# Reshape vectors to 3D arrays: (n_lat, n_lon, n_lev)
-x_b_3d_arr = x_b.reshape(n_lat, n_lon, n_lev)
-x_a_3d_arr = x_a_3d.reshape(n_lat, n_lon, n_lev)
-dx_3d_arr = dx_3d.reshape(n_lat, n_lon, n_lev)
+    x_b_arr = x_b.reshape(n_lat, n_lon, n_lev)[None, ...]
+    x_a_arr = x_a.reshape(n_lat, n_lon, n_lev)[None, ...]
+    dx_arr = dx.reshape(n_lat, n_lon, n_lev)[None, ...]
 
-analysis_time = pd.Timestamp("2021-01-01T00:00:00")
+    analysis_time = pd.Timestamp(time_str)
 
-ds_out = xr.Dataset(
-    data_vars={
-        "x_b": (["time", "latitude", "longitude", "level"], x_b_3d_arr[None, ...], 
-                {"standard_name": "air_temperature", "long_name": "Background State (x_b)", "units": "K"}),
-        "x_a": (["time", "latitude", "longitude", "level"], x_a_3d_arr[None, ...], 
-                {"standard_name": "air_temperature", "long_name": "3D-Var Analysis State (x_a)", "units": "K"}),
-        "dx":  (["time", "latitude", "longitude", "level"], dx_3d_arr[None, ...], 
-                {"standard_name": "air_temperature_increment", "long_name": "Analysis Increment (dx)", "units": "K"}),
-    },
-    coords={
-        "time": [analysis_time],
-        "latitude": ("latitude", lats, {"units": "degrees_north", "standard_name": "latitude"}),
-        "longitude": ("longitude", lons, {"units": "degrees_east", "standard_name": "longitude"}),
-        "level": ("level", p_levels, {"units": "hPa", "standard_name": "air_pressure", "positive": "down"}),
-    },
-    attrs={
-        "title": "3D-Var Temperature Assimilation Output",
-        "institution": "NOAA-NASA / EAGLE DA Pipeline",
-        "data_source": "NNJA-AI conv-adpupa-NC002001",
-        "method": "Incremental 3D-Var in v-space with Gaspari-Cohn Localization",
-        "conventions": "CF-1.8",
-    }
-)
+    ds_out = xr.Dataset(
+        data_vars={
+            "x_b": (["time", "latitude", "longitude", "level"], x_b_arr,
+                    {"standard_name": "air_temperature", "long_name": "Background State (x_b)", "units": "K"}),
+            "x_a": (["time", "latitude", "longitude", "level"], x_a_arr,
+                    {"standard_name": "air_temperature", "long_name": "3D-Var Analysis State (x_a)", "units": "K"}),
+            "dx":  (["time", "latitude", "longitude", "level"], dx_arr,
+                    {"standard_name": "air_temperature_increment", "long_name": "Analysis Increment (dx)", "units": "K"}),
+        },
+        coords={
+            "time": [analysis_time],
+            "latitude": ("latitude", lats, {"units": "degrees_north", "standard_name": "latitude"}),
+            "longitude": ("longitude", lons, {"units": "degrees_east", "standard_name": "longitude"}),
+            "level": ("level", p_levels, {"units": "hPa", "standard_name": "air_pressure", "positive": "down"}),
+        },
+        attrs={
+            "title": "3D-Var Temperature Assimilation Output",
+            "institution": "NOAA-NASA / EAGLE DA Pipeline",
+            "data_source": "NNJA-AI conv-adpupa-NC002001",
+            "method": "Incremental 3D-Var in v-space with Gaspari-Cohn Localization",
+            "conventions": "CF-1.8",
+        }
+    )
 
-nc_filename = "3dvar_analysis_20210101.nc"
-ds_out.to_netcdf(nc_filename)
-print(f"Saved NetCDF file '{nc_filename}' successfully.")
+    ds_out.to_netcdf(output_path)
+    print(f"\nSaved NetCDF analysis dataset successfully to: {output_path}")
+
+
+# ==============================================================================
+# MAIN EXECUTION ENTRYPOINT
+# ==============================================================================
+def main():
+    args = parse_args()
+
+    domain_bbox = {"lat_min": 30.0, "lat_max": 45.0, "lon_min": -100.0, "lon_max": -80.0}
+
+    # 1. Fetch & Preprocess Observations
+    obs_df = fetch_and_clean_obs(args.time, domain_bbox)
+
+    # 2. Build Grid & Background State
+    lats, lons, p_levels, grid_coords, coords_2d, x_b = create_3d_grid()
+
+    # 3. Construct Localized Background Covariance Matrix (L_3D)
+    L_3D = build_background_covariance_cholesky(coords_2d, p_levels)
+
+    # 4. Construct Forward Operator & Run 3-Sigma QC
+    H_qc, d_qc, R_inv = apply_forward_operator_and_qc(obs_df, grid_coords, x_b)
+
+    # 5. Run 3D-Var Optimizer
+    dx_3d, res = run_3dvar_solver(H_qc, d_qc, L_3D, R_inv, len(grid_coords))
+    x_a_3d = x_b + dx_3d
+
+    print(f"\n3D-Var Converged: {res.success} in {res.nit} iterations.")
+    print(f"Final Cost J: {res.fun:.3f}")
+    print(f"Overall Mean Abs Increment: {np.mean(np.abs(dx_3d)):.3f} K")
+
+    # 6. Save Analysis Results to NetCDF
+    export_to_netcdf(
+        output_path=args.output,
+        time_str=args.time,
+        lats=lats,
+        lons=lons,
+        p_levels=p_levels,
+        x_b=x_b,
+        x_a=x_a_3d,
+        dx=dx_3d
+    )
+
+
+if __name__ == "__main__":
+    main()
