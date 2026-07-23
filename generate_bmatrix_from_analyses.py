@@ -144,6 +144,7 @@ def compute_analysis_statistics(filepaths, alpha=0.03):
     for idx, fname in enumerate(filepaths):
         with xr.open_dataset(fname) as ds:
             for var in variables:
+                print(f"idx: {idx}, fname: {fname}, var: {var}")
                 if var in ds:
                     data = np.nan_to_num(ds[var].values, nan=0.0)
                     # Compute anomaly: delta_x = x_a(t) - mean_x
@@ -161,6 +162,7 @@ def compute_analysis_statistics(filepaths, alpha=0.03):
     vert_corr_dict = {}
 
     for var in variables:
+        print(f"prcess corr for var: {var}")
         # Unbiased 3D variance scaled by alpha
         raw_var = sq_diff_sum[var] / max(n_files - 1, 1)
         var_3d = alpha * raw_var

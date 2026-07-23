@@ -465,3 +465,458 @@ def create_aida_dataloader(
 | **`num_workers > 2`** | Spawns separate CPU background processes to handle NetCDF file reading and spatial interpolation in parallel while the GPU runs forward/backward passes. |
 | **`persistent_workers=True`** | Keeps dataset worker processes alive between training epochs, avoiding repeated initialization overhead of `xarray` dataset handles. |
 | **`preload_to_ram=True`** | If your dataset fits inside system memory (RAM), set this to `True` to store all array tensors in memory after the first epoch, eliminating disk bottlenecking entirely. |
+
+
+
+
+
+
+Your dataset is a clean 1D node-based **unstructured icosahedral mesh** (`node = 2562`, `height = 32`, `face = 5120`) following CF/UGRID conventions.
+
+Using unstructured node representations with point-based observation archives like **NNJA-AI (Brightband's NOAA-NASA Joint Archive in Parquet format)** requires a graph-based or node-based model (e.g., **Graph Neural Network / Anemoi Graph** architecture).
+
+Below is a architecture and codebase to **convert NetCDF to Zarr**, **load NNJA-AI observations**, **train a Graph Neural Network (GNN)**, and run **separate inference to generate $x_a$ and $\delta x$ checkpoints**.
+
+---
+
+## Architecture Overview
+
+```
+                      ┌─────────────────────────────────────────┐
+  GFS Background      │  Icosahedral Node Mesh (2562 nodes)     │
+   NetCDF / Zarr  ───►│  x_b = [t, u, v, w, q, p]               │
+                      └────────────────────┬────────────────────┘
+                                           │
+                      ┌────────────────────▼────────────────────┐
+  NNJA-AI Observations│  Scatter Obs to Nearest Mesh Nodes      │
+  Parquet (lat/lon)──►│  d_node = y_obs - H(x_b)                │
+                      └────────────────────┬────────────────────┘
+                                           │
+                                           ▼
+                      ┌─────────────────────────────────────────┐
+                      │  Mesh Graph Neural Network (GNN)        │
+                      │  Encoder -> Graph Processor -> Decoder  │
+                      └────────────────────┬────────────────────┘
+                                           │
+                                     checkpoint.pt
+                                           │
+                                           ▼
+                      ┌─────────────────────────────────────────┐
+                      │  Analysis State x_a = x_b + dx          │
+                      │  Analysis Increment dx = f(x_b, d_node) │
+                      └─────────────────────────────────────────┘
+
+```
+
+---
+
+## 1. Convert NetCDF to Zarr (Optional but Recommended)
+
+Converting a year's worth of daily or 6-hourly icosahedral NetCDF files into a unified Zarr store optimizes read access during PyTorch training.
+
+```python
+# convert_nc_to_zarr.py
+import glob
+import xarray as xr
+
+
+def convert_icosahedral_nc_to_zarr(
+    nc_pattern: str, zarr_out_path: str = "data/icosahedral_2023.zarr"
+):
+    print("Opening NetCDF files...")
+    # Open dataset using xarray, combining across time
+    ds = xr.open_mfdataset(
+        nc_pattern, combine="nested", concat_dim="time", engine="netcdf4"
+    )
+
+    # Rechunk for optimal PyTorch DataLoader access
+    # Chunking time=1 means loading 1 full global timestep at a time
+    ds = ds.chunk(
+        {"time": 1, "height": 32, "node": 2562, "face": 5120, "three": 3}
+    )
+
+    print(f"Writing unified Zarr archive to {zarr_out_path}...")
+    ds.to_zarr(zarr_out_path, mode="w", consolidated=True)
+    print("Zarr conversion complete.")
+
+
+if __name__ == "__main__":
+    convert_icosahedral_nc_to_zarr(
+        "data/icosahedral_grid/global_icosahedral_*.nc"
+    )
+
+```
+
+---
+
+## 2. Graph Neural Network (GNN) Architecture (`model_gnn.py`)
+
+Since your background state consists of 2,562 unstructured icosahedral nodes, a 3D-CNN cannot process it. We build a **Node-Graph Mesh Network** where connectivity is derived directly from your `face_nodes` array.
+
+```python
+# model_gnn.py
+import torch
+import torch.nn as nn
+
+
+class MeshGraphConv(nn.Module):
+    """Message passing layer on icosahedral mesh nodes."""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels * 2, out_channels),
+            nn.LayerNorm(out_channels),
+            nn.SiLU(),
+            nn.Linear(out_channels, out_channels),
+        )
+
+    def forward(self, x, edge_index):
+        # x shape: (Batch, Num_Nodes, Channels)
+        src, dst = edge_index[0], edge_index[1]
+
+        # Gather node features for edge endpoints
+        x_src = x[:, src, :]
+        x_dst = x[:, dst, :]
+
+        # Message passing over graph edges
+        edge_features = torch.cat([x_src, x_dst], dim=-1)
+        messages = self.mlp(edge_features)
+
+        # Aggregate messages back to destination nodes
+        out = torch.zeros_like(x)
+        out.index_add_(1, dst, messages)
+        return out
+
+
+class IcosahedralAIDA_GNN(nn.Module):
+    """Icosahedral Mesh AI Data Assimilation Model."""
+
+    def __init__(self, num_nodes=2562, num_levels=32, in_vars=6, hidden_dim=128):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.num_levels = num_levels
+
+        # Input channels = (Variables * Height Levels) for x_b + Observation Innovations
+        in_channels = (in_vars * num_levels) * 2
+
+        # 1. Node Feature Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # 2. Graph Processor Layers (Message Passing across Icosahedral Faces)
+        self.processor1 = MeshGraphConv(hidden_dim, hidden_dim)
+        self.processor2 = MeshGraphConv(hidden_dim, hidden_dim)
+
+        # 3. Output Decoder -> Predicts Increments dx
+        out_channels = in_vars * num_levels
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, out_channels),
+        )
+
+    def forward(self, x_b, obs_innovations, edge_index):
+        # x_b shape: (Batch, Num_Nodes, Height * Vars)
+        # Combine background state and observation innovations
+        x_in = torch.cat([x_b, obs_innovations], dim=-1)
+
+        # Encode
+        feat = self.encoder(x_in)
+
+        # Graph Message Passing
+        feat = feat + self.processor1(feat, edge_index)
+        feat = feat + self.processor2(feat, edge_index)
+
+        # Predict Analysis Increment dx
+        dx = self.decoder(feat)
+
+        # Calculate Analysis State x_a
+        x_a = x_b + dx
+
+        return x_a, dx
+
+```
+
+---
+
+## 3. Training Script (`train_aida.py`)
+
+This script loads background states from your dataset, processes **NNJA-AI observation Parquet files**, constructs graph edges from `face_nodes`, and saves a standalone PyTorch checkpoint `.pt` file.
+
+```python
+# train_aida.py
+import numpy as np
+import pandas as pd
+import torch
+import torch.optim as optim
+import xarray as xr
+from model_gnn import IcosahedralAIDA_GNN
+from scipy.spatial import KDTree
+
+
+def extract_edge_index_from_faces(face_nodes):
+    """Converts (face, 3) triangle face connectivity into PyTorch Graph edge_index (2, num_edges)."""
+    edges = set()
+    for tri in face_nodes:
+        n1, n2, n3 = tri
+        edges.add((n1, n2))
+        edges.add((n2, n1))
+        edges.add((n2, n3))
+        edges.add((n3, n2))
+        edges.add((n3, n1))
+        edges.add((n1, n3))
+
+    edge_list = list(edges)
+    edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+    return edge_index
+
+
+def load_nnja_obs_to_mesh(
+    parquet_path, node_lats, node_lons, kdtree, num_nodes, num_levels=32
+):
+    """Reads NNJA-AI observation Parquet file and projects point innovations onto nearest mesh nodes."""
+    grid_innovations = np.zeros(
+        (num_nodes, num_levels * 6), dtype=np.float32
+    )
+
+    try:
+        df_obs = pd.read_parquet(parquet_path)
+    except Exception:
+        # Return zeros if observation file for timestamp does not exist
+        return grid_innovations
+
+    if len(df_obs) == 0:
+        return grid_innovations
+
+    # Find nearest mesh node for each observation point (Lat/Lon)
+    obs_coords = np.column_stack(
+        [df_obs["latitude"].values, df_obs["longitude"].values]
+    )
+    _, node_indices = kdtree.query(obs_coords)
+
+    # Accumulate innovations onto node tensor
+    # Assuming column 'observation_innovation' exists
+    if "innovation" in df_obs.columns:
+        innovations = df_obs["innovation"].values
+        np.add.at(
+            grid_innovations[:, 0], node_indices, innovations
+        )  # Add to 1st var level
+
+    return grid_innovations
+
+
+def train_icosahedral_aida():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Starting Training on Device: {device}")
+
+    # 1. Load Topology from sample file
+    zarr_ds = xr.open_zarr("data/icosahedral_2023.zarr")
+    face_nodes = zarr_ds["face_nodes"].values
+    node_lats = zarr_ds["latitude"].values
+    node_lons = zarr_ds["longitude"].values
+
+    # Build Spatial KDTree for fast observation mapping
+    mesh_coords = np.column_stack([node_lats, node_lons])
+    kdtree = KDTree(mesh_coords)
+
+    # Construct Graph Topology Edge Index
+    edge_index = extract_edge_index_from_faces(face_nodes).to(device)
+
+    # 2. Instantiate GNN Model
+    model = IcosahedralAIDA_GNN(num_nodes=2562, num_levels=32, in_vars=6).to(
+        device
+    )
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion = torch.nn.MSELoss()
+
+    num_timesteps = len(zarr_ds.time)
+    print(f"Total Available Timesteps: {num_timesteps}")
+
+    model.train()
+    for epoch in range(10):
+        running_loss = 0.0
+
+        for t in range(min(num_timesteps, 50)):  # Sample loop
+            # Extract x_b background state (Height x Node -> Node x (Height*Vars))
+            t_val = zarr_ds["t_icosahedral"].isel(time=t).values
+            u_val = zarr_ds["u_icosahedral"].isel(time=t).values
+            v_val = zarr_ds["v_icosahedral"].isel(time=t).values
+            w_val = zarr_ds["w_icosahedral"].isel(time=t).values
+            q_val = zarr_ds["q_icosahedral"].isel(time=t).values
+            p_val = zarr_ds["p_icosahedral"].isel(time=t).values
+
+            # Stack into single feature vector per node
+            x_b_np = np.concatenate(
+                [t_val, u_val, v_val, w_val, q_val, p_val], axis=0
+            ).T  # (2562, 192)
+            x_b_tensor = (
+                torch.from_numpy(x_b_np).unsqueeze(0).to(device)
+            )  # Add batch dim
+
+            # Load matching NNJA-AI observations
+            obs_file = (
+                f"data/nnja_obs/nnja_obs_{t:04d}.parquet"  # Example path
+            )
+            obs_inno_np = load_nnja_obs_to_mesh(
+                obs_file, node_lats, node_lons, kdtree, 2562
+            )
+            obs_inno_tensor = (
+                torch.from_numpy(obs_inno_np).unsqueeze(0).to(device)
+            )
+
+            # Target synthetic increment for demonstration
+            target_dx = torch.randn_like(x_b_tensor) * 0.1
+
+            # Forward Pass
+            optimizer.zero_grad()
+            x_a_pred, dx_pred = model(x_b_tensor, obs_inno_tensor, edge_index)
+
+            loss = criterion(dx_pred, target_dx)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/10 - Loss: {running_loss / 50:.6f}")
+
+    # 3. Save Checkpoint File
+    checkpoint_path = "checkpoints/icosahedral_aida_model.pt"
+    checkpoint = {
+        "epoch": 10,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "face_nodes": face_nodes,  # Save graph topology inside checkpoint
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"\n[✓] Checkpoint saved successfully to '{checkpoint_path}'")
+
+
+if __name__ == "__main__":
+    train_icosahedral_aida()
+
+```
+
+---
+
+## 4. Separated Inference Script (`inference_aida.py`)
+
+This script runs **completely independently** from training. It loads `icosahedral_aida_model.pt`, applies it to any target $x_b$ file, and exports $x_a$ and $\delta x$ as NetCDF or Zarr files.
+
+```python
+# inference_aida.py
+import numpy as np
+import torch
+import xarray as xr
+from model_gnn import IcosahedralAIDA_GNN
+from train_aida import extract_edge_index_from_faces, load_nnja_obs_to_mesh
+from scipy.spatial import KDTree
+
+
+def run_inference_on_xb(
+    checkpoint_path: str,
+    xb_nc_file: str,
+    obs_parquet_file: str,
+    output_nc_file: str = "analysis_output.nc",
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running AI-DA Inference on Device: {device}")
+
+    # 1. Load Checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    face_nodes = checkpoint["face_nodes"]
+    edge_index = extract_edge_index_from_faces(face_nodes).to(device)
+
+    # Initialize Model & Load Weights
+    model = IcosahedralAIDA_GNN(num_nodes=2562, num_levels=32, in_vars=6).to(
+        device
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    print("[✓] Loaded model weights from checkpoint.")
+
+    # 2. Read Target Input x_b NetCDF File
+    ds_xb = xr.open_dataset(xb_nc_file)
+    node_lats = ds_xb["latitude"].values
+    node_lons = ds_xb["longitude"].values
+
+    t_val = ds_xb["t_icosahedral"].values
+    u_val = ds_xb["u_icosahedral"].values
+    v_val = ds_xb["v_icosahedral"].values
+    w_val = ds_xb["w_icosahedral"].values
+    q_val = ds_xb["q_icosahedral"].values
+    p_val = ds_xb["p_icosahedral"].values
+
+    # Reshape input to (1, Node, Vars * Height)
+    x_b_np = np.concatenate(
+        [t_val, u_val, v_val, w_val, q_val, p_val], axis=0
+    ).T
+    x_b_tensor = torch.from_numpy(x_b_np).unsqueeze(0).to(device)
+
+    # 3. Read NNJA-AI Observations and Map to Mesh Nodes
+    kdtree = KDTree(np.column_stack([node_lats, node_lons]))
+    obs_inno_np = load_nnja_obs_to_mesh(
+        obs_parquet_file, node_lats, node_lons, kdtree, num_nodes=2562
+    )
+    obs_inno_tensor = torch.from_numpy(obs_inno_np).unsqueeze(0).to(device)
+
+    # 4. Model Forward Pass
+    with torch.no_grad():
+        x_a_pred, dx_pred = model(x_b_tensor, obs_inno_tensor, edge_index)
+
+    x_a_np = x_a_pred.squeeze(0).cpu().numpy().T  # Shape: (192, 2562)
+    dx_np = dx_pred.squeeze(0).cpu().numpy().T  # Shape: (192, 2562)
+
+    # Split output variables back into (height=32, node=2562)
+    t_inc = dx_np[0:32, :]
+    u_inc = dx_np[32:64, :]
+    v_inc = dx_np[64:96, :]
+
+    t_a = x_a_np[0:32, :]
+    u_a = x_a_np[32:64, :]
+    v_a = x_a_np[64:96, :]
+
+    # 5. Export Results to NetCDF File
+    ds_out = ds_xb.copy(deep=True)
+
+    # Add Increments and Analysis to Dataset
+    ds_out["t_increment"] = (("height", "node"), t_inc)
+    ds_out["u_increment"] = (("height", "node"), u_inc)
+    ds_out["v_increment"] = (("height", "node"), v_inc)
+
+    ds_out["t_analysis"] = (("height", "node"), t_a)
+    ds_out["u_analysis"] = (("height", "node"), u_a)
+    ds_out["v_analysis"] = (("height", "node"), v_a)
+
+    ds_out.to_netcdf(output_nc_file)
+    print(f"[✓] Analysis $x_a$ and Increments $\delta x$ written to '{output_nc_file}'")
+
+
+if __name__ == "__main__":
+    run_inference_on_xb(
+        checkpoint_path="checkpoints/icosahedral_aida_model.pt",
+        xb_nc_file="data/icosahedral_grid/global_icosahedral_m4.20230101.t00z.1p00.f006.nc",
+        obs_parquet_file="data/nnja_obs/nnja_obs_20230101_00z.parquet",
+        output_nc_file="analysis_output_20230101.nc",
+    )
+
+```
+
+---
+
+## Workflow Steps
+
+1. **Zarr Conversion:** One-time Setup.
+Convert your year of NetCDF files into a single Zarr archive (`data/icosahedral_2023.zarr`) using `convert_nc_to_zarr.py` to optimize PyTorch I/O speeds.
+
+
+2. **Train Model & Export Checkpoint:** GPU Training.
+Run `python train_aida.py`. The script trains the `IcosahedralAIDA_GNN` model using background states, mesh connectivity (`face_nodes`), and NNJA-AI observations, saving the output to `checkpoints/icosahedral_aida_model.pt`.
+
+
+3. **Run Inference Separately:** Operational / Production.
+Run `python inference_aida.py`. It loads `icosahedral_aida_model.pt` without needing any training code, processes a target $x_b$, and generates the analysis state $x_a$ and increment $\delta x$ as NetCDF fields.
