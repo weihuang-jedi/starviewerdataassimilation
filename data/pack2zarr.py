@@ -25,5 +25,5 @@ def convert_icosahedral_nc_to_zarr(
 
 if __name__ == "__main__":
     convert_icosahedral_nc_to_zarr(
-        "data/icosahedral_grid/global_icosahedral_*.nc"
+        "icosahedral_grid/global_icosahedral_*.nc"
     )
