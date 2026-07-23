@@ -1,0 +1,139 @@
+Here are practical Python examples showing how to query the **NNJA-AI** dataset using the `nnja-ai` Python SDK, structure the observations, and feed them into a Data Assimilation (DA) workflow (e.g., computing observation increments $y - H(x)$).
+
+---
+
+### Prerequisites
+
+Make sure you have installed the SDK with optional dependencies:
+
+```bash
+pip install "nnja-ai[complete]"
+
+```
+
+---
+
+### Example 1: Extracting Conventional Upper-Air Soundings (`ADPUPA`)
+
+Radiosondes provide vertical profile measurements (pressure, temperature, dew point, winds). NNJA-AI exposes these nested BUFR arrays (`UARLV`) as clean Pandas/Xarray structures.
+
+```python
+import pandas as pd
+import numpy as np
+from nnja_ai import DataCatalog
+
+# 1. Initialize the dataset catalog
+catalog = DataCatalog()
+
+# 2. Load upper-air radiosonde observations (ADPUPA) for a specific date
+adpupa_ds = catalog["conv-adpupa-NC002001"]
+df_obs = adpupa_ds.sel(time="2021-01-01").load_dataset(backend="pandas")
+
+print(f"Loaded {len(df_obs)} sounding reports.")
+
+# 3. Helper to extract a vertical profile array from nested UARLV structs
+def extract_sounding_profile(row):
+    uarlv_data = row["UARLV"]
+    
+    pressures, temps = [], []
+    for level in uarlv_data:
+        p = level.get("PRLC")
+        # Extract temperature if available inside nested UATMP struct
+        t = level.get("UATMP", {}).get("TMDB") if level.get("UATMP") else None
+        
+        # Filter sentinel missing value indicators (often 1e11 in BUFR)
+        if p and p != 1e11 and t and t != 1e11:
+            pressures.append(p / 100.0)  # Convert Pa to hPa
+            temps.append(t)               # Kelvin
+            
+    return pd.DataFrame({"pressure_hpa": pressures, "obs_temp_k": temps})
+
+# Example: Get sounding from the first station
+single_sounding = extract_sounding_profile(df_obs.iloc[0])
+print("\nFirst Station Sounding Profile:")
+print(single_sounding.head())
+
+```
+
+---
+
+### Example 2: Computing Observation Increments $y - H(x)$
+
+In data assimilation:
+
+* **$y$**: The observation vector from NNJA-AI.
+* **$x_b$**: The prior model state (first guess, e.g., from ERA5 or a ML forecast model like Pangu/GraphCast).
+* **$H(x)$**: The observation operator mapping model state to observation space.
+
+Here is a 3D-Var / EnKF precursor calculating observation innovations:
+
+```python
+import numpy as np
+import pandas as pd
+from nnja_ai import DataCatalog
+
+# 1. Fetch surface station observations (ADPSFC)
+catalog = DataCatalog()
+sfc_ds = catalog["conv-adpsfc-NC001001"] # Weather station observations
+df_sfc = sfc_ds.sel(time="2021-01-01T12:00:00").load_dataset(backend="pandas")
+
+# Clean observation dataset: filter missing 2m temperature values
+# Assuming column 'TMDB' is 2m temperature
+obs_df = df_sfc[df_sfc["TMDB"] < 1e5][["LAT", "LON", "TMDB"]].dropna().copy()
+obs_df.rename(columns={"TMDB": "y_obs"}, inplace=True)
+
+# 2. Mock a Model Prior State H(x) via Bilinear Interpolation from a Grid
+# (In production, replace this with scipy.interpolate or xarray's interp)
+def mock_observation_operator(lats, lons):
+    """
+    Simulates mapping grid model state x_b to observation locations -> H(x_b)
+    """
+    # Dummy grid baseline temperature ~ 288 K with latitudinal gradient
+    return 288.15 - 0.5 * np.abs(lats) + np.sin(np.radians(lons)) * 2.0
+
+# Apply forward operator H(x_b)
+obs_df["Hx_b"] = mock_observation_operator(obs_df["LAT"].values, obs_df["LON"].values)
+
+# 3. Calculate Observation Innovation / Vector d = y - H(x_b)
+obs_df["innovation_d"] = obs_df["y_obs"] - obs_df["Hx_b"]
+
+# 4. Filter gross errors (Quality Control step before DA optimization)
+qc_threshold = 10.0 # Kelvin max allowable deviation
+valid_obs = obs_df[np.abs(obs_df["innovation_d"]) <= qc_threshold]
+
+print("Processed Observation Increments for Data Assimilation:")
+print(valid_obs[["LAT", "LON", "y_obs", "Hx_b", "innovation_d"]].head())
+
+```
+
+---
+
+### Example 3: Satellite Radiance Processing (ATMS / CrIS)
+
+For satellite radiances (e.g., ATMS or CrIS instruments), NNJA-AI exposes channel brightness temperatures.
+
+```python
+from nnja_ai import DataCatalog
+
+catalog = DataCatalog()
+
+# Access ATMS satellite radiance observations
+atms_ds = catalog["atms-atms-NC021203"]
+df_atms = atms_ds.sel(time="2021-01-01").load_dataset(backend="pandas")
+
+# Select mandatory metadata and raw channel brightness temperatures
+print("Available ATMS columns:", [col for col in df_atms.columns if "BRIT" in col or "LAT" in col or "LON" in col][:10])
+
+# Satellite observations typically require:
+# 1. Zenith angle / scan geometry filtering
+# 2. Radiometric forward operator (e.g., RTTOV or PyRTTOV) to map model profiles to Brightness Temp (Tb)
+
+```
+
+---
+
+### Key Next Steps for Full DA Pipelines
+
+1. **Quality Control (QC):** Filter sentinel BUFR values (`1e11` or default NaN flags) and apply background check limits.
+2. **Observation Errors ($R$ Matrix):** Assign observation error variances ($\sigma_o^2$) per sensor/level type.
+3. **Forward Operators:** Use fast radiative transfer models (like **RTTOV**) when assimilating satellite channels.

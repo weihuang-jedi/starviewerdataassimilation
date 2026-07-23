@@ -1,0 +1,174 @@
+Here is a complete, scalable 3D-Var spatial data assimilation script using **Gaspari-Cohn tapering** for distance-based horizontal localization.
+
+This script pulls multi-station surface observations (`conv-adpsfc-NC000001`) from **NNJA-AI**, projects them onto a 2D spatial grid (e.g., $10 \times 10$ latitude-longitude region), and solves the 3D-Var cost function using **BFGS optimization**.
+
+---
+
+### The 3D-Var Cost Function & Localization
+
+$$J(x) = \frac{1}{2} (x - x_b)^T B_{loc}^{-1} (x - x_b) + \frac{1}{2} (y - H(x))^T R^{-1} (y - H(x))$$
+
+Where:
+
+* **Background Covariance ($B_{loc}$):** Standard background error covariance $B$ modified by a **Gaspari-Cohn localization matrix ($\mathbf{C}$)** via Hadamard (element-wise) product:
+
+$$B_{loc} = B \circ \mathbf{C}(d / L_{loc})$$
+
+
+* **Gaspari-Cohn Function $\mathbf{C}(r)$:** Smoothly tapers spurious long-range spatial correlations to zero beyond a localization radius $2 L_{loc}$, preventing distant observations from corrupting local model grid updates.
+
+---
+
+### End-to-End Python Script: `3dvar_spatial.py`
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from nnja_ai import DataCatalog
+
+# --------------------------------------------------
+# 1. FETCH MULTI-STATION SURFACE OBS FROM NNJA-AI
+# --------------------------------------------------
+print("Fetching NNJA-AI surface observations...")
+catalog = DataCatalog(mirror="gcp_brightband")
+
+sfc_ds = catalog["conv-adpsfc-NC000001"]
+subset = sfc_ds.sel(time="2021-01-01")
+df_sfc = subset.load_dataset(backend="pandas")
+
+# Clean observation dataset and filter valid temperatures (TMPSQ1.TMDB)
+obs_df = df_sfc[df_sfc["TMPSQ1.TMDB"] < 1e5][["LAT", "LON", "TMPSQ1.TMDB"]].dropna().copy()
+
+# Focus spatial region (e.g., CONUS snippet: Lats 30-45, Lons -100 to -80)
+spatial_mask = (
+    (obs_df["LAT"] >= 30) & (obs_df["LAT"] <= 45) &
+    (obs_df["LON"] >= -100) & (obs_df["LON"] <= -80)
+)
+obs_df = obs_df[spatial_mask].sample(n=min(50, len(obs_df)), random_state=42).reset_index(drop=True)
+obs_df.rename(columns={"TMPSQ1.TMDB": "y_obs"}, inplace=True)
+
+n_obs = len(obs_df)
+print(f"Selected {n_obs} observations inside target domain.")
+
+# --------------------------------------------------
+# 2. DEFINE SPATIAL GRID & PRIOR BACKGROUND STATE x_b
+# --------------------------------------------------
+lats = np.linspace(30.0, 45.0, 10)
+lons = np.linspace(-100.0, -80.0, 10)
+grid_lon, grid_lat = np.meshgrid(lons, lats)
+
+grid_coords = np.column_stack([grid_lat.ravel(), grid_lon.ravel()])
+n_grid = len(grid_coords)
+
+# Background temperature profile x_b (288 K with latitude gradient)
+x_b = 288.15 - 0.4 * (grid_coords[:, 0] - 30.0)
+
+# --------------------------------------------------
+# 3. GASPARI-COHN LOCALIZATION & B MATRIX
+# --------------------------------------------------
+def gaspari_cohn(r):
+    """
+    Computes Gaspari-Cohn correlation scalar for scaled distance r = d / L_loc.
+    Tapers smoothly to 0 at r = 2.0.
+    """
+    c = np.zeros_like(r)
+    
+    # 0 <= r < 1
+    m1 = (r >= 0) & (r < 1)
+    c[m1] = 1.0 - 5/3*r[m1]**2 + 5/8*r[m1]**3 + 0.5*r[m1]**4 - 0.25*r[m1]**5
+    
+    # 1 <= r < 2
+    m2 = (r >= 1) & (r < 2)
+    c[m2] = (
+        4/3*r[m2]**(-1) - 5.0 + 5.0*r[m2] - 5/3*r[m2]**2 
+        + 5/8*r[m2]**3 - 0.5*r[m2]**4 + 1/12*r[m2]**5
+    )
+    # r >= 2 remains 0
+    return np.clip(c, 0.0, 1.0)
+
+# Great-circle approximation for grid-to-grid distances (in km)
+grid_dists = cdist(grid_coords, grid_coords) * 111.0  # ~111 km per degree
+
+# Raw Background Error Covariance B
+sigma_b = 2.5  # Kelvin
+L_b = 300.0    # Length scale (km)
+B_raw = (sigma_b ** 2) * np.exp(-0.5 * (grid_dists / L_b) ** 2)
+
+# Apply Gaspari-Cohn Horizontal Localization Matrix C
+L_loc = 250.0  # Localization half-radius (km)
+C_loc = gaspari_cohn(grid_dists / L_loc)
+B_loc = B_raw * C_loc  # Hadamard product
+
+# Invert localized background covariance matrix for 3D-Var objective function
+B_inv = np.linalg.inv(B_loc + 1e-6 * np.eye(n_grid))
+
+# --------------------------------------------------
+# 4. FORWARD OBSERVATION OPERATOR H
+# --------------------------------------------------
+obs_coords = obs_df[["LAT", "LON"]].values
+obs_grid_dists = cdist(obs_coords, grid_coords) * 111.0
+
+# Inverse-distance weighting operator H (maps n_grid -> n_obs)
+weights = 1.0 / (obs_grid_dists + 1.0)**2
+H = weights / weights.sum(axis=1, keepdims=True)
+
+y = obs_df["y_obs"].values
+sigma_r = 1.0  # Sensor error (Kelvin)
+R_inv = (1.0 / sigma_r**2) * np.eye(n_obs)
+
+# --------------------------------------------------
+# 5. 3D-VAR COST FUNCTION & VARIATIONAL OPTIMIZATION
+# --------------------------------------------------
+def cost_function(x):
+    """3D-Var Cost Function J(x)"""
+    dx = x - x_b
+    dy = y - H @ x
+    j_b = 0.5 * dx.T @ B_inv @ dx
+    j_o = 0.5 * dy.T @ R_inv @ dy
+    return j_b + j_o
+
+def cost_gradient(x):
+    """3D-Var Cost Function Gradient grad(J)"""
+    dx = x - x_b
+    dy = y - H @ x
+    grad_b = B_inv @ dx
+    grad_o = -H.T @ R_inv @ dy
+    return grad_b + grad_o
+
+# Solve 3D-Var using L-BFGS-B optimizer
+print("Solving 3D-Var optimization...")
+res = minimize(
+    fun=cost_function,
+    x0=x_b,
+    jac=cost_gradient,
+    method="L-BFGS-B",
+    options={"gtol": 1e-5, "maxiter": 200}
+)
+
+x_a = res.x
+print(f"3D-Var Converged: {res.success} in {res.nit} iterations.")
+
+# --------------------------------------------------
+# 6. RESULTS & ANALYSIS INCREMENTS
+# --------------------------------------------------
+increments = x_a - x_b
+
+results_df = pd.DataFrame({
+    "Grid Lat": grid_coords[:, 0],
+    "Grid Lon": grid_coords[:, 1],
+    "Background x_b (K)": np.round(x_b, 2),
+    "Analysis x_a (K)": np.round(x_a, 2),
+    "Increment (x_a - x_b)": np.round(increments, 2)
+})
+
+print("\n--- 3D-Var Spatial Assimilation Summary ---")
+print(f"Mean Abs Increment: {np.mean(np.abs(increments)):.3f} K")
+print(f"Max Positive Increment: {np.max(increments):.3f} K")
+print(f"Max Negative Increment: {np.min(increments):.3f} K")
+
+print("\nSample Grid Points After 3D-Var Assimilation:")
+print(results_df.head(10).to_string(index=False))
+
+```
