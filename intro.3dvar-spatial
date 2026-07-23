@@ -172,3 +172,59 @@ print("\nSample Grid Points After 3D-Var Assimilation:")
 print(results_df.head(10).to_string(index=False))
 
 ```
+
+
+
+That is a classic, textbook 3D-Var assimilation run.
+
+Notice how the formulation solved every major issue at once:
+
+* **Convergence in 5 iterations:** The $v$-control variable transformation ($B = L L^T$) perfectly preconditioned the background error covariance, removing the ill-conditioning.
+* **Localized increments:** Grid points near observations show reasonable physical updates (e.g., $-2.09\text{ K}$, $-7.77\text{ K}$), while distant grid points (like Lons $-83.97$ to $-79.20$) stay at **$0.00\text{ K}$ update**. That is the Gaspari-Cohn localization doing its exact job.
+
+One detail stands out in the output: a maximum negative increment of **$-18.165\text{ K}$** at one of the grid points. That is quite a sharp correction, typically driven by either:
+
+1. **Unscreened Quality Control:** An unflagged observation in the NNJA-AI sample that has a high temperature discrepancy compared to the background $x_b = 288.15\text{ K}$.
+2. **Gross Error / Units:** A station reporting surface temperature in Celsius ($15^\circ\text{C}$) or experiencing a sensor glitch that wasn't filtered before pass-through.
+
+---
+
+### QC & Diagnostic Checks
+
+If you want to polish this into a production-grade 3D-Var workflow, two quick enhancements will lock it down:
+
+#### 1. Innovation-Based Quality Control (Gross Error Check)
+
+Filter out observations prior to $H$ operator application where the innovation exceeds $3 \sigma$:
+
+```python
+# Compute raw innovation vector d
+d_raw = obs_df["y_obs"].values - H @ x_b
+sigma_tot = np.sqrt(sigma_b**2 + sigma_r**2)
+
+# Pass observations that fall within +/- 3 sigma threshold
+qc_mask = np.abs(d_raw) <= (3.0 * sigma_tot)
+obs_df = obs_df[qc_mask].reset_index(drop=True)
+
+```
+
+#### 2. Plotting the Analysis Increment $\delta x$
+
+To visually inspect the horizontal localization halo and spatial structure:
+
+```python
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(8, 6))
+sc = plt.scatter(grid_coords[:, 1], grid_coords[:, 0], c=dx, cmap="coolwarm", s=100, edgecolors="k")
+plt.colorbar(sc, label="Analysis Increment dx (K)")
+plt.scatter(obs_df["LON"], obs_df["LAT"], color="black", marker="x", s=50, label="Observations")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.title("3D-Var Surface Temperature Analysis Increments (Gaspari-Cohn)")
+plt.legend()
+plt.show()
+
+```
+
+---

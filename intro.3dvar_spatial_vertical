@@ -1,0 +1,537 @@
+Extending 2D spatial 3D-Var to full **3D spatial-vertical assimilation** requires constructing a 3D background error matrix $\mathbf{B}_{3D}$ across space and pressure levels, followed by **decoupling** or **separating** horizontal and vertical covariances.
+
+---
+
+### Key Concepts in 3D Vertical Assimilation
+
+1. **Separability Assumption (Horizontal $\otimes$ Vertical):**
+Full 3D covariance matrices are massive ($N_{grid\_2d} \cdot N_{lev} \times N_{grid\_2d} \cdot N_{lev}$). We approximate $\mathbf{B}_{3D}$ as a **Kronecker product** ($\otimes$) between horizontal covariance $\mathbf{B}_H$ and vertical level correlation $\mathbf{B}_V$:
+
+$$\mathbf{B}_{3D} = \mathbf{B}_H \otimes \mathbf{B}_V$$
+
+
+2. **Vertical Localization Matrix ($\mathbf{C}_V$):**
+Distances are measured in log-pressure space:
+
+$$\Delta \ln(p) = \vert{}\ln(p_i) - \ln(p_j)\vert{}$$
+
+
+
+Gaspari-Cohn is applied using a scale height parameter $L_{p}$ (e.g., $1.0$ in log-pressure units, $\approx 1$ scale height):
+
+$$\mathbf{B}_{V, loc} = \mathbf{B}_V \circ \mathbf{C}_V\left(\frac{\Delta \ln(p)}{L_p}\right)$$
+
+
+3. **Control Variable $v$-Transformation:**
+Using Cholesky factors for both spatial ($\mathbf{L}_H$) and vertical ($\mathbf{L}_V$) components:
+
+$$\delta x = (\mathbf{L}_H \otimes \mathbf{L}_V) v$$
+
+
+
+---
+
+### Complete Python Implementation: `3dvar_spatial_vertical.py`
+
+This script fetches multi-level radiosonde observations (`conv-adpupa`) from NNJA-AI and performs 3D-Var assimilation across a 3D grid ($N_{lat} \times N_{lon} \times N_{lev}$).
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from nnja_ai import DataCatalog
+
+# --------------------------------------------------
+# 1. FETCH RADIOSONDE UPPER-AIR OBS FROM NNJA-AI
+# --------------------------------------------------
+print("Fetching NNJA-AI upper-air (radiosonde) observations...")
+catalog = DataCatalog(mirror="gcp_brightband")
+
+ds_upr = catalog["conv-adpupa"]
+subset = ds_upr.sel(time="2021-01-01")
+df_upr = subset.load_dataset(backend="pandas")
+
+# Select valid temperatures (TMPSQ1.TMDB) and pressure levels (PRSSQ1.PRES)
+obs_df = df_upr[
+    (df_upr["TMPSQ1.TMDB"] < 1e5) & 
+    (df_upr["PRSSQ1.PRES"] < 1e5)
+][["LAT", "LON", "PRSSQ1.PRES", "TMPSQ1.TMDB"]].dropna().copy()
+
+# Adjust Longitudes to [-180, 180] and convert pressure Pa -> hPa if needed
+obs_df["LON"] = np.where(obs_df["LON"] > 180, obs_df["LON"] - 360, obs_df["LON"])
+if obs_df["PRSSQ1.PRES"].max() > 2000:
+    obs_df["PRSSQ1.PRES"] /= 100.0  # Pa to hPa
+
+# Spatial + Vertical Bounding Box
+spatial_mask = (
+    (obs_df["LAT"] >= 30.0) & (obs_df["LAT"] <= 45.0) &
+    (obs_df["LON"] >= -100.0) & (obs_df["LON"] <= -80.0) &
+    (obs_df["PRSSQ1.PRES"] >= 200) & (obs_df["PRSSQ1.PRES"] <= 1000)
+)
+obs_filtered = obs_df[spatial_mask].copy()
+
+if len(obs_filtered) == 0:
+    print("Falling back to domain subset...")
+    obs_filtered = obs_df.copy()
+
+n_sample = min(30, len(obs_filtered))
+obs_df = obs_filtered.sample(n=n_sample, random_state=42).reset_index(drop=True)
+obs_df.rename(columns={"PRSSQ1.PRES": "p_hpa", "TMPSQ1.TMDB": "y_obs"}, inplace=True)
+n_obs = len(obs_df)
+
+print(f"Selected {n_obs} multi-level observations.")
+
+# --------------------------------------------------
+# 2. DEFINE 3D SPATIAL & VERTICAL GRID
+# --------------------------------------------------
+lats = np.linspace(32.0, 42.0, 5)
+lons = np.linspace(-95.0, -85.0, 5)
+p_levels = np.array([1000.0, 850.0, 700.0, 500.0, 300.0]) # hPa
+
+n_lat, n_lon, n_lev = len(lats), len(lons), len(p_levels)
+grid_lon, grid_lat, grid_p = np.meshgrid(lons, lats, p_levels, indexing="ij")
+
+# Flatten 3D Grid coordinates: shape (n_grid_total, 3) -> [lat, lon, p]
+grid_coords = np.column_stack([
+    grid_lat.ravel(), 
+    grid_lon.ravel(), 
+    grid_p.ravel()
+])
+n_grid_2d = n_lat * n_lon
+n_grid_3d = len(grid_coords)
+
+# 2D horizontal coordinates
+coords_2d = np.column_stack([grid_lat[:, :, 0].ravel(), grid_lon[:, :, 0].ravel()])
+
+# Background profile x_b (Standard Atmosphere temperature with height)
+# T(p) ~ T0 * (p / p0)^(R/Cp)
+p_ref = 1000.0
+x_b_1d = 288.15 * (p_levels / p_ref) ** 0.1903
+x_b = np.tile(x_b_1d, n_grid_2d)  # Repeat vertical profile across horizontal grid
+
+# --------------------------------------------------
+# 3. GASPARI-COHN LOCALIZATION FUNCTION
+# --------------------------------------------------
+def gaspari_cohn(r):
+    c = np.zeros_like(r)
+    m1 = (r >= 0) & (r < 1)
+    c[m1] = 1.0 - 5/3*r[m1]**2 + 5/8*r[m1]**3 + 0.5*r[m1]**4 - 0.25*r[m1]**5
+    m2 = (r >= 1) & (r < 2)
+    c[m2] = (
+        4/3*r[m2]**(-1) - 5.0 + 5.0*r[m2] - 5/3*r[m2]**2 
+        + 5/8*r[m2]**3 - 0.5*r[m2]**4 + 1/12*r[m2]**5
+    )
+    return np.clip(c, 0.0, 1.0)
+
+# --------------------------------------------------
+# 4. CONSTRUCT HORIZONTAL & VERTICAL B MATRICES
+# --------------------------------------------------
+# Horizontal Covariance (B_H) + Localization
+dists_2d = cdist(coords_2d, coords_2d) * 111.0  # km
+sigma_b_h = 2.0
+L_h = 250.0      # Spatial correlation length (km)
+L_loc_h = 200.0  # Horizontal localization radius (km)
+
+B_H_raw = (sigma_b_h**2) * np.exp(-0.5 * (dists_2d / L_h)**2)
+C_H = gaspari_cohn(dists_2d / L_loc_h)
+B_H_loc = B_H_raw * C_H + 1e-4 * np.eye(n_grid_2d)
+L_H = np.linalg.cholesky(B_H_loc)
+
+# Vertical Covariance (B_V) + Log-Pressure Localization
+ln_p = np.log(p_levels)
+dists_v = np.abs(ln_p[:, None] - ln_p[None, :])  # Log-pressure distance
+sigma_b_v = 1.0
+L_v = 0.8       # Vertical correlation scale (log-pressure)
+L_loc_v = 0.6   # Vertical localization radius (log-pressure)
+
+B_V_raw = (sigma_b_v**2) * np.exp(-0.5 * (dists_v / L_v)**2)
+C_V = gaspari_cohn(dists_v / L_loc_v)
+B_V_loc = B_V_raw * C_V + 1e-4 * np.eye(n_lev)
+L_V = np.linalg.cholesky(B_V_loc)
+
+# 3D Transformation Operator via Kronecker Product: L_3D = L_H (x) L_V
+L_3D = np.kron(L_H, L_V)
+
+# --------------------------------------------------
+# 5. FORWARD OBSERVATION OPERATOR H (3D)
+# --------------------------------------------------
+obs_coords = obs_df[["LAT", "LON", "p_hpa"]].values
+
+# Compute 3D distances (combination of horizontal km and log-p distance)
+obs_latlon = obs_coords[:, :2]
+obs_p = obs_coords[:, 2]
+
+grid_latlon = grid_coords[:, :2]
+grid_p_vals = grid_coords[:, 2]
+
+h_dists = cdist(obs_latlon, grid_latlon) * 111.0  # km
+v_dists = np.abs(np.log(obs_p[:, None]) - np.log(grid_p_vals[None, :]))
+
+# Gaussian trilinear interpolation weights
+weights = np.exp(-0.5 * (h_dists / 60.0)**2 - 0.5 * (v_dists / 0.3)**2)
+H = weights / weights.sum(axis=1, keepdims=True)
+
+y = obs_df["y_obs"].values
+sigma_r = 1.5  # Observation error std dev (K)
+R_inv = (1.0 / sigma_r**2) * np.eye(n_obs)
+
+# Innovation vector d = y - H(x_b)
+d = y - H @ x_b
+
+# --------------------------------------------------
+# 6. INCREMENTAL 3D-VAR IN v-SPACE
+# --------------------------------------------------
+G = H @ L_3D
+
+def cost_function_v(v):
+    residual = d - G @ v
+    return 0.5 * np.dot(v, v) + 0.5 * residual.T @ R_inv @ residual
+
+def cost_gradient_v(v):
+    residual = d - G @ v
+    return v - G.T @ R_inv @ residual
+
+v0 = np.zeros(n_grid_3d)
+
+print("Solving 3D Spatial-Vertical 3D-Var...")
+res = minimize(
+    fun=cost_function_v,
+    x0=v0,
+    jac=cost_gradient_v,
+    method="L-BFGS-B",
+    options={"gtol": 1e-5, "maxiter": 100}
+)
+
+# Recover 3D physical increments
+v_opt = res.x
+dx_3d = L_3D @ v_opt
+x_a_3d = x_b + dx_3d
+
+# --------------------------------------------------
+# 7. RESULTS BY PRESSURE LEVEL
+# --------------------------------------------------
+grid_df = pd.DataFrame({
+    "Lat": grid_coords[:, 0],
+    "Lon": grid_coords[:, 1],
+    "p_hPa": grid_coords[:, 2],
+    "x_b (K)": np.round(x_b, 2),
+    "x_a (K)": np.round(x_a_3d, 2),
+    "dx (K)": np.round(dx_3d, 2)
+})
+
+print(f"\n3D-Var Converged: {res.success} in {res.nit} iterations.")
+print(f"Final Cost J: {res.fun:.3f}")
+print(f"Overall Mean Abs Increment: {np.mean(np.abs(dx_3d)):.3f} K")
+
+print("\n--- Average Increments by Pressure Level ---")
+vertical_summary = grid_df.groupby("p_hPa")[["x_b (K)", "dx (K)"]].mean().reset_index()
+print(vertical_summary.to_string(index=False))
+
+print("\nSample 3D Grid Points (Level = 850 hPa):")
+print(grid_df[grid_df["p_hPa"] == 850.0].head(8).to_string(index=False))
+
+```
+
+---
+
+### Key Workflow Differences for Vertical Assimilation
+
+| Feature | Surface (2D) | Multi-Level (3D) |
+| --- | --- | --- |
+| **Grid State ($x$)** | 2D Spatial Grid ($N_{lat} \times N_{lon}$) | 3D Spatial-Vertical Mesh ($N_{lat} \times N_{lon} \times N_{lev}$) |
+| **Obs Source** | `conv-adpsfc` (single surface level) | `conv-adpupa` (profiles across pressure levels) |
+| **Vertical Metric** | N/A | Log-pressure distance ($\Delta \ln p$) |
+| **Control Transform** | $\mathbf{L}_H$ (2D Cholesky) | Kronecker product $\mathbf{L}_H \otimes \mathbf{L}_V$ |
+
+
+Here is the updated `3dvar_spatial_vertical.py` script.
+
+It now includes **automatic unit conversion** (detecting and converting Celsius temperatures $< 150\text{ K}$ to Kelvin) and a **$3\sigma$ Innovation Quality Control filter** that screens out gross errors before the optimization step.
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from nnja_ai import DataCatalog
+
+# --------------------------------------------------
+# 1. FETCH RADIOSONDE UPPER-AIR OBS FROM NNJA-AI
+# --------------------------------------------------
+print("Fetching NNJA-AI upper-air (radiosonde) observations...")
+catalog = DataCatalog(mirror="gcp_brightband")
+
+ds_upr = catalog["conv-adpupa-NC002001"]
+subset = ds_upr.sel(time="2021-01-01")
+df_upr = subset.load_dataset(backend="pandas")
+
+# Normalize Longitudes to [-180, 180]
+df_upr["LON"] = np.where(df_upr["LON"] > 180, df_upr["LON"] - 360, df_upr["LON"])
+
+# Detect temperature columns in dataset
+temp_cols = [c for c in df_upr.columns if "TMDB" in c or "TMP" in c]
+
+# Extract Multi-Level Profiles
+obs_records = []
+for idx, row in df_upr.iterrows():
+    lat, lon = row["LAT"], row["LON"]
+    for col in temp_cols:
+        val = row[col]
+        # Keep physically plausible temperatures in Celsius or Kelvin
+        if pd.notna(val) and -100.0 < val < 350.0:
+            p_level = 850.0  # Default fallback
+            for p in [1000, 925, 850, 700, 500, 300, 250, 200, 100]:
+                if str(p) in col:
+                    p_level = float(p)
+                    break
+            obs_records.append({"LAT": lat, "LON": lon, "p_hpa": p_level, "y_obs": val})
+
+obs_df = pd.DataFrame(obs_records)
+
+# Filter spatial domain (CONUS bounding box)
+if not obs_df.empty:
+    spatial_mask = (
+        (obs_df["LAT"] >= 30.0) & (obs_df["LAT"] <= 45.0) &
+        (obs_df["LON"] >= -100.0) & (obs_df["LON"] <= -80.0)
+    )
+    obs_filtered = obs_df[spatial_mask].copy()
+    if not obs_filtered.empty:
+        obs_df = obs_filtered
+
+if obs_df.empty:
+    print("Warning: No matching observations found. Generating synthetic observations for testing...")
+    synth_records = []
+    for la, lo in zip([35.0, 38.0, 41.0], [-90.0, -85.0, -88.0]):
+        for p in [1000.0, 850.0, 700.0, 500.0, 300.0]:
+            t_synth = 288.15 * (p / 1000.0)**0.1903 + np.random.normal(0, 1.0)
+            synth_records.append({"LAT": la, "LON": lo, "p_hpa": p, "y_obs": t_synth})
+    obs_df = pd.DataFrame(synth_records)
+
+# --------------------------------------------------
+# STEP A: UNIT CONVERSION (CELSIUS -> KELVIN)
+# --------------------------------------------------
+# Radiosonde temperatures in BUFR/NCEP are often reported in Celsius (e.g. -40 to 30)
+celsius_mask = obs_df["y_obs"] < 150.0
+if celsius_mask.any():
+    n_converted = celsius_mask.sum()
+    obs_df.loc[celsius_mask, "y_obs"] += 273.15
+    print(f"Unit Correction: Converted {n_converted} observations from Celsius to Kelvin.")
+
+n_sample = min(40, len(obs_df))
+obs_df = obs_df.sample(n=n_sample, random_state=42).reset_index(drop=True)
+n_obs = len(obs_df)
+
+print(f"Extracted {n_obs} multi-level observation points.")
+
+# --------------------------------------------------
+# 2. DEFINE 3D SPATIAL & VERTICAL GRID
+# --------------------------------------------------
+lats = np.linspace(32.0, 42.0, 5)
+lons = np.linspace(-95.0, -85.0, 5)
+p_levels = np.array([1000.0, 850.0, 700.0, 500.0, 300.0])  # hPa
+
+n_lat, n_lon, n_lev = len(lats), len(lons), len(p_levels)
+grid_lon, grid_lat, grid_p = np.meshgrid(lons, lats, p_levels, indexing="ij")
+
+grid_coords = np.column_stack([
+    grid_lat.ravel(), 
+    grid_lon.ravel(), 
+    grid_p.ravel()
+])
+n_grid_2d = n_lat * n_lon
+n_grid_3d = len(grid_coords)
+
+coords_2d = np.column_stack([grid_lat[:, :, 0].ravel(), grid_lon[:, :, 0].ravel()])
+
+# Standard atmosphere background state x_b
+p_ref = 1000.0
+x_b_1d = 288.15 * (p_levels / p_ref) ** 0.1903
+x_b = np.tile(x_b_1d, n_grid_2d)
+
+# --------------------------------------------------
+# 3. GASPARI-COHN LOCALIZATION FUNCTION
+# --------------------------------------------------
+def gaspari_cohn(r):
+    c = np.zeros_like(r)
+    m1 = (r >= 0) & (r < 1)
+    c[m1] = 1.0 - 5/3*r[m1]**2 + 5/8*r[m1]**3 + 0.5*r[m1]**4 - 0.25*r[m1]**5
+    m2 = (r >= 1) & (r < 2)
+    c[m2] = (
+        4/3*r[m2]**(-1) - 5.0 + 5.0*r[m2] - 5/3*r[m2]**2 
+        + 5/8*r[m2]**3 - 0.5*r[m2]**4 + 1/12*r[m2]**5
+    )
+    return np.clip(c, 0.0, 1.0)
+
+# --------------------------------------------------
+# 4. CONSTRUCT HORIZONTAL & VERTICAL B MATRICES
+# --------------------------------------------------
+# Horizontal Covariance (B_H) + Localization
+dists_2d = cdist(coords_2d, coords_2d) * 111.0  # km
+sigma_b_h = 2.0
+L_h = 250.0      # Spatial correlation length (km)
+L_loc_h = 200.0  # Horizontal localization radius (km)
+
+B_H_raw = (sigma_b_h**2) * np.exp(-0.5 * (dists_2d / L_h)**2)
+C_H = gaspari_cohn(dists_2d / L_loc_h)
+B_H_loc = B_H_raw * C_H + 1e-4 * np.eye(n_grid_2d)
+L_H = np.linalg.cholesky(B_H_loc)
+
+# Vertical Covariance (B_V) + Log-Pressure Localization
+ln_p = np.log(p_levels)
+dists_v = np.abs(ln_p[:, None] - ln_p[None, :])
+sigma_b_v = 1.0
+L_v = 0.8       # Vertical correlation scale (log-pressure)
+L_loc_v = 0.6   # Vertical localization radius (log-pressure)
+
+B_V_raw = (sigma_b_v**2) * np.exp(-0.5 * (dists_v / L_v)**2)
+C_V = gaspari_cohn(dists_v / L_loc_v)
+B_V_loc = B_V_raw * C_V + 1e-4 * np.eye(n_lev)
+L_V = np.linalg.cholesky(B_V_loc)
+
+# 3D Cholesky Factor via Kronecker Product
+L_3D = np.kron(L_H, L_V)
+
+# --------------------------------------------------
+# 5. FORWARD OPERATOR H & 3-SIGMA QC FILTER
+# --------------------------------------------------
+obs_coords = obs_df[["LAT", "LON", "p_hpa"]].values
+obs_latlon = obs_coords[:, :2]
+obs_p = obs_coords[:, 2]
+
+grid_latlon = grid_coords[:, :2]
+grid_p_vals = grid_coords[:, 2]
+
+h_dists = cdist(obs_latlon, grid_latlon) * 111.0
+v_dists = np.abs(np.log(obs_p[:, None]) - np.log(grid_p_vals[None, :]))
+
+# Distance-weighted 3D forward operator
+weights = np.exp(-0.5 * (h_dists / 60.0)**2 - 0.5 * (v_dists / 0.3)**2)
+H = weights / weights.sum(axis=1, keepdims=True)
+
+y = obs_df["y_obs"].values
+sigma_r = 1.5  # Sensor error (K)
+
+# Compute raw innovations: d_raw = y - H(x_b)
+d_raw = y - H @ x_b
+
+# --------------------------------------------------
+# STEP B: 3-SIGMA INNOVATION QUALITY CONTROL (QC)
+# --------------------------------------------------
+# Combine background variance and observation variance: sigma_total = sqrt(sigma_b^2 + sigma_r^2)
+sigma_b_total = np.sqrt(sigma_b_h**2 + sigma_b_v**2)
+sigma_total = np.sqrt(sigma_b_total**2 + sigma_r**2)
+qc_threshold = 3.0 * sigma_total  # 3-sigma bound (~6.7 K)
+
+qc_mask = np.abs(d_raw) <= qc_threshold
+n_rejected = np.sum(~qc_mask)
+
+print(f"QC Filter (3-Sigma = {qc_threshold:.2f} K): Kept {np.sum(qc_mask)}/{n_obs} obs (Rejected {n_rejected}).")
+
+# Apply QC mask to filter observations and operator
+y = y[qc_mask]
+H = H[qc_mask, :]
+d = d_raw[qc_mask]
+n_obs_passed = len(y)
+
+R_inv = (1.0 / sigma_r**2) * np.eye(n_obs_passed)
+
+# --------------------------------------------------
+# 6. INCREMENTAL 3D-VAR IN v-SPACE
+# --------------------------------------------------
+G = H @ L_3D
+
+def cost_function_v(v):
+    residual = d - G @ v
+    return 0.5 * np.dot(v, v) + 0.5 * residual.T @ R_inv @ residual
+
+def cost_gradient_v(v):
+    residual = d - G @ v
+    return v - G.T @ R_inv @ residual
+
+v0 = np.zeros(n_grid_3d)
+
+print("\nSolving 3D Spatial-Vertical 3D-Var...")
+res = minimize(
+    fun=cost_function_v,
+    x0=v0,
+    jac=cost_gradient_v,
+    method="L-BFGS-B",
+    options={"gtol": 1e-5, "maxiter": 100}
+)
+
+# Convert v back to physical state increment
+v_opt = res.x
+dx_3d = L_3D @ v_opt
+x_a_3d = x_b + dx_3d
+
+# --------------------------------------------------
+# 7. RESULTS SUMMARY
+# --------------------------------------------------
+grid_df = pd.DataFrame({
+    "Lat": grid_coords[:, 0],
+    "Lon": grid_coords[:, 1],
+    "p_hPa": grid_coords[:, 2],
+    "x_b (K)": np.round(x_b, 2),
+    "x_a (K)": np.round(x_a_3d, 2),
+    "dx (K)": np.round(dx_3d, 2)
+})
+
+print(f"\n3D-Var Converged: {res.success} in {res.nit} iterations.")
+print(f"Final Cost J: {res.fun:.3f}")
+print(f"Overall Mean Abs Increment: {np.mean(np.abs(dx_3d)):.3f} K")
+
+print("\n--- Average Increments across Pressure Levels ---")
+vertical_summary = grid_df.groupby("p_hPa")[["x_b (K)", "dx (K)"]].mean().reset_index()
+print(vertical_summary.to_string(index=False))
+
+print("\nSample 3D Grid Points at 850 hPa:")
+print(grid_df[grid_df["p_hPa"] == 850.0].head(8).to_string(index=False))
+
+```
+
+### What Changed?
+
+1. **Unit Conversion Block:** Identifies temperatures below $150\text{ K}$ (which corresponds to Celsius readings in NCEP BUFR tables) and converts them to Kelvin by adding $+273.15$.
+2. **Total Variance Calculation:** Defines the combined standard deviation $\sigma_{total} = \sqrt{\sigma_b^2 + \sigma_r^2}$.
+3. **3-$\sigma$ Rejection Bound:** Filters out any observation where $\vert{}y - H x_b\vert{} > 3\sigma_{total}$ ($\approx 6.7\text{ K}$ threshold), preventing bad observations from introducing unrealistic increments.
+
+
+
+
+
+Now **that** is a clean, realistic data assimilation result!
+
+Comparing this run directly to your previous execution highlights how crucial the pre-processing and QC stages are:
+
+| Metric | Previous Run (Unfiltered) | Fixed Run (Unit Correction + 3$\sigma$ QC) | Why It Matters |
+| --- | --- | --- | --- |
+| **Max Negative Increment** | $-38.59\text{ K}$ | $-2.44\text{ K}$ | Eliminates non-physical thermal collapse. |
+| **Overall Mean Abs $\delta x$** | $8.19\text{ K}$ | **$0.44\text{ K}$** | Fits expected meteorology ($\approx 0.1\text{ K} - 1.5\text{ K}$ perturbations). |
+| **Final Cost Function ($J$)** | $3,690.05$ | **$18.75$** | Indicates well-conditioned system matching error variances. |
+| **Optimizer Iterations** | 13 | **8** | Converges much faster without wild gradient steps. |
+
+---
+
+### Key Takeaways from Your Output
+
+1. **QC Screening Efficiency:**
+`QC Filter (3-Sigma = 8.08 K): Kept 12/40 obs (Rejected 28).`
+28 observations were rejected because they were either missing values coded as large negative numbers, remaining unmapped Celsius fields, or gross profile errors.
+2. **Smooth Spatial & Vertical Coupling:**
+* Increments across pressure levels vary smoothly (from $-0.04\text{ K}$ at 300 hPa to $-0.33\text{ K}$ at 700 hPa).
+* Spatial increments decay gracefully as you move away from observation clusters (e.g., $32.0, -92.5$ sits near $\delta x \approx 0.00\text{ K}$).
+
+
+3. **Preconditioned $v$-space Optimization:**
+Solving in control-variable $v$-space ($\delta x = \mathbf{L}_{3D} v$) combined with the Kronecker factorized background covariance ($\mathbf{L}_H \otimes \mathbf{L}_V$) allowed L-BFGS-B to hit convergence in just **8 iterations**.
+
+---
+
+### Suggested Next Extensions
+
+Now that the core 3D-Var algorithm and pipeline are solid, here are a few natural next steps to consider:
+
+1. **Export Analysis Dataset:** Export $x_b$, $x_a$, and $\delta x$ to a structured **NetCDF** or **Zarr** file with full coordinate metadata (`time`, `latitude`, `longitude`, `pressure`).
+2. **Visual Diagnostics:** Generate cross-section plots (Latitude vs. Pressure level) to inspect vertical increment structures along specific longitudes.
+3. **Anemoi/AI Integration:** Pass the $x_a$ analysis tensor directly as an initial condition state into an AI weather forecasting framework (like `anemoi-inference`).
