@@ -1,1 +1,57 @@
 # starviewerdataassimilation
+
+**NNJA-AI** (pronounced *"Ninja AI"*) refers to the **NOAA-NASA Joint Archive of Observations for Earth System Reanalysis — AI Ready**, developed by **Brightband** in collaboration with NOAA and supported by the NOAA Open Data Dissemination (NODD) Program.
+
+---
+
+## 🌍 What is NNJA-AI?
+
+The original NOAA-NASA Joint Archive (NNJA) is a massive dataset of Earth system observations from 1979 to the present. However, the raw data was historically stored in **BUFR**, a binary format that is notoriously awkward to process for modern machine learning (ML) workflows.
+
+**NNJA-AI** converts that raw observational record into an **AI-ready, cloud-optimized, tabular Parquet format** hosted directly on Google Cloud Storage.
+
+---
+
+## 🛠 Key Specs & Access
+
+| Attribute | Details |
+| --- | --- |
+| **Data Scope** | Satellite radiances (GOES, ATMS, CrIS, MHS), radiosondes, surface stations, weather balloons. |
+| **Storage Format** | Hive-partitioned Apache Parquet. |
+| **License** | Open Access, **CC BY 4.0**. |
+| **Google Cloud Bucket** | `gs://gcp-nnja-ai` (or `gs://nnja-ai`) |
+
+---
+
+## 📦 How to Access the Data
+
+You can query the Parquet files directly from Google Cloud or use their Python SDK:
+
+### 1. Install the Python SDK
+
+```bash
+pip install nnja-ai
+# or with all optional dependencies:
+pip install "nnja-ai[complete]"
+
+```
+
+### 2. Querying the Catalog
+
+```python
+from nnja_ai import DataCatalog
+
+catalog = DataCatalog()
+print("Available Datasets:", catalog.list_datasets())
+
+```
+
+---
+
+## 🔗 Official Resources & Links
+
+* 🌐 **Brightband Project Page:** [brightband.com/data/nnja-ai](https://www.brightband.com/data/nnja-ai/)
+* 📚 **SDK Documentation:** [nnja-ai.readthedocs.io](https://nnja-ai.readthedocs.io/)
+* 💻 **GitHub Repository:** [github.com/brightbandtech/nnja-ai](https://github.com/brightbandtech/nnja-ai)
+* 🏛 **NOAA PSL Archive Page:** [psl.noaa.gov/data/nnja_obs](https://psl.noaa.gov/data/nnja_obs/)
+
