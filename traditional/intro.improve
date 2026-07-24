@@ -147,3 +147,16 @@ obs_err = obs_err[valid_mask]
 1. **Add `SIGMA_HORIZONTAL` Gaussian filter** into `apply_B_half_var` and `apply_B_half_transpose_var` ($2\text{--}3$ grid cells length scale).
 2. **Increase `DEFAULT_OBS_ERRORS**` for $p$ and $t$ so individual points don't pull the grid unrealistically hard.
 3. Re-run `run_gfs_3dvar_pipeline.py` and inspect `gfs_3dvar_t_level0.png` using `plot_da_analysis.py` to confirm the isolated dots have blended into smooth, continuous synoptic structures!
+
+
+
+
+Component,Strategy & Implementation
+Observation Handling,Automated ingestion from NNJA-AI catalog (conv-adpupa-NC002001) with robust 3.5σ innovation quality control (QC) and fallback generation.
+B-Matrix Operators,Cholesky-decomposed vertical correlations coupled with tunable horizontal Gaussian spatial smoothing.
+Wind & Mass Spread,"Broader spatial scales (∼350–450 km) for u,v components to maintain continuous atmospheric jet streams."
+Weak Constraints (Jc​),"Geostrophic Balance (couples ∇δp to δu,δv) + Hydrostatic Balance (couples ∂z∂δp​ to δT)."
+Physical Bounds,Automatic positivity enforcement on specific humidity (q≥0).
+IO / Format,"CF-compliant compressed NetCDF export with full background, analysis, and increment arrays for all 5 variables (p,t,u,v,q)."
+
+
