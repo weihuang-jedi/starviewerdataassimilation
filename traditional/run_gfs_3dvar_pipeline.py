@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-Complete 3D-Var Data Assimilation Pipeline for GFS / Anemoi Environment
-------------------------------------------------------------------------
-Ingests:
-  1. GFS Background State NetCDF (x_b)
-  2. Generated B-Matrix Statistics NetCDF (Variances + Vertical Correlations)
-  3. Real Observations via NNJA-AI Catalog (conv-adpupa-NC002001) or Fallback NetCDF
+Multivariate 3D-Var Data Assimilation Pipeline (NNJA-AI Ingestion)
+------------------------------------------------------------------
+Assimilates 5 State Variables: [p, t, u, v, q]
 
-Outputs:
-  CF-Compliant NetCDF containing Background (x_b), Analysis (x_a),
-  and Analysis Increments (delta_x).
+Directly queries NNJA-AI 'conv-adpupa-NC002001' catalog for upper-air sounding data.
+Outputs a CF-compliant NetCDF with [Background, Analysis, Increments].
 """
 
 import argparse
@@ -27,8 +23,26 @@ try:
 except ImportError:
     HAS_NNJA = False
 
-# Suppress minor catalog warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="nnja_ai")
+
+# 5 target variables and NNJA column keywords
+VAR_LIST = ["p", "t", "u", "v", "q"]
+NNJA_VAR_MAP = {
+    "p": ["PRLC", "PRES", "PRSE"],
+    "t": ["TMDB", "TMP"],
+    "u": ["UGRD", "UWND", "U_WIND"],
+    "v": ["VGRD", "VWND", "V_WIND"],
+    "q": ["SPFH", "Q", "HUMI"],
+}
+
+# Standard observational errors (R-matrix terms)
+DEFAULT_OBS_ERRORS = {
+    "p": 1.0,     # hPa
+    "t": 1.0,     # K
+    "u": 1.5,     # m/s
+    "v": 1.5,     # m/s
+    "q": 0.001,   # kg/kg
+}
 
 
 # ==============================================================================
@@ -36,190 +50,196 @@ warnings.filterwarnings("ignore", category=UserWarning, module="nnja_ai")
 # ==============================================================================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run 3D-Var Data Assimilation on GFS Grid with NNJA-AI observations."
+        description="Run 5-Variable [p, t, u, v, q] 3D-Var with NNJA-AI Data Ingestion."
     )
     parser.add_argument(
         "--gfs_file",
         type=str,
         required=True,
-        help="Path to GFS NetCDF file containing background forecast state.",
+        help="Path to GFS background NetCDF file.",
     )
     parser.add_argument(
         "--bmatrix_file",
         type=str,
         required=True,
-        help="Path to B-Matrix NetCDF file containing error variances and correlations.",
+        help="Path to B-Matrix error statistics NetCDF file.",
     )
     parser.add_argument(
         "--time",
         type=str,
         default="2023-07-01",
-        help="Assimilation date/time string (e.g. '2023-07-01' or '2023-07-01T06:00:00').",
-    )
-    parser.add_argument(
-        "--obs_file",
-        type=str,
-        default=None,
-        help="Optional path to local observation NetCDF. If omitted, NNJA-AI catalog is queried.",
-    )
-    parser.add_argument(
-        "--var_name",
-        type=str,
-        default="t",
-        help="Variable name to assimilate (e.g., 't', 'u', 'v', 'q'). Default: 't'",
+        help="Assimilation date (e.g., '2023-07-01').",
     )
     parser.add_argument(
         "--output",
         type=str,
-        default="gfs_3dvar_analysis.nc",
-        help="Output NetCDF file name. Default: 'gfs_3dvar_analysis.nc'",
+        default="gfs_5var_3dvar_analysis.nc",
+        help="Output NetCDF file path.",
     )
     parser.add_argument(
         "--max_iter",
         type=int,
         default=30,
-        help="Maximum iterations for L-BFGS-B optimizer. Default: 30",
+        help="Maximum iterations for L-BFGS-B optimizer.",
     )
     return parser.parse_args()
 
 
 # ==============================================================================
-# 2. DATA INGESTION & B-MATRIX LOADING
+# 2. DATA & COVARIANCE LOADING
 # ==============================================================================
-def load_gfs_and_bmatrix(gfs_path: str, bmatrix_path: str, var_name: str):
-    """Loads 3D background state, grid coordinates, and B-matrix statistics."""
-    print(f"[1/5] Loading Background State from: {gfs_path}")
+def load_gfs_and_bmatrix(gfs_path: str, bmatrix_path: str):
+    """Loads 5-variable background states and B-matrix terms."""
+    print(f"[1/5] Loading Background State [p, t, u, v, q] from: {gfs_path}")
+    x_b_dict = {}
+    sigma_b_dict = {}
+    L_v_dict = {}
+
     with xr.open_dataset(gfs_path) as ds_gfs:
-        x_b = ds_gfs[var_name].values.astype(np.float64)  # (height, lat, lon)
         heights = ds_gfs["height"].values.astype(np.float64)
         lats = ds_gfs["latitude"].values.astype(np.float64)
         lons = ds_gfs["longitude"].values.astype(np.float64)
 
-    # Ensure latitude coordinates are strictly ascending
-    lat_asc = np.all(np.diff(lats) > 0)
-    if not lat_asc:
-        lats = lats[::-1]
-        x_b = np.flip(x_b, axis=1)
+        lat_asc = np.all(np.diff(lats) > 0)
+        if not lat_asc:
+            lats = lats[::-1]
+
+        for var in VAR_LIST:
+            val = ds_gfs[var].values.astype(np.float64)
+            if not lat_asc:
+                val = np.flip(val, axis=1)
+            x_b_dict[var] = val
 
     print(f"[2/5] Loading B-Matrix Error Statistics from: {bmatrix_path}")
     with xr.open_dataset(bmatrix_path) as ds_b:
-        var_3d = ds_b[f"{var_name}_var"].values.astype(np.float64)
-        if not lat_asc:
-            var_3d = np.flip(var_3d, axis=1)
+        for var in VAR_LIST:
+            var_3d = ds_b[f"{var}_var"].values.astype(np.float64)
+            if not lat_asc:
+                var_3d = np.flip(var_3d, axis=1)
 
-        sigma_b = np.sqrt(np.maximum(var_3d, 1e-8))
+            sigma_b_dict[var] = np.sqrt(np.maximum(var_3d, 1e-8))
 
-        vert_corr = ds_b[f"{var_name}_vert_corr"].values.astype(np.float64)
-        vert_corr += np.eye(vert_corr.shape[0]) * 1e-6
-        L_v = cholesky(vert_corr, lower=True)
+            vert_corr = ds_b[f"{var}_vert_corr"].values.astype(np.float64)
+            vert_corr += np.eye(vert_corr.shape[0]) * 1e-6
+            L_v_dict[var] = cholesky(vert_corr, lower=True)
 
-    return x_b, sigma_b, L_v, heights, lats, lons
+    return x_b_dict, sigma_b_dict, L_v_dict, heights, lats, lons
 
 
 # ==============================================================================
-# 3. NNJA-AI OBSERVATION FETCHING & CLEANING
+# 3. NNJA-AI CATALOG INGESTION ENGINE
 # ==============================================================================
-def fetch_nnja_observations(time_str: str, heights, lats, lons, x_b):
-    """Fetches real radiosonde observations from NNJA-AI catalog."""
+def fetch_nnja_observations(time_str: str, heights, lats, lons, x_b_dict):
+    """Queries NNJA-AI catalog for [p, t, u, v, q] sounding profiles."""
+    obs_dict = {}
+
     if not HAS_NNJA:
-        print("Warning: 'nnja_ai' library not installed. Falling back to synthetic obs.")
-        return generate_synthetic_observations(heights, lats, lons, x_b)
+        print("Warning: 'nnja_ai' not installed. Falling back to synthetic obs.")
+        return generate_synthetic_obs_all(heights, lats, lons, x_b_dict)
 
-    # Extract date part (YYYY-MM-DD) for NNJA-AI dataset manifest indexing
+    # Use date string YYYY-MM-DD for NNJA-AI manifest lookup
     date_part = time_str.split("T")[0]
     print(f"\n[3/5] Querying NNJA-AI Catalog ('conv-adpupa-NC002001') for date: {date_part}...")
 
     try:
         catalog = DataCatalog(mirror="gcp_brightband")
         ds_upr = catalog["conv-adpupa-NC002001"]
-        subset = ds_upr.sel(time=date_part)  # Select by date string
+        subset = ds_upr.sel(time=date_part)
         df_upr = subset.load_dataset(backend="pandas")
     except Exception as e:
-        print(f"Error accessing NNJA-AI catalog: {e}. Falling back to synthetic obs.")
-        return generate_synthetic_observations(heights, lats, lons, x_b)
+        print(f"NNJA access notice: {e}. Falling back to domain synthetic obs.")
+        return generate_synthetic_obs_all(heights, lats, lons, x_b_dict)
 
     if df_upr.empty:
-        print("Warning: Retrieved empty observation dataset. Falling back to synthetic obs.")
-        return generate_synthetic_observations(heights, lats, lons, x_b)
+        print("Retrieved empty dataset from NNJA-AI. Falling back to synthetic obs.")
+        return generate_synthetic_obs_all(heights, lats, lons, x_b_dict)
 
-    # Normalize Longitudes to match GFS grid domain
+    # Normalize longitudes to match background domain
     grid_lon_min, grid_lon_max = lons.min(), lons.max()
     if grid_lon_min < 0:
         df_upr["LON"] = np.where(df_upr["LON"] > 180, df_upr["LON"] - 360, df_upr["LON"])
     else:
         df_upr["LON"] = np.where(df_upr["LON"] < 0, df_upr["LON"] + 360, df_upr["LON"])
 
-    temp_cols = [c for c in df_upr.columns if "TMDB" in c or "TMP" in c]
-
-    obs_records = []
     lat_min, lat_max = lats.min(), lats.max()
     h_min, h_max = heights.min(), heights.max()
 
-    for _, row in df_upr.iterrows():
-        lat, lon = row["LAT"], row["LON"]
-        if not (lat_min <= lat <= lat_max and grid_lon_min <= lon <= grid_lon_max):
-            continue
+    for var in VAR_LIST:
+        keywords = NNJA_VAR_MAP[var]
+        match_cols = [c for c in df_upr.columns if any(k in c for k in keywords)]
 
-        for col in temp_cols:
-            val = row[col]
-            if pd.notna(val) and -100.0 < val < 350.0:
-                p_level = 850.0
-                for p in [1000, 925, 850, 700, 500, 300, 250, 200, 100]:
-                    if str(p) in col:
-                        p_level = float(p)
-                        break
+        records = []
+        for _, row in df_upr.iterrows():
+            lat, lon = row["LAT"], row["LON"]
+            if not (lat_min <= lat <= lat_max and grid_lon_min <= lon <= grid_lon_max):
+                continue
 
-                # Map pressure level to height in meters
-                h_approx = 44330.0 * (1.0 - (p_level / 1013.25)**0.1903)
-                h_clamped = np.clip(h_approx, h_min, h_max)
+            for col in match_cols:
+                val = row[col]
+                if pd.notna(val) and not np.isnan(val):
+                    p_level = 850.0
+                    for p in [1000, 925, 850, 700, 500, 300, 250, 200, 100]:
+                        if str(p) in col:
+                            p_level = float(p)
+                            break
 
-                if val < 150.0:
-                    val += 273.15
+                    h_approx = 44330.0 * (1.0 - (p_level / 1013.25)**0.1903)
+                    h_clamped = np.clip(h_approx, h_min, h_max)
 
-                obs_records.append({
-                    "height": h_clamped,
-                    "latitude": lat,
-                    "longitude": lon,
-                    "observation_value": val,
-                    "observation_error": 1.0
-                })
+                    # Temperature units conversion if reported in Celsius
+                    if var == "t" and val < 150.0:
+                        val += 273.15
 
-    obs_df = pd.DataFrame(obs_records)
+                    records.append({
+                        "height": h_clamped,
+                        "latitude": lat,
+                        "longitude": lon,
+                        "observation_value": float(val),
+                        "observation_error": DEFAULT_OBS_ERRORS[var],
+                    })
 
-    if obs_df.empty:
-        print("Warning: No observations found inside domain. Falling back to synthetic obs.")
-        return generate_synthetic_observations(heights, lats, lons, x_b)
+        df_var = pd.DataFrame(records)
 
-    print(f"Successfully ingested {len(obs_df)} observation points from NNJA-AI.")
+        if df_var.empty:
+            print(f"No real observations found for '{var}'. Generating domain fallback.")
+            obs_dict[var] = generate_single_synth_obs(heights, lats, lons, x_b_dict[var], var)
+        else:
+            obs_dict[var] = (
+                df_var["height"].values,
+                df_var["latitude"].values,
+                df_var["longitude"].values,
+                df_var["observation_value"].values,
+                df_var["observation_error"].values,
+            )
+            print(f"Ingested {len(df_var)} observation points for variable '{var}'.")
 
-    return (
-        obs_df["height"].values,
-        obs_df["latitude"].values,
-        obs_df["longitude"].values,
-        obs_df["observation_value"].values,
-        obs_df["observation_error"].values,
-    )
+    return obs_dict
 
 
-def generate_synthetic_observations(heights, lats, lons, x_b, n_obs=150):
-    """Realistic synthetic observation generator sampled from background state."""
-    print(f"Generating {n_obs} synthetic observations anchored to x_b...")
+def generate_single_synth_obs(heights, lats, lons, x_b_var, var_name, n_obs=120):
+    """Generates synthetic obs anchored to x_b if real field obs are missing."""
     np.random.seed(42)
     obs_h = np.random.uniform(heights.min(), heights.max(), n_obs)
     obs_lat = np.random.uniform(lats.min(), lats.max(), n_obs)
     obs_lon = np.random.uniform(lons.min(), lons.max(), n_obs)
 
-    H_temp = ObservationOperator3D(heights, lats, lons, obs_h, obs_lat, obs_lon)
-    x_b_obs = H_temp.H(x_b)
+    interp = RegularGridInterpolator((heights, lats, lons), x_b_var, bounds_error=False, fill_value=None)
+    obs_pts = np.column_stack((obs_h, obs_lat, obs_lon))
+    err_std = DEFAULT_OBS_ERRORS[var_name]
+    obs_y = interp(obs_pts) + np.random.normal(0.0, err_std, n_obs)
+    errs = np.full(n_obs, err_std, dtype=np.float64)
+    return obs_h, obs_lat, obs_lon, obs_y, errs
 
-    # Add realistic +0.5 K bias and 1.0 K Gaussian error
-    obs_values = x_b_obs + np.random.normal(0.5, 1.0, n_obs)
-    errors = np.full(n_obs, 1.0, dtype=np.float64)
-    return obs_h, obs_lat, obs_lon, obs_values, errors
+
+def generate_synthetic_obs_all(heights, lats, lons, x_b_dict):
+    obs_dict = {}
+    for var in VAR_LIST:
+        obs_dict[var] = generate_single_synth_obs(heights, lats, lons, x_b_dict[var], var)
+    return obs_dict
 
 
 # ==============================================================================
-# 4. OBSERVATION OPERATOR (TRILINEAR INTERPOLATION & ADJOINT)
+# 4. TRILINEAR OBSERVATION OPERATOR & ADJOINT
 # ==============================================================================
 class ObservationOperator3D:
     def __init__(self, heights, lats, lons, obs_heights, obs_lats, obs_lons):
@@ -264,122 +284,140 @@ class ObservationOperator3D:
 
 
 # ==============================================================================
-# 5. CONTROL VARIABLE TRANSFORM & 3D-VAR COST FUNCTION
+# 5. MULTIVARIATE 3D-VAR COST FUNCTION & GRADIENT
 # ==============================================================================
-def apply_B_half(v, L_v, sigma_b, grid_shape):
+def apply_B_half_var(v_single, L_v, sigma_b, grid_shape):
     n_lev = grid_shape[0]
-    v_3d = v.reshape(grid_shape)
+    v_3d = v_single.reshape(grid_shape)
     v_vert = (L_v @ v_3d.reshape(n_lev, -1)).reshape(grid_shape)
     return sigma_b * v_vert
 
 
-def apply_B_half_transpose(r, L_v, sigma_b, grid_shape):
+def apply_B_half_transpose_var(r_single, L_v, sigma_b, grid_shape):
     n_lev = grid_shape[0]
-    r_scaled = sigma_b * r.reshape(grid_shape)
+    r_scaled = sigma_b * r_single.reshape(grid_shape)
     r_flat = r_scaled.reshape(n_lev, -1)
     v_grad = (L_v.T @ r_flat).reshape(grid_shape)
     return v_grad.ravel()
 
 
-def cost_function_and_gradient(v, H_op, y_obs, sigma_o, x_b, L_v, sigma_b, grid_shape):
-    delta_x = apply_B_half(v, L_v, sigma_b, grid_shape)
-    x_state = x_b + delta_x
+def cost_function_and_gradient_multivariate(
+    v_stacked, h_ops_dict, obs_dict, x_b_dict, L_v_dict, sigma_b_dict, grid_shape
+):
+    n_grid = np.prod(grid_shape)
+    J_b = 0.5 * np.sum(v_stacked**2)
+    J_o = 0.0
 
-    H_x = H_op.H(x_state)
-    d = y_obs - H_x
+    grad_stacked = np.copy(v_stacked)
 
-    J_b = 0.5 * np.sum(v**2)
-    J_o = 0.5 * np.sum((d / sigma_o)**2)
+    for idx, var in enumerate(VAR_LIST):
+        v_var = v_stacked[idx * n_grid : (idx + 1) * n_grid]
+
+        delta_x = apply_B_half_var(v_var, L_v_dict[var], sigma_b_dict[var], grid_shape)
+        x_state = x_b_dict[var] + delta_x
+
+        H_op = h_ops_dict[var]
+        _, _, _, obs_y, obs_err = obs_dict[var]
+
+        H_x = H_op.H(x_state)
+        d = obs_y - H_x
+
+        J_o += 0.5 * np.sum((d / obs_err)**2)
+
+        obs_adj_input = -d / (obs_err**2)
+        grid_adj_input = H_op.H_adjoint(obs_adj_input)
+        grad_v_var = apply_B_half_transpose_var(
+            grid_adj_input, L_v_dict[var], sigma_b_dict[var], grid_shape
+        )
+
+        grad_stacked[idx * n_grid : (idx + 1) * n_grid] += grad_v_var
+
     J_total = J_b + J_o
-
-    obs_adj_input = -d / (sigma_o**2)
-    grid_adj_input = H_op.H_adjoint(obs_adj_input)
-    grad_v = v + apply_B_half_transpose(grid_adj_input, L_v, sigma_b, grid_shape)
-
-    return J_total, grad_v
+    return J_total, grad_stacked
 
 
 # ==============================================================================
-# 6. MAIN PIPELINE EXECUTION
+# 6. PIPELINE DRIVER
 # ==============================================================================
 def main():
     args = parse_args()
 
-    # Step 1: Load GFS background and B-matrix
-    x_b, sigma_b, L_v, heights, lats, lons = load_gfs_and_bmatrix(
-        args.gfs_file, args.bmatrix_file, args.var_name
+    # Step 1: Ingest Background State and Covariances
+    x_b_dict, sigma_b_dict, L_v_dict, heights, lats, lons = load_gfs_and_bmatrix(
+        args.gfs_file, args.bmatrix_file
     )
-    grid_shape = x_b.shape
-    print(f"Domain Shape: Height={grid_shape[0]}, Lat={grid_shape[1]}, Lon={grid_shape[2]}")
+    grid_shape = x_b_dict["t"].shape
+    n_grid = np.prod(grid_shape)
 
-    # Step 2: Fetch Observations
-    if args.obs_file:
-        print(f"\n[3/5] Ingesting Observations from NetCDF File: {args.obs_file}")
-        with xr.open_dataset(args.obs_file) as ds_obs:
-            obs_h = ds_obs["height"].values
-            obs_lat = ds_obs["latitude"].values
-            obs_lon = ds_obs["longitude"].values
-            obs_y = ds_obs["observation_value"].values
-            obs_err = ds_obs["observation_error"].values
-    else:
-        obs_h, obs_lat, obs_lon, obs_y, obs_err = fetch_nnja_observations(
-            args.time, heights, lats, lons, x_b
-        )
+    # Step 2: Fetch NNJA-AI Observations
+    obs_dict = fetch_nnja_observations(args.time, heights, lats, lons, x_b_dict)
 
-    # Initialize Forward Operator
-    H_op = ObservationOperator3D(heights, lats, lons, obs_h, obs_lat, obs_lon)
+    # Setup forward operators
+    h_ops_dict = {}
+    for var in VAR_LIST:
+        obs_h, obs_lat, obs_lon, _, _ = obs_dict[var]
+        h_ops_dict[var] = ObservationOperator3D(heights, lats, lons, obs_h, obs_lat, obs_lon)
 
-    # Step 3: Run 3D-Var Minimization
-    print("\n[4/5] Running Incremental 3D-Var Minimization (L-BFGS-B)...")
-    v0 = np.zeros(np.prod(grid_shape), dtype=np.float64)
+    # Step 3: Run Joint 5-Variable Minimization
+    print("\n[4/5] Minimizing Cost Function J(v) over [p, t, u, v, q]...")
+    v0_stacked = np.zeros(5 * n_grid, dtype=np.float64)
 
-    # Note: 'disp' removed from options dict to prevent SciPy warning
     opt_result = minimize(
-        fun=cost_function_and_gradient,
-        x0=v0,
-        args=(H_op, obs_y, obs_err, x_b, L_v, sigma_b, grid_shape),
+        fun=cost_function_and_gradient_multivariate,
+        x0=v0_stacked,
+        args=(h_ops_dict, obs_dict, x_b_dict, L_v_dict, sigma_b_dict, grid_shape),
         method="L-BFGS-B",
         jac=True,
         options={"maxiter": args.max_iter},
     )
 
-    # Step 4: Reconstruct Analysis State (x_a = x_b + delta_x)
-    v_opt = opt_result.x
-    delta_x_opt = apply_B_half(v_opt, L_v, sigma_b, grid_shape)
-    x_a = x_b + delta_x_opt
+    v_opt_stacked = opt_result.x
+    print(f"\n3D-Var Convergence Finished in {opt_result.nit} iterations!")
 
-    print(f"\n3D-Var Convergence Finished!")
-    print(f"Max Absolute Increment: {np.max(np.abs(delta_x_opt)):.4f} K")
-    print(f"Mean Increment: {np.mean(delta_x_opt):.4f} K")
+    # Step 4: Reconstruct 5-Variable Analysis and Increments
+    x_a_dict = {}
+    delta_x_dict = {}
 
-    # Step 5: Export Results to NetCDF
-    print(f"\n[5/5] Exporting Analysis Results to NetCDF: '{args.output}'")
+    for idx, var in enumerate(VAR_LIST):
+        v_opt_var = v_opt_stacked[idx * n_grid : (idx + 1) * n_grid]
+        delta_x = apply_B_half_var(v_opt_var, L_v_dict[var], sigma_b_dict[var], grid_shape)
+        delta_x_dict[var] = delta_x
+        x_a_dict[var] = x_b_dict[var] + delta_x
+
+        print(f"Var '{var.upper()}' | Max Abs Increment: {np.max(np.abs(delta_x)):.4e}")
+
+    # Step 5: Export Analysis NetCDF File
+    print(f"\n[5/5] Saving Output NetCDF to: '{args.output}'")
+    data_vars = {}
+
+    for var in VAR_LIST:
+        data_vars[f"{var}_background"] = (
+            ["height", "latitude", "longitude"],
+            x_b_dict[var].astype(np.float32),
+            {"long_name": f"GFS Background State ({var.upper()})"},
+        )
+        data_vars[f"{var}_analysis"] = (
+            ["height", "latitude", "longitude"],
+            x_a_dict[var].astype(np.float32),
+            {"long_name": f"3D-Var Analysis State ({var.upper()})"},
+        )
+        data_vars[f"{var}_increment"] = (
+            ["height", "latitude", "longitude"],
+            delta_x_dict[var].astype(np.float32),
+            {"long_name": f"3D-Var Analysis Increment ({var.upper()})"},
+        )
+
     ds_out = xr.Dataset(
-        data_vars={
-            f"{args.var_name}_background": (
-                ["height", "latitude", "longitude"],
-                x_b.astype(np.float32),
-                {"long_name": "GFS Background Forecast State"},
-            ),
-            f"{args.var_name}_analysis": (
-                ["height", "latitude", "longitude"],
-                x_a.astype(np.float32),
-                {"long_name": "3D-Var Analysis State"},
-            ),
-            f"{args.var_name}_increment": (
-                ["height", "latitude", "longitude"],
-                delta_x_opt.astype(np.float32),
-                {"long_name": "3D-Var Analysis Increment (x_a - x_b)"},
-            ),
-        },
+        data_vars=data_vars,
         coords={
             "height": heights,
             "latitude": lats,
             "longitude": lons,
         },
         attrs={
-            "title": "GFS 3D-Var Analysis Output",
+            "title": "5-Variable GFS 3D-Var Analysis Output",
             "institution": "Anemoi DA Environment",
+            "assimilated_variables": "p, t, u, v, q",
             "optimization_status": str(opt_result.message),
             "iterations": str(opt_result.nit),
         },

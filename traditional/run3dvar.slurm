@@ -10,12 +10,11 @@
 
 set -x
 
-cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation
+cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/traditional
 
 python run_gfs_3dvar_pipeline.py \
-    --gfs_file data/regular_grid/gfs.20230701.t06z.1p00.f006.nc \
-    --bmatrix_file bmatrix/bmatrix_from_gfs_analysis.nc \
+    --gfs_file ../data/regular_grid/gfs.20230701.t06z.1p00.f006.nc \
+    --bmatrix_file ../bmatrix/bmatrix_from_gfs_analysis.nc \
     --time "2023-07-01" \
-    --var_name t \
     --output gfs.20230701.t12z.1p00.anal.nc \
     --max_iter 30
