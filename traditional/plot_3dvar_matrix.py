@@ -34,7 +34,7 @@ def plot_increment_matrix(nc_file: str, output_png: str = "3dvar_increment_matri
 
     lon_name = get_coord_name(ds, ["longitude", "lon"])
     lat_name = get_coord_name(ds, ["latitude", "lat"])
-    h_name = get_coord_name(ds, ["height", "level", "lev", "plev"])
+    h_name = get_coord_name(ds, ["height", "level", "lev", "z"])
 
     lons = ds[lon_name].values
     lats = ds[lat_name].values

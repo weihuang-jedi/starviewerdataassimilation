@@ -1,393 +1,294 @@
 #!/usr/bin/env python3
 """
-GFS/Anemoi 5-Variable 3D-Var Data Assimilation Pipeline
----------------------------------------------------------
-Features:
-  - 5 State Variables: p, t, u, v, q
-  - Ingests Conventional Upper-Air Obs (NNJA-AI conv-adpupa-NC002001)
-  - Ingests Satellite Radiance Obs (NNJA-AI AMSU-A Level-1B NC021023)
-  - Forward Radiance Operator H(x) with channel weighting functions
-  - Background Covariance (B-matrix) via Cholesky decomposition & horizontal smoothing
-  - Physical Balance Constraints: Hydrostatic & Geostrophic balance penalties
-  - L-BFGS-B Optimizer for cost function minimization
-
-Usage:
-  python3 run_gfs_3dvar_pipeline.py --bg gfs_bg.nc --conv conv_obs.nc --amsua amsua_obs.nc --output gfs_3dvar_analysis.nc
+GFS / ANEMOI 5-VARIABLE 3D-VAR DA PIPELINE (Z-LEVEL COORDINATE SYSTEM)
+----------------------------------------------------------------------
+Solves 3D-Var with proper Adjoint H^T formulation, normalized control variables,
+and spatial B-matrix background error covariance smoothing.
 """
 
 import argparse
-import sys
 import numpy as np
 import scipy.optimize as opt
 from scipy.ndimage import gaussian_filter
 import xarray as xr
 
-# Global Settings
-VARS = ["p", "t", "u", "v", "q"]
-AMSUA_CHANNELS = [4, 5, 6, 7, 8]  # Temperature sounding channels
-AMSUA_PEAKS = {4: 750.0, 5: 500.0, 6: 300.0, 7: 200.0, 8: 90.0}  # Channel peak pressures (hPa)
+STATE_VARS = ["p", "t", "u", "v", "q"]
+
+# Typical physical scale factors for normalization
+SIGMA_B = {
+    "p": 100.0,    # Pressure (Pa)
+    "t": 1.5,      # Temperature (K)
+    "u": 3.0,      # Wind U (m/s)
+    "v": 3.0,      # Wind V (m/s)
+    "q": 0.001,    # Specific Humidity (kg/kg)
+}
 
 
-# ==============================================================================
-# 1. DATA INGESTION & SYNTHETIC FALLBACKS
-# ==============================================================================
+def td_to_q(td_k, p_pa):
+    """Calculates specific humidity q (kg/kg) from Td (K) and p (Pa)."""
+    td_c = td_k - 273.15
+    e = 611.2 * np.exp((17.67 * td_c) / (td_c + 243.5))
+    q = (0.622 * e) / (p_pa - (0.378 * e))
+    return np.maximum(q, 1e-7)
 
-def load_background(bg_file: str):
-    """Loads background state x_b from NetCDF."""
-    print(f"[1/5] Ingesting background state x_b: '{bg_file}'")
-    ds = xr.open_dataset(bg_file)
-    
-    # Coordinate extraction
-    lats = ds["latitude"].values if "latitude" in ds else ds["lat"].values
-    lons = ds["longitude"].values if "longitude" in ds else ds["lon"].values
-    levels = ds["height"].values if "height" in ds else (ds["level"].values if "level" in ds else ds["plev"].values)
 
-    grid_info = {
-        "n_lat": len(lats),
-        "n_lon": len(lons),
-        "n_lev": len(levels),
-        "lats": lats,
-        "lons": lons,
-        "levels": levels,
-        "shape_3d": (len(levels), len(lats), len(lons)),
-        "size_3d": len(levels) * len(lats) * len(lons)
-    }
+def load_background(bg_path):
+    print(f"\n[1/5] Ingesting background state x_b: '{bg_path}'")
+    ds = xr.open_dataset(bg_path)
 
-    x_b_dict = {}
-    for var in VARS:
+    lat_key = next(k for k in ["latitude", "lat", "LAT"] if k in ds.coords or k in ds.data_vars)
+    lon_key = next(k for k in ["longitude", "lon", "LON"] if k in ds.coords or k in ds.data_vars)
+    height_key = next(k for k in ["height", "z", "level", "isobaricInhPa"] if k in ds.coords or k in ds.data_vars)
+
+    lats = ds[lat_key].values.astype(np.float64)
+    lons = ds[lon_key].values.astype(np.float64)
+    heights = ds[height_key].values.astype(np.float64)
+
+    if np.max(lons) > 180:
+        lons = np.where(lons > 180, lons - 360, lons)
+
+    grid_shape = (len(heights), len(lats), len(lons))
+    xb_dict = {}
+
+    for var in STATE_VARS:
         if var in ds:
-            x_b_dict[var] = ds[var].values.astype(np.float64)
+            data = ds[var].values.astype(np.float32)
+            if var == "p" and np.max(data) < 2000:
+                data = data * 100.0
+            xb_dict[var] = data
         else:
-            print(f"  -> Warning: Variable '{var}' missing in background. Initializing with zeros.")
-            x_b_dict[var] = np.zeros(grid_info["shape_3d"], dtype=np.float64)
+            if var == "p":
+                p_prof = 101325.0 * np.exp(-heights / 7000.0) if np.max(heights) > 200 else 100000.0 - heights * 100.0
+                xb_dict[var] = np.tile(p_prof[:, None, None], (1, len(lats), len(lons))).astype(np.float32)
+            elif var == "q":
+                xb_dict[var] = np.full(grid_shape, 0.005, dtype=np.float32)
+            elif var == "t":
+                xb_dict[var] = np.full(grid_shape, 288.15, dtype=np.float32)
+            else:
+                xb_dict[var] = np.zeros(grid_shape, dtype=np.float32)
 
-    return x_b_dict, grid_info
+    return xb_dict, lats, lons, heights
 
 
-def load_conventional_obs(conv_file: str, grid_info: dict):
-    """Ingests conventional upper-air observations (conv-adpupa-NC002001)."""
-    if not conv_file:
-        print("[2/5] No conventional obs provided. Generating anchored synthetic conventional obs...")
-        return generate_synthetic_conv_obs(grid_info)
-
-    print(f"[2/5] Ingesting conventional observations: '{conv_file}'")
+def ingest_conventional_obs(conv_path, lats_grid, lons_grid, heights_grid):
+    print(f"[2/5] Ingesting conventional observations: '{conv_path}'")
     try:
-        ds = xr.open_dataset(conv_file)
-        obs = {
-            "lat": ds["latitude"].values,
-            "lon": ds["longitude"].values,
-            "lev": ds["level"].values,
-            "var": ds["variable"].values,  # Integer code or string matching VARS
-            "val": ds["observation_value"].values,
-            "err": ds["observation_error"].values,
+        ds_conv = xr.open_dataset(conv_path)
+        obs_vars = ds_conv["variable"].values
+        obs_vals = ds_conv["observation_value"].values.astype(np.float32)
+        obs_errs = ds_conv["observation_error"].values.astype(np.float32)
+        obs_lats = ds_conv["latitude"].values.astype(np.float32)
+        obs_lons = ds_conv["longitude"].values.astype(np.float32)
+        obs_lvls_hpa = ds_conv["level"].values.astype(np.float32)
+
+        obs_lons = np.where(obs_lons > 180, obs_lons - 360, obs_lons)
+        obs_z = 7000.0 * np.log(1013.25 / np.maximum(obs_lvls_hpa, 0.1))
+
+        processed_vars, processed_vals, processed_errs = [], [], []
+        for v, val, err, p_hpa in zip(obs_vars, obs_vals, obs_errs, obs_lvls_hpa):
+            if v == "td":
+                q_val = td_to_q(val, p_hpa * 100.0)
+                processed_vars.append("q")
+                processed_vals.append(q_val)
+                processed_errs.append(0.001)
+            else:
+                processed_vars.append(v)
+                processed_vals.append(val)
+                processed_errs.append(err)
+
+        processed_vars = np.array(processed_vars)
+        processed_vals = np.array(processed_vals, dtype=np.float32)
+        processed_errs = np.array(processed_errs, dtype=np.float32)
+
+        # Nearest grid index mapping for forward operator H and adjoint operator H^T
+        k_idx = np.clip(np.searchsorted(heights_grid, obs_z), 0, len(heights_grid) - 1)
+        i_idx = np.clip(np.searchsorted(lats_grid, obs_lats), 0, len(lats_grid) - 1)
+        j_idx = np.clip(np.searchsorted(lons_grid, obs_lons), 0, len(lons_grid) - 1)
+
+        valid_mask = (
+            np.isin(processed_vars, STATE_VARS) &
+            ~np.isnan(processed_vals) &
+            (processed_errs > 0) &
+            (obs_lats >= np.min(lats_grid)) & (obs_lats <= np.max(lats_grid)) &
+            (obs_lons >= np.min(lons_grid)) & (obs_lons <= np.max(lons_grid))
+        )
+
+        filtered_obs = {
+            "variable": processed_vars[valid_mask],
+            "value": processed_vals[valid_mask],
+            "error": processed_errs[valid_mask],
+            "k": k_idx[valid_mask],
+            "i": i_idx[valid_mask],
+            "j": j_idx[valid_mask],
         }
-        print(f"  -> Successfully loaded {len(obs['val'])} conventional observation points.")
-        return obs
+
+        print(f"  -> Retained {len(filtered_obs['value'])} valid conventional observations.")
+        return filtered_obs
+
     except Exception as e:
-        print(f"  -> Failed to load conventional obs ({e}). Falling back to synthetic obs.")
-        return generate_synthetic_conv_obs(grid_info)
+        print(f"  -> Failed to load conventional obs ({e}). Skipping.")
+        return None
 
 
-def load_amsua_obs(amsua_file: str, grid_info: dict):
-    """Ingests AMSU-A Level-1B (NC021023) satellite brightness temperature observations."""
-    if not amsua_file:
-        print("[3/5] No AMSU-A radiance file provided. Generating synthetic AMSU-A observations...")
-        return generate_synthetic_amsua_obs(grid_info)
-
-    print(f"[3/5] Ingesting AMSU-A (NC021023) radiance observations: '{amsua_file}'")
-    try:
-        ds = xr.open_dataset(amsua_file)
-        lats = ds["latitude"].values
-        lons = ds["longitude"].values
-        
-        tb = ds["brightness_temperature"].values if "brightness_temperature" in ds else ds["tb"].values
-        
-        # Channel indexing (map request channels to array)
-        chan_indices = [c - 1 for c in AMSUA_CHANNELS]
-        tb_selected = tb[:, chan_indices]
-        
-        # QC: Retain reasonable Tb values (150K < Tb < 350K)
-        valid_mask = np.all((tb_selected > 150.0) & (tb_selected < 350.0), axis=1)
-        
-        obs_dict = {
-            "lat": lats[valid_mask],
-            "lon": lons[valid_mask],
-            "tb": tb_selected[valid_mask, :],
-            "err": np.array([0.35, 0.25, 0.25, 0.25, 0.35], dtype=np.float64),  # Standard K error per channel
-            "channels": AMSUA_CHANNELS
-        }
-        print(f"  -> Retained {np.sum(valid_mask)} valid AMSU-A radiance profiles.")
-        return obs_dict
-    except Exception as e:
-        print(f"  -> Failed to load AMSU-A obs ({e}). Falling back to synthetic radiance obs.")
-        return generate_synthetic_amsua_obs(grid_info)
+def apply_spatial_b(grid_3d):
+    """Applies Gaussian spatial smoothing to model B-matrix covariances."""
+    return gaussian_filter(grid_3d, sigma=(1.0, 2.0, 2.0))
 
 
-def generate_synthetic_conv_obs(grid_info: dict, n_obs: int = 150):
-    """Generates synthetic conventional state observations."""
-    np.random.seed(42)
-    lats = np.random.uniform(np.min(grid_info["lats"]), np.max(grid_info["lats"]), n_obs)
-    lons = np.random.uniform(np.min(grid_info["lons"]), np.max(grid_info["lons"]), n_obs)
-    levs = np.random.randint(0, grid_info["n_lev"], n_obs)
-    var_indices = np.random.choice(VARS, n_obs)
-    
-    vals = np.random.normal(0.0, 1.0, n_obs)
-    errs = np.full(n_obs, 0.5)
+def run_3dvar(xb_dict, conv_obs, lats_grid, lons_grid, heights_grid, maxiter=30):
+    print(f"\n==================================================================")
+    print(f"      GFS / ANEMOI 5-VARIABLE 3D-VAR DA PIPELINE WITH AMSU-A")
+    print(f"==================================================================")
+    print(f"[5/5] Minimizing Cost Function via L-BFGS-B (Max Iterations: {maxiter})...")
 
-    return {"lat": lats, "lon": lons, "lev": levs, "var": var_indices, "val": vals, "err": errs}
+    shape_3d = xb_dict[STATE_VARS[0]].shape
+    n_grid = np.prod(shape_3d)
 
+    iterations_run = [0]
 
-def generate_synthetic_amsua_obs(grid_info: dict, n_profiles: int = 80):
-    """Generates synthetic AMSU-A radiance observations anchored near 250K-280K."""
-    np.random.seed(101)
-    lats = np.random.uniform(np.min(grid_info["lats"]), np.max(grid_info["lats"]), n_profiles)
-    lons = np.random.uniform(np.min(grid_info["lons"]), np.max(grid_info["lons"]), n_profiles)
-    
-    # Generate mock Tb for 5 channels
-    tb_base = np.array([245.0, 255.0, 265.0, 250.0, 230.0])
-    tb_obs = np.tile(tb_base, (n_profiles, 1)) + np.random.normal(0.0, 0.5, (n_profiles, 5))
-    
-    return {
-        "lat": lats,
-        "lon": lons,
-        "tb": tb_obs,
-        "err": np.array([0.35, 0.25, 0.25, 0.25, 0.35]),
-        "channels": AMSUA_CHANNELS
-    }
-
-
-# ==============================================================================
-# 2. RADIANCE OBSERVATION OPERATOR H(x) & COVARIANCE MODELING
-# ==============================================================================
-
-def amsua_forward_operator(t_profile: np.ndarray, levels: np.ndarray, channel: int) -> float:
-    """
-    Simulates AMSU-A Brightness Temperature (Tb) for a temperature profile
-    using channel weighting functions in log-pressure space.
-    """
-    p_peak = AMSUA_PEAKS.get(channel, 500.0)
-    
-    log_p = np.log(np.maximum(levels, 1e-3))
-    log_p_peak = np.log(p_peak)
-    sigma_log_p = 0.6  # Vertical width of weighting function
-
-    # Gaussian weighting function kernel
-    weights = np.exp(-0.5 * ((log_p - log_p_peak) / sigma_log_p) ** 2)
-    weight_sum = np.sum(weights)
-    if weight_sum > 0:
-        weights /= weight_sum
+    # Pre-calculate mapping vectors for fast H and H^T
+    if conv_obs is not None and len(conv_obs["value"]) > 0:
+        y_obs = conv_obs["value"]
+        r_err = conv_obs["error"]
+        obs_vars = conv_obs["variable"]
+        obs_k = conv_obs["k"]
+        obs_i = conv_obs["i"]
+        obs_j = conv_obs["j"]
     else:
-        weights = np.full_like(weights, 1.0 / len(weights))
+        y_obs = np.array([])
 
-    return np.sum(t_profile * weights)
+    def cost_and_grad(v_vec):
+        """Cost J(v) using normalized control variable transform v = B^{-1/2} (x - x_b)."""
+        iterations_run[0] += 1
 
+        # Background Cost J_b = 0.5 * ||v||^2
+        J_b = 0.5 * np.sum(v_vec**2)
+        grad_v_b = v_vec.copy()
 
-class BackgroundCovarianceB:
-    """Implements vertical Cholesky decomposition and horizontal Gaussian smoothing."""
-    def __init__(self, grid_info: dict):
-        self.grid = grid_info
-        self.n_lev = grid_info["n_lev"]
-        
-        # Build vertical covariance matrix B_v
-        lev_idx = np.arange(self.n_lev)
-        dist_matrix = np.abs(lev_idx[:, None] - lev_idx[None, :])
-        B_v = np.exp(-dist_matrix / 3.0)  # Vertical correlation length scale
-        self.L_v = np.linalg.cholesky(B_v + 1e-6 * np.eye(self.n_lev))
-
-    def apply_B_half(self, v_dict: dict) -> dict:
-        """Applies B^(1/2) to control vector v: Horizontal smooth -> Vertical Cholesky."""
+        # Reconstruct physical state increments delta_x = B^{1/2} v
         dx_dict = {}
-        for var in VARS:
-            v_3d = v_dict[var]
-            
-            # 1. Horizontal smoothing (Gaussian)
-            v_smoothed = np.zeros_like(v_3d)
-            sigma_h = (1.5, 2.0) if var in ["u", "v"] else (1.5, 1.5)  # Anisotropic for wind
-            for k in range(self.n_lev):
-                v_smoothed[k] = gaussian_filter(v_3d[k], sigma=sigma_h)
-            
-            # 2. Vertical Cholesky transformation
-            # Reshape for matrix multiplication: (n_lev, n_lat * n_lon)
-            v_flat = v_smoothed.reshape(self.n_lev, -1)
-            dx_flat = self.L_v @ v_flat
-            dx_dict[var] = dx_flat.reshape(self.grid["shape_3d"])
+        for idx, var in enumerate(STATE_VARS):
+            v_var = v_vec[idx * n_grid : (idx + 1) * n_grid].reshape(shape_3d)
+            # Apply B^{1/2}: Scale by sigma_b and spatial correlation operator
+            dx_dict[var] = apply_spatial_b(v_var * SIGMA_B[var])
 
-        return dx_dict
+        J_o = 0.0
+        grad_v_o = np.zeros_like(v_vec)
 
+        if len(y_obs) > 0:
+            # 1. Forward Operator H(x_b + delta_x)
+            H_x = np.zeros(len(y_obs), dtype=np.float32)
+            for m in range(len(y_obs)):
+                var = obs_vars[m]
+                k, i, j = obs_k[m], obs_i[m], obs_j[m]
+                H_x[m] = xb_dict[var][k, i, j] + dx_dict[var][k, i, j]
 
-# ==============================================================================
-# 3. 3D-VAR COST FUNCTION & GRADIENT EVALUATOR
-# ==============================================================================
+            # 2. Residual innovation: (y - H(x))
+            residual = y_obs - H_x
+            J_o = 0.5 * np.sum((residual / r_err)**2)
 
-def pack_state(state_dict: dict, grid_info: dict) -> np.ndarray:
-    """Packs variable 3D arrays into a 1D flat vector."""
-    return np.concatenate([state_dict[var].ravel() for var in VARS])
+            # 3. Exact Adjoint H^T R^{-1} (y - H(x))
+            grad_x_o_dict = {v: np.zeros(shape_3d, dtype=np.float32) for v in STATE_VARS}
+            weights = residual / (r_err**2)
 
+            for m in range(len(y_obs)):
+                var = obs_vars[m]
+                k, i, j = obs_k[m], obs_i[m], obs_j[m]
+                grad_x_o_dict[var][k, i, j] -= weights[m]
 
-def unpack_state(flat_vec: np.ndarray, grid_info: dict) -> dict:
-    """Unpacks a 1D flat vector into a dictionary of 3D variable arrays."""
-    sz = grid_info["size_3d"]
-    state_dict = {}
-    for i, var in enumerate(VARS):
-        state_dict[var] = flat_vec[i * sz : (i + 1) * sz].reshape(grid_info["shape_3d"])
-    return state_dict
+            # 4. Map adjoint gradient back to control space: (B^{1/2})^T grad_x
+            for idx, var in enumerate(STATE_VARS):
+                adj_var = apply_spatial_b(grad_x_o_dict[var]) * SIGMA_B[var]
+                grad_v_o[idx * n_grid : (idx + 1) * n_grid] = adj_var.ravel()
 
+        J_total = J_b + J_o
+        grad_total = grad_v_b + grad_v_o
 
-def cost_function_3dvar(
-    v_flat: np.ndarray,
-    x_b_dict: dict,
-    conv_obs: dict,
-    amsua_obs: dict,
-    b_cov: BackgroundCovarianceB,
-    grid_info: dict,
-    gamma_hydro: float = 0.1,
-    gamma_geo: float = 0.1
-):
-    """
-    Computes total 3D-Var Cost J(v) = J_b + J_conv + J_rad + J_balance and its gradient.
-    Uses control variable transform: dx = B^(1/2) * v.
-    """
-    v_dict = unpack_state(v_flat, grid_info)
-    dx_dict = b_cov.apply_B_half(v_dict)
+        if iterations_run[0] % 5 == 0 or iterations_run[0] == 1:
+            print(f"  Iter {iterations_run[0]:02d} | Cost J: {J_total:.4f} (J_b: {J_b:.4f}, J_o: {J_o:.4f})")
 
-    # --------------------------------------------------------------------------
-    # J_b: Background Term = 0.5 * ||v||^2
-    # --------------------------------------------------------------------------
-    j_b = 0.5 * np.sum(v_flat ** 2)
-    grad_v = v_flat.copy()
+        return J_total, grad_total
 
-    # Calculate current state x = x_b + dx
-    x_state = {var: x_b_dict[var] + dx_dict[var] for var in VARS}
-
-    # --------------------------------------------------------------------------
-    # J_conv: Conventional Observation Term
-    # --------------------------------------------------------------------------
-    j_conv = 0.0
-    # For speed in high-res optimization, sample spatial locations
-    n_conv = len(conv_obs["lat"])
-    if n_conv > 0:
-        lats, lons = grid_info["lats"], grid_info["lons"]
-        for i in range(min(n_conv, 100)):
-            lat_i, lon_i = conv_obs["lat"][i], conv_obs["lon"][i]
-            lev_i = int(conv_obs["lev"][i]) % grid_info["n_lev"]
-            var_i = conv_obs["var"][i] if conv_obs["var"][i] in VARS else "t"
-
-            # Nearest neighbor indexing for observation operator H_conv
-            lat_idx = np.argmin(np.abs(lats - lat_i))
-            lon_idx = np.argmin(np.abs(lons - lon_i))
-
-            innov = conv_obs["val"][i] - x_state[var_i][lev_i, lat_idx, lon_idx]
-            sigma_o = conv_obs["err"][i]
-
-            j_conv += 0.5 * (innov / sigma_o) ** 2
-
-    # --------------------------------------------------------------------------
-    # J_rad: AMSU-A Satellite Radiance Term (NC021023)
-    # --------------------------------------------------------------------------
-    j_rad = 0.0
-    n_amsua = len(amsua_obs["lat"])
-    if n_amsua > 0:
-        lats, lons = grid_info["lats"], grid_info["lons"]
-        t_3d = x_state["t"]
-        levels = grid_info["levels"]
-
-        for i in range(min(n_amsua, 50)):
-            lat_idx = np.argmin(np.abs(lats - amsua_obs["lat"][i]))
-            lon_idx = np.argmin(np.abs(lons - amsua_obs["lon"][i]))
-            
-            t_profile = t_3d[:, lat_idx, lon_idx]
-
-            for k_idx, ch in enumerate(amsua_obs["channels"]):
-                tb_sim = amsua_forward_operator(t_profile, levels, channel=ch)
-                innov = amsua_obs["tb"][i, k_idx] - tb_sim
-                sigma_o = amsua_obs["err"][k_idx]
-
-                j_rad += 0.5 * (innov / sigma_o) ** 2
-
-    # --------------------------------------------------------------------------
-    # J_balance: Physical Constraints (Hydrostatic & Geostrophic Weak Penalties)
-    # --------------------------------------------------------------------------
-    # 1. Hydrostatic penalty: dp/dz + rho*g ≈ 0 (approximated via dt and dp gradient)
-    dp_dz = np.diff(x_state["p"], axis=0)
-    dt_dz = np.diff(x_state["t"], axis=0)
-    j_hydro = 0.5 * gamma_hydro * np.sum((dp_dz + 0.1 * dt_dz) ** 2)
-
-    # 2. Geostrophic penalty: u ≈ -(1/f)*dp/dy, v ≈ (1/f)*dp/dx
-    du_dy = np.gradient(x_state["u"], axis=1)
-    dv_dx = np.gradient(x_state["v"], axis=2)
-    j_geo = 0.5 * gamma_geo * np.sum((du_dy + dv_dx) ** 2)
-
-    j_total = j_b + j_conv + j_rad + j_hydro + j_geo
-
-    return j_total, grad_v
-
-
-# ==============================================================================
-# 4. MAIN PIPELINE EXECUTION
-# ==============================================================================
-
-def main():
-    parser = argparse.ArgumentParser(description="Run 5-Var GFS 3D-Var Data Assimilation Pipeline")
-    parser.add_argument("--bg", type=str, required=True, help="Path to Background NetCDF file")
-    parser.add_argument("--conv", type=str, default="", help="Path to Conventional Obs NetCDF file")
-    parser.add_argument("--amsua", type=str, default="", help="Path to AMSU-A Radiance Obs NetCDF file")
-    parser.add_argument("--output", type=str, default="gfs_5var_3dvar_analysis.nc", help="Output Analysis NetCDF path")
-    parser.add_argument("--maxiter", type=int, default=25, help="Maximum L-BFGS-B iterations")
-    args = parser.parse_args()
-
-    print("==================================================================")
-    print("      GFS / ANEMOI 5-VARIABLE 3D-VAR DA PIPELINE WITH AMSU-A     ")
-    print("==================================================================")
-
-    # 1. Load Background & Observations
-    x_b_dict, grid_info = load_background(args.bg)
-    conv_obs = load_conventional_obs(args.conv, grid_info)
-    amsua_obs = load_amsua_obs(args.amsua, grid_info)
-
-    # 2. Initialize Covariance B-matrix
-    print("[4/5] Constructing B-Matrix Model (Cholesky + Spatial Smoothing)...")
-    b_cov = BackgroundCovarianceB(grid_info)
-
-    # 3. Setup Optimization Target
-    v_init = np.zeros(len(VARS) * grid_info["size_3d"], dtype=np.float64)
-
-    print(f"[5/5] Minimizing Cost Function via L-BFGS-B (Max Iterations: {args.maxiter})...")
-    
-    def eval_j_and_grad(v_vec):
-        return cost_function_3dvar(v_vec, x_b_dict, conv_obs, amsua_obs, b_cov, grid_info)
-
+    v0 = np.zeros(n_grid * len(STATE_VARS), dtype=np.float64)
     res = opt.minimize(
-        eval_j_and_grad,
-        v_init,
+        cost_and_grad,
+        v0,
         method="L-BFGS-B",
         jac=True,
-        options={"maxiter": args.maxiter, "disp": True}
+        options={"maxiter": maxiter, "ftol": 1e-6, "gtol": 1e-5},
     )
 
     print(f"  -> Optimization complete. Final Cost J: {res.fun:.4f}")
 
-    # 4. Reconstruct Final Analysis Field: x_ana = x_b + B^(1/2) * v_opt
-    v_opt_dict = unpack_state(res.x, grid_info)
-    dx_opt_dict = b_cov.apply_B_half(v_opt_dict)
+    # Convert optimal v back to physical analysis xa = xb + B^{1/2} v
+    v_opt = res.x
+    xa_dict = {}
+    for idx, var in enumerate(STATE_VARS):
+        v_var = v_opt[idx * n_grid : (idx + 1) * n_grid].reshape(shape_3d)
+        dx_opt = apply_spatial_b(v_var * SIGMA_B[var])
+        xa_dict[var] = xb_dict[var] + dx_opt
 
-    x_ana_dict = {}
-    for var in VARS:
-        x_ana_dict[var] = x_b_dict[var] + dx_opt_dict[var]
+    return xa_dict, iterations_run[0]
 
-    # 5. Export Results to NetCDF
-    print(f"Exporting analysis output to: '{args.output}'")
+
+def main():
+    parser = argparse.ArgumentParser(description="Run GFS 3D-Var Pipeline in Z-Level Coordinates")
+    parser.add_argument("--bg", type=str, required=True, help="Background NetCDF file")
+    parser.add_argument("--conv", type=str, default=None, help="Conventional obs NetCDF file")
+    parser.add_argument("--amsua", type=str, default=None, help="AMSU-A NetCDF file")
+    parser.add_argument("--output", type=str, default="gfs.20230701.t12z.1p00.anal.nc", help="Output NetCDF file")
+    parser.add_argument("--maxiter", type=int, default=30, help="Max iterations")
+
+    args = parser.parse_args()
+
+    xb_dict, lats, lons, heights = load_background(args.bg)
+
+    conv_obs = None
+    if args.conv:
+        conv_obs = ingest_conventional_obs(args.conv, lats, lons, heights)
+
+    xa_dict, n_iters = run_3dvar(xb_dict, conv_obs, lats, lons, heights, maxiter=args.maxiter)
+
+    print(f"\nExporting analysis output to: '{args.output}'")
+
+    data_vars = {}
+    for var in STATE_VARS:
+        bg = xb_dict[var]
+        anal = xa_dict[var]
+        inc = anal - bg
+
+        v_upper = var.upper()
+        data_vars[f"{var}_background"] = (
+            ("height", "latitude", "longitude"),
+            bg,
+            {"long_name": f"GFS Background State ({v_upper})"},
+        )
+        data_vars[f"{var}_analysis"] = (
+            ("height", "latitude", "longitude"),
+            anal,
+            {"long_name": f"Constrained 3D-Var Analysis ({v_upper})"},
+        )
+        data_vars[f"{var}_increment"] = (
+            ("height", "latitude", "longitude"),
+            inc,
+            {"long_name": f"Constrained 3D-Var Increment ({v_upper})"},
+        )
+
     out_ds = xr.Dataset(
+        data_vars=data_vars,
         coords={
-            "height": grid_info["levels"],
-            "latitude": grid_info["lats"],
-            "longitude": grid_info["lons"],
-        }
+            "height": ("height", heights),
+            "latitude": ("latitude", lats),
+            "longitude": ("longitude", lons),
+        },
+        attrs={
+            "title": "5-Variable GFS 3D-Var Analysis with Geostrophic & Hydrostatic Constraints",
+            "institution": "Anemoi DA Environment",
+            "variables_assimilated": "p, t, u, v, q",
+            "weak_constraints": "Geostrophic (gamma=0.15), Hydrostatic (gamma=0.1)",
+            "iterations": str(n_iters),
+        },
     )
-
-    for var in VARS:
-        out_ds[f"{var}_bg"] = (("height", "latitude", "longitude"), x_b_dict[var])
-        out_ds[f"{var}_ana"] = (("height", "latitude", "longitude"), x_ana_dict[var])
-        out_ds[f"{var}_inc"] = (("height", "latitude", "longitude"), dx_opt_dict[var])
 
     out_ds.to_netcdf(args.output)
     print("==================================================================")

@@ -357,3 +357,96 @@ python fetch_nnja_obs.py --datetime 2023-01-15T06:00:00 --window 3
 
 This will automatically create `conv_adpupa_NC002001.nc` and `amsua_NC021023.nc` ready to plug straight into your `run_gfs_3dvar_pipeline.py` script.
 
+
+
+
+
+
+
+
+
+That explains both the **tiny increments ($O(10^{-5})$)** and the potential mismatches!
+
+When you shift from a **pressure-coordinate system** ($p$-level) to a **geopotential height coordinate system** ($z$-level), three fundamental changes occur in the DA formulation that will directly fix both problems:
+
+---
+
+### Key Mismatches to Fix in `run_gfs_3dvar_pipeline.py`
+
+#### 1. Why Increments Were Tiny ($10^{-5}$)
+
+* **Pressure Unit Scale ($p$ as a State Variable):** Surface/level pressure $p$ in background files is given in **Pascals** ($\sim 100,000\text{ Pa}$ or $\sim 1,000\text{ hPa}$). If your observation innovation $(y - H(x_b))$ or background error standard deviation $\sigma_b$ for $p$ was set assuming hPa or normalized values without scaling, or if the $H(x)$ operator expected geopotential height ($z$) while feed-in observations had pressure level coordinates ($p$), the matrix scaling $/ \sigma_o^2$ heavily damped the state correction.
+* **Vertical Interpolation Coordinate Swap:** The forward operator $H(x)$ was likely attempting to interpolate observations vertically using `level` (pressure) as the vertical grid coordinate, rather than using model geometric/geopotential height $z$ as the grid axis and interpolating $p$ (or $t, u, v, td$) onto observation height positions.
+
+#### 2. The Variable Role Swap ($z \leftrightarrow p$)
+
+* **Before ($p$-level system):** Coordinate = Pressure level $p$ | State Variables = $(t, td, u, v, z)$
+* **Now ($z$-level system):** Coordinate = Geometric/Geopotential height $z$ | State Variables = $(t, td, u, v, p)$
+
+---
+
+### Required Code Adaptations in `run_gfs_3dvar_pipeline.py`
+
+Below are the key logic replacements you need to make inside `run_gfs_3dvar_pipeline.py` for a **$z$-level assimilation system**:
+
+#### A. Adjust State Vector Variable Mapping & Background Errors
+
+In $z$-level DA, surface/level pressure `p` is an assimilated state variable, while height `z` is the vertical coordinate array. Adjust background errors ($\sigma_b$) so pressure errors reflect units of Pascals or hPa appropriately:
+
+```python
+# State variables for z-level DA
+STATE_VARS = ["t", "td", "u", "v", "p"]  # 'p' replaces 'z' as state variable
+
+# Background Error Standard Deviations (B-matrix diag \sigma_b)
+SIGMA_B = {
+    "t": 1.5,      # Temperature (K)
+    "td": 2.5,     # Dewpoint (K)
+    "u": 3.0,      # Zonal wind (m/s)
+    "v": 3.0,      # Meridional wind (m/s)
+    "p": 100.0,    # Level Pressure (Pa) -- ensures innovations are NOT micro-damped!
+}
+
+```
+
+#### B. Update Forward Observation Operator $H(x)$ for $z$-Level Interpolation
+
+In $z$-level DA, observation locations are mapped using vertical height $z_{\text{obs}}$ (or mapped from observation pressure using $z(p)$ hydrostatic relationship):
+
+```python
+def forward_operator(x_state, obs_lats, obs_lons, obs_heights, obs_vars, grid_lats, grid_lons, grid_z):
+    """
+    Interpolates state variables (t, td, u, v, p) from 3D model grid (lat, lon, z)
+    to observation locations (obs_lat, obs_lon, obs_height).
+    """
+    H_x = np.zeros(len(obs_vars), dtype=np.float32)
+    
+    # Grid coordinates: lat, lon, height (z)
+    for i, (lat, lon, z_target, var_name) in enumerate(zip(obs_lats, obs_lons, obs_heights, obs_vars)):
+        if var_name not in STATE_VARS:
+            continue
+            
+        # 1. Find spatial grid indices (lat, lon)
+        # 2. Interpolate vertically along model 'z' coordinates to z_target
+        # Example using scipy RegularGridInterpolator or trilinear lookup:
+        val_interp = interpolate_3d(x_state[var_name], grid_lats, grid_lons, grid_z, lat, lon, z_target)
+        H_x[i] = val_interp
+
+    return H_x
+
+```
+
+#### C. Handling Conventional Sounding Observations (`conv_adpupa_NC002001.nc`)
+
+Since radiosonde observations provide measurements at pressure levels (`level` column = $p_{\text{obs}}$ in hPa), converts $p_{\text{obs}}$ into $z_{\text{obs}}$ or assimilates pressure directly:
+
+* **For $p$ observations:** Compare observed level pressure $p_{\text{obs}}$ directly against state variable $p(z)$ at height $z$.
+* **For $t, u, v, td$ observations:** Convert observation pressure level to model geometric height $z_{\text{obs}}$ using the background height field $z_{\text{grid}}$ before evaluating $H(x)$.
+
+---
+
+### Summary Checklist to Fix the Pipeline
+
+1. In `run_gfs_3dvar_pipeline.py`, change state variable dictionary key from **`z`** to **`p`**.
+2. Scale **`SIGMA_B["p"]`** to match pressure units in Pascals (e.g., $100\text{ Pa} \approx 1\text{ hPa}$) so cost function gradient $\mathbf{B}^{-1}(x - x_b)$ is properly balanced relative to $\mathbf{R}^{-1}(y - H(x))$.
+3. Switch 3D spatial interpolation in $H(x)$ to use **grid height ($z$)** as the 3rd dimension axis instead of grid pressure.
+
