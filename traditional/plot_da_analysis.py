@@ -209,25 +209,26 @@ def main():
     args = parse_args()
 
     # 1. Ingest Data
-    lats, lons, height_val, x_b, x_a, dx, units = load_analysis_fields(
-        file_path=args.input,
-        var_prefix=args.var_prefix,
-        level_idx=args.level_idx,
-    )
+    for var in ['t', 'p', 'u', 'v', 'q']:
+        lats, lons, height_val, x_b, x_a, dx, units = load_analysis_fields(
+            file_path=args.input,
+            var_prefix=var,
+            level_idx=args.level_idx,
+        )
 
-    # 2. Render Figure
-    plot_3panel_diagnostic(
-        lats=lats,
-        lons=lons,
-        height_val=height_val,
-        x_b=x_b,
-        x_a=x_a,
-        dx=dx,
-        units=units,
-        var_prefix=args.var_prefix,
-        output_path=args.output,
-        dpi=args.dpi,
-    )
+        # 2. Render Figure
+        plot_3panel_diagnostic(
+            lats=lats,
+            lons=lons,
+            height_val=height_val,
+            x_b=x_b,
+            x_a=x_a,
+            dx=dx,
+            units=units,
+            var_prefix=args.var_prefix,
+            output_path=args.output,
+            dpi=args.dpi,
+        )
 
 
 if __name__ == "__main__":
