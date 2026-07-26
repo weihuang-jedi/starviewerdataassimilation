@@ -11,7 +11,7 @@
 
 set -x
 
-cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
+cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida/data
 
 source ../svg.env
 

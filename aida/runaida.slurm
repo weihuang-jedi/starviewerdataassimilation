@@ -1,37 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=s3_data_transfer
-##SBATCH --partition=u1-service
-#SBATCH --partition=u1-compute
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8       # Allocates 8 CPU cores on the service node
-#SBATCH --time=01:00:00
+#SBATCH --job-name=training
 #SBATCH --account=epic
-#SBATCH --output=log.3dvar_%j.out
-
-set -x
+#SBATCH --gres=gpu:h100:1
+#SBATCH --mem=128G
+#SBATCH --nodes=1
+#SBATCH --partition=u1-h100
+#SBATCH --qos=gpuwf
+#SBATCH --time=06:00:00
+#SBATCH --output=log.training_%J.out
+#SBATCH --export=NONE
 
 cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
+source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
 
-python run_aida_graph_3dvar.py \
+# Notice the trailing backslash '\' on the python line below:
+python scripts/train_aida_surrogate.py \
     --zarr ../data/icosahedral_2023.zarr \
-    --edges ../data/graph \
-    --conv CONV        Path to conventional observations
-    --output gfs.20230701.t12z.1p00.aida.nc \
-    --maxiter 30
+    --bmatrix ../bmatrix/bmatrix_from_gfs_analysis.nc \
+    --edges ../data/graph/edge_index_m4.pt \
+    --out_ckpt ../checkpoints/aida_gnn_v1.pt \
+    --epochs 20 \
+    --batch_size 4 \
+    --lr 1e-4
 
 exit 0
-
-(anemoi) [Wei.Huang@ufe02 aida]$ python run_aida_graph_3dvar.py --help
-usage: run_aida_graph_3dvar.py [-h] [--zarr ZARR] [--edges EDGES] [--conv CONV] [--output OUTPUT] [--maxiter MAXITER]
-
-Run AI-DA Graph-based 3D-Var Engine on Icosahedral Mesh
-
-options:
-  -h, --help         show this help message and exit
-  --zarr ZARR        Path to background Zarr
-  --edges EDGES      Path to PyTorch graph edges
-  --conv CONV        Path to conventional observations
-  --output OUTPUT    Output NetCDF analysis file
-  --maxiter MAXITER  Max optimization iterations
-
