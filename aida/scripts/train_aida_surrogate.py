@@ -47,21 +47,21 @@ class IcosahedralGraphGNN(nn.Module):
         self.register_buffer("edge_index", edge_index)
         self.src = edge_index[0]
         self.dst = edge_index[1]
-        
+
         # Node feature encoder
         self.encoder = nn.Sequential(
             nn.Linear(in_channels, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        
+
         # Message Passing Layer (Graph Edge Interactions)
         self.msg_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        
+
         # Node feature decoder (Predicts state increment dx)
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -72,29 +72,30 @@ class IcosahedralGraphGNN(nn.Module):
     def forward(self, x):
         # Input shape: (batch_size, 5_vars, 32_levels, 2562_nodes)
         batch_size, n_vars, n_lvls, n_nodes = x.shape
-        
+
         # Reshape to (batch_size, 2562_nodes, 160_features)
         x_flat = x.view(batch_size, n_vars * n_lvls, n_nodes).permute(0, 2, 1)
-        
+
         # 1. Encode node features
         h = self.encoder(x_flat)  # Shape: (batch_size, 2562, hidden_dim)
-        
+
         # 2. Graph Message Passing across Mesh Edges
-        h_src = h[:, self.src, :]
-        h_dst = h[:, self.dst, :]
-        
+        h_src = h[:, self.src, :]  # (batch_size, 15360_edges, hidden_dim)
+        h_dst = h[:, self.dst, :]  # (batch_size, 15360_edges, hidden_dim)
+
         msg_in = torch.cat([h_src, h_dst], dim=-1)
         messages = self.msg_mlp(msg_in)
-        
-        # Aggregate incoming messages at destination nodes
+
+        # Aggregate incoming messages at destination nodes along dim 1
+        # self.dst is a 1D vector of shape [15360]
         aggr_msg = torch.zeros_like(h)
-        aggr_msg.index_add_(1, self.dst.unsqueeze(0).expand(batch_size, -1, -1), messages)
-        
+        aggr_msg.index_add_(1, self.dst, messages)
+
         h_out = h + aggr_msg
-        
+
         # 3. Decode state increment dx
         dx_flat = self.decoder(h_out).permute(0, 2, 1).view(batch_size, n_vars, n_lvls, n_nodes)
-        
+
         # Residual prediction formulation: x_{t+6h} = x_t + dx
         return x + dx_flat
 
