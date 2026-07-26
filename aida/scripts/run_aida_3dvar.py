@@ -249,14 +249,16 @@ def execute_3dvar_analysis(zarr_path, bmatrix_path, edge_index_path, conv_path, 
 
             for var in ["p", "t", "u", "v"]:
                 mask = (obs_vars == var)
-                if torch.any(mask):
+                # if torch.any(mask):
+                if mask.any():
                     k_m = obs_ks[mask]
                     node_m = obs_nodes[mask]
                     H_x[mask] = x_state[var][k_m, node_m]
 
             # Dewpoint observation operator Td = H_td(q, p)
             mask_td = (obs_vars == "td")
-            if torch.any(mask_td):
+            # if torch.any(mask_td):
+            if mask_td.any():
                 k_m = obs_ks[mask_td]
                 node_m = obs_nodes[mask_td]
                 q_state = x_state["q"][k_m, node_m]

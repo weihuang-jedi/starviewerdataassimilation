@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=aida_3dvar
+#SBATCH --job-name=ai_3dvar
 #SBATCH --account=epic
 #SBATCH --gres=gpu:h100:1
 #SBATCH --mem=64G
