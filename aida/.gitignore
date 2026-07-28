@@ -1,2 +1,4 @@
 log.*
 *.png
+checkpoints
+cycling_output_*
