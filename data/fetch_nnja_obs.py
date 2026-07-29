@@ -2,7 +2,7 @@
 """
 fetch_full_year_conv_complete.py
 --------------------------------
-Downloads and structures full-suite conventional observations for 2023 AI-DA.
+Downloads and structures full-suite conventional observations for 2024 AI-DA.
 Coordinate: Height z (meters)
 Variables: Pressure p (hPa/Pa), Temperature t, Dewpoint td, Winds u/v
 """
@@ -14,8 +14,8 @@ import pandas as pd
 import xarray as xr
 import requests
 
-YEAR = 2023
-OUTPUT_DIR = "conv_2023"
+YEAR = 2024
+OUTPUT_DIR = "conv_2024"
 CYCLES = ["00", "06", "12", "18"]
 OBS_TYPES = ["adpupa", "adpsfc", "aircar", "satwnd"]
 
@@ -120,7 +120,7 @@ def main():
 
         current_date += timedelta(days=1)
 
-    print("\nCompleted! 1,460 full-suite observation files ready with 'td' for 2023.")
+    print("\nCompleted! 1,460 full-suite observation files ready with 'td' for 2024.")
 
 
 if __name__ == "__main__":

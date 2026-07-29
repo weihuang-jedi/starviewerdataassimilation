@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --partition=u1-h100
 #SBATCH --qos=gpuwf
-#SBATCH --time=03:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=log.cycling_%J.out
 #SBATCH --export=NONE
 
@@ -17,27 +17,29 @@ cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
 source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
 
 # 3. Define cycling parameters
-START_DATE="20230306_00"
+START_YMD="20240106"
+START_HOUR="00"
+START_DATE="${START_YMD}_${START_HOUR}"
 NUM_CYCLES=4  # Runs 4x 6-hour cycles (24 hours total)
 
-GNN_CKPT="../checkpoints/aida_gnn_v1.pt"
+GNN_CKPT="checkpoints/aida_gnn_v1.pt"
 EDGES="../data/graph/edge_index_m4.pt"
-ZARR_INIT="../data/icosahedral_2023.zarr"
 BMATRIX="../bmatrix/bmatrix_from_gfs_analysis.nc"
-OBS_DIR="../data/conv_2023"
-WORK_DIR="./cycling_output_20230306"
+OBS_DIR="../data/conv_2024"
+WORK_DIR="./cycling_output_${START_YMD}"
+BG_DIR="../data/icosahedral_grid"
 
 
-rm -rf ./cycling_output_20230306/temp_bg_*
+rm -rf ${WORK_DIR}/temp_bg_*
 # 4. Run AI-DA Cycling orchestrator
 python scripts/run_aida_cycling.py \
-    --start_date ${START_DATE} \
-    --num_cycles ${NUM_CYCLES} \
-    --gnn_ckpt ${GNN_CKPT} \
-    --edges ${EDGES} \
-    --zarr_init ${ZARR_INIT} \
-    --bmatrix ${BMATRIX} \
-    --obs_dir ${OBS_DIR} \
-    --work_dir ${WORK_DIR}
+   --start_date ${START_DATE} \
+   --num_cycles ${NUM_CYCLES} \
+   --gnn_ckpt ${GNN_CKPT} \
+   --edges ${EDGES} \
+   --bg_dir ${BG_DIR} \
+   --bmatrix ${BMATRIX} \
+   --obs_dir ${OBS_DIR} \
+   --work_dir ${WORK_DIR}
 
 exit 0

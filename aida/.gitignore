@@ -1,4 +1,5 @@
 log.*
 *.png
+__pycache__
 checkpoints
 cycling_output_*

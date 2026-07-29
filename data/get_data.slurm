@@ -18,8 +18,8 @@ mamba activate anemoi
 
 cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data
 
-# Run your new production controller script, matching worker counts to allocated cpus
-#python get_data_pipeline.py --start_year 2023 --total_years 1 --res 1p00 --forecast_hour f006 --workers 16
+#python get_data_pipeline.py --start_year 2024 --total_years 1 --res 1p00 --forecast_hour f000 --workers 16
 
- get_data.sh >& log.data
+ get_data.sh
+#get_truth.sh
 

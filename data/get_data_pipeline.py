@@ -27,8 +27,14 @@ class GFSPipelineManager:
         self.s3_client = boto3.client('s3', config=Config(signature_version=UNSIGNED))
         
         # Ensure your local workspace directory architecture is setup safely
-        os.makedirs("regular_grid", exist_ok=True)
-        os.makedirs("icosahedral_grid", exist_ok=True)
+        if (self.forecast_hour == "f000"):
+            self.regular_dir = "regular_truth"
+            self.icosahedral_dir = "icosahedral_truth"
+        else:
+            self.regular_dir = "regular_grid"
+            self.icosahedral_dir = "icosahedral_grid"
+        os.makedirs(self.regular_dir, exist_ok=True)
+        os.makedirs(self.icosahedral_dir, exist_ok=True)
 
     def _generate_tasks(self):
         """Generates all potential task definitions across the targeted date matrix range."""
@@ -52,8 +58,8 @@ class GFSPipelineManager:
                             "yyyy": yyyy, "mm": mm, "dd": dd, "hh": hh,
                             "s3dir": f"gfs.{yyyy}{mm}{dd}",
                             "iflnm": f"gfs.t{hh}z.pgrb2.{self.resolution}.{self.forecast_hour}",
-                            "ncflnm": f"regular_grid/gfs.{yyyy}{mm}{dd}.t{hh}z.{self.resolution}.{self.forecast_hour}.nc",
-                            "mlgridflnm": f"icosahedral_grid/global_icosahedral_m4.{yyyy}{mm}{dd}.t{hh}z.{self.resolution}.{self.forecast_hour}.nc"
+                            "ncflnm": f"{self.regular_dir}/gfs.{yyyy}{mm}{dd}.t{hh}z.{self.resolution}.{self.forecast_hour}.nc",
+                            "mlgridflnm": f"{self.icosahedral_dir}/global_icosahedral_m4.{yyyy}{mm}{dd}.t{hh}z.{self.resolution}.{self.forecast_hour}.nc"
                         }
                         tasks.append(task)
         return tasks
@@ -141,7 +147,7 @@ def main():
     parser.add_argument("--start_year", type=int, default=2023, help="Starting year coordinate.")
     parser.add_argument("--total_years", type=int, default=1, help="Number of years to add to starting point.")
     parser.add_argument("--res", type=str, default="1p00", choices=["1p00", "0p50", "0p25"], help="GFS Resolution sheet grid sizing.")
-    parser.add_argument("--forecast_hour", type=str, default="f006", choices=["f006", "f012", "f024", ...], help="GFS forecast time string.")
+    parser.add_argument("--forecast_hour", type=str, default="f000", choices=["f000", "f006", "f012", "f024", ...], help="GFS forecast time string.")
     parser.add_argument("--workers", type=int, default=4, help="Maximum concurrent multi-process worker tracks to assign.")
 
     args = parser.parse_args()

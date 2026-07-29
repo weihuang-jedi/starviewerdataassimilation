@@ -8,7 +8,7 @@ cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
 # 2. Activate Conda environment
 source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
 
-yyyymmdd=20230306
+yyyymmdd=20240106
 analhour=06
 
 origanalysis=cycling_output_${yyyymmdd}/aida_analysis_${yyyymmdd}_t${analhour}z.nc
@@ -23,7 +23,12 @@ fi
 
 python plot_3dvar_matrix.py \
    --input ${gridanalysis} \
-   --output aida_increment_matrix_${yyyymmdd}.png
+   --output aida_increment_matrix_${yyyymmdd}T${analhour}.png
+
+python validate_reconstruction.py \
+   -i ${gridanalysis} \
+   -r ../data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
+   -o cycling_output_${yyyymmdd}/verification_levels_t${analhour}z.csv
 
 exit 0
 
