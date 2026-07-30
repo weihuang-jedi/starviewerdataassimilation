@@ -22,24 +22,23 @@ START_HOUR="00"
 START_DATE="${START_YMD}_${START_HOUR}"
 NUM_CYCLES=4  # Runs 4x 6-hour cycles (24 hours total)
 
-GNN_CKPT="checkpoints/aida_gnn_v1.pt"
-EDGES="../data/graph/edge_index_m4.pt"
+GNN_CKPT="checkpoints/aida_gnn_surrogate.pt"
+EDGES="../data/graph/icosahedral_edge_index_m4.pt"
 BMATRIX="../bmatrix/bmatrix_from_gfs_analysis.nc"
 OBS_DIR="../data/conv_2024"
 WORK_DIR="./cycling_output_${START_YMD}"
 BG_DIR="../data/icosahedral_grid"
 
-
 rm -rf ${WORK_DIR}/temp_bg_*
+
 # 4. Run AI-DA Cycling orchestrator
 python scripts/run_aida_cycling.py \
-   --start_date ${START_DATE} \
-   --num_cycles ${NUM_CYCLES} \
    --gnn_ckpt ${GNN_CKPT} \
-   --edges ${EDGES} \
-   --bg_dir ${BG_DIR} \
-   --bmatrix ${BMATRIX} \
+   --graph_path ${EDGES} \
+   --data_dir ${BG_DIR} \
    --obs_dir ${OBS_DIR} \
-   --work_dir ${WORK_DIR}
+   --bmatrix_path ${BMATRIX} \
+   --output_dir ${WORK_DIR} \
+   --cycles ${NUM_CYCLES}
 
 exit 0

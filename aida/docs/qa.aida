@@ -1,0 +1,58 @@
+We have worked together for a while, and there are quite some issues we need to fix.
+But I feel that I have asked too many questions, moved too fast,
+without thinking things over.
+
+Now, let us slow down, and rethink our tasks over. Below is what our thought on AI weather model.
+
+1. Our model is a z (height, we should say it is geometry height, not geopotential height)
+   coordinator model. So we have t, p, u, v, w, and q as model variables.
+
+   This is quite different to other models, as many models use p as vertical coordinate
+   and geopotential height as proganostic variable. From my understanding, this is
+   kink of hydrostatic model.
+
+   Since we use z as vertical coordinate, and p as proganostic variable (or model variable),
+   so our model is non-hydrostatic model. But as p is not a direct predictable variable,
+   let us think of the atmospheric state equation:
+
+   p = (rho).R.T
+
+   and gradient force: -(1/rho).Delt(p)
+
+   since rho is a proganostic variable in continuity equation: partial(rho)/partial(t) + Delt.(rho.V) = 0
+
+   but rho (actually p as well) varies greatly with height, and vary small in higher atmosphere level,
+   let us use ln(rho) = lnrho, so the gradient force become: -R.Delt(T) - R.T.Delt(lnrho)
+   or write as:  -R.T.(Delt(ln(T)) + Delt(lnrho))
+   And perturbed state equation can be written as:   delt(ln(p)) = delt(lnrho) + delt(ln(T))
+
+2. Back to our AI DA model, since we use icosahedral grid, we may focus hydrostatic balance
+   at icosahedral mesh 0, and allowing seasonal temperature change.
+
+   at mesh 0, is it possible that we have reasonal t, p (rho) values, which keep the ACC score
+   at a relative higher value, to match the seasonal changes. At this level, temperature has
+   a seasonal change, therefore avoid big bias (cool or warm drift), and also keep mass conservation,
+   to avoid mass loss/gain.
+
+   at mesh 1, is it possible that we have seasonal changes from mesh 0, and also have meridianal
+   changes, and have u-componnet geostrophical balance:
+   f.u = -R.partial(T)/partial(y) - R.T.partial(lnrho)/parital(y).
+   with such, should we have some ACC score improve for u.
+   for the geostrophic wind, at equtorial region, f is very small. some people change it this way:
+   let beta = partial(f)/partial(y). With f = 2.Omega.sin(lat), then beta = 2.Omega.cos(lat)/r, r is earth radius.
+   and a new formula of geostrophic balance:
+   beta.u = -R.partial(partial(T))/partial(partial(y)) + other-terms.
+
+   at mesh 2, we should have full geostrophic balance, uncompressible continuity equation, etc.
+
+So the new AIDA is trained with input of graph/mesh info, 6 hour forecast, and observation to get a checkpoint file.
+And the inference is use the checkpoint file, and 6 hour forecast to get an analysis.
+This analysis will be used as input for AI weather model. This this new analysis, plus analysis of previous 6 hours,
+AI weather model can rollout and forecast weather for next 60 - 120 hours, or even to 480 hours.
+
+For our current resolution can inject our convention obs at mesh 3, and feedback to mesh4 to fit the obs?
+
+Later, when we get to fine mesh like 5, 6, or even 7, and 8. We still want to convetrional obs at level 3 or 4.
+And then other data based on their resultion to perform at certain levels, but usually one level below its
+model (AI weather model), so we can speed up the training, and with dynamic adjust, our decoder part
+feed back matches obs better.

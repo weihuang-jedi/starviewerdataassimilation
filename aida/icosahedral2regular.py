@@ -18,7 +18,7 @@ def regrid_dataset(input_file: str, output_file: str, grid_file: str = None, res
             raise FileNotFoundError(f"Specified grid file not found: {grid_file}")
         print(f"Loading grid coordinates from external file: {grid_file}")
         ds_grid = xr.open_dataset(grid_file)
-        
+
         lons_raw = None
         lats_raw = None
         for lon_key in ['longitude', 'lon', 'clon']:
@@ -72,7 +72,7 @@ def regrid_dataset(input_file: str, output_file: str, grid_file: str = None, res
     linear_interp = LinearNDInterpolator(points, dummy_values)
     nearest_interp = NearestNDInterpolator(points, dummy_values)
 
-    # Target variables
+    # Target variables containing spatial node dimension
     node_vars = [v for v in ds.data_vars if 'node' in ds[v].dims]
     print(f"Variables target for regridding: {node_vars}")
 
@@ -86,12 +86,12 @@ def regrid_dataset(input_file: str, output_file: str, grid_file: str = None, res
         has_time = 'time' in da.dims
         has_height = 'height' in da.dims
 
-        time_len = len(ds['time']) if has_time else 1
+        time_len = ds['time'].size if 'time' in ds else 1
         height_len = len(ds['height']) if has_height else 1
 
         def interpolate_layer(layer_raw):
             layer_flat = np.squeeze(layer_raw).flatten()[valid_coord_mask].astype(np.float64)
-            
+
             # Execute pre-calculated Delaunay triangulation
             linear_interp.values = layer_flat.reshape(-1, 1)
             grid_data = linear_interp(lon_mesh, lat_mesh)
@@ -100,12 +100,12 @@ def regrid_dataset(input_file: str, output_file: str, grid_file: str = None, res
             if np.isnan(grid_data).any():
                 nearest_interp.values = layer_flat.reshape(-1, 1)
                 nearest_evaluated = nearest_interp(lon_mesh, lat_mesh)
-                
+
                 # Flatten arrays to 1D to guarantee safe 1D boolean indexing
                 grid_flat = grid_data.ravel()
                 nan_mask_flat = np.isnan(grid_flat)
                 nearest_flat = nearest_evaluated.ravel()
-                
+
                 grid_flat[nan_mask_flat] = nearest_flat[nan_mask_flat]
                 grid_data = grid_flat.reshape(lon_mesh.shape)
 
@@ -147,14 +147,23 @@ def regrid_dataset(input_file: str, output_file: str, grid_file: str = None, res
             attrs=da.attrs
         )
 
+    # Construct coordinates safely
     coords = {
         'lon': ('lon', grid_lons.astype(np.float32), {'units': 'degrees_east', 'standard_name': 'longitude'}),
         'lat': ('lat', grid_lats.astype(np.float32), {'units': 'degrees_north', 'standard_name': 'latitude'})
     }
+
     if 'height' in ds.coords:
         coords['height'] = ('height', ds['height'].values, ds['height'].attrs)
+
+    # Safely handle scalar or 1D time coordinates
     if 'time' in ds.coords:
-        coords['time'] = ('time', ds['time'].values, ds['time'].attrs)
+        t_val = ds['time'].values
+        if t_val.ndim == 0:
+            # Scalar time coordinate -> store as scalar without forcing dimension name
+            coords['time'] = xr.Variable((), t_val, attrs=ds['time'].attrs)
+        else:
+            coords['time'] = ('time', t_val, ds['time'].attrs)
 
     output_ds = xr.Dataset(data_vars=regrid_dict, coords=coords, attrs=ds.attrs)
 
