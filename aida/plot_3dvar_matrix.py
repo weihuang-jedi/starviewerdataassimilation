@@ -144,7 +144,7 @@ def plot_increment_matrix(nc_file: str, output_png: str = "3dvar_increment_matri
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot 5x7 3D-Var Increment Matrix")
-    parser.add_argument("--input", type=str, default="cycling_output_20230306/aida_analysis_20230306_t06z.nc", help="Path to 3D-Var Analysis NetCDF file")
+    parser.add_argument("--input", type=str, default="cycling_output_20240106/aida_analysis_20240106_t00z.nc", help="Path to 3D-Var Analysis NetCDF file")
     parser.add_argument("--output", type=str, default="3dvar_increment_matrix.png", help="Output PNG path")
 
     args = parser.parse_args()

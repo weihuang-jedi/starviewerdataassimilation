@@ -14,6 +14,10 @@ analhour=06
 origanalysis=cycling_output_${yyyymmdd}/aida_analysis_${yyyymmdd}_t${analhour}z.nc
 gridanalysis=cycling_output_${yyyymmdd}/reconstructed_aida_analysis_${yyyymmdd}_t${analhour}z.nc
 
+#python scripts/verify_aida_logstate.py \
+#   -a cycling_output_20240106/aida_analysis_cycle_01.nc \
+#   -t ../data/nc/truth_t06z.nc
+
 if [ ! -f ${gridanalysis} ]; then
    python icosahedral2regular.py \
       -i ${origanalysis} \

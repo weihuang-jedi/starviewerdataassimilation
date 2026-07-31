@@ -17,12 +17,12 @@ set -x
 
 # Notice the trailing backslash '\' on the python line below:
 python scripts/train_aida_surrogate.py \
-    --zarr ../data/icosahedral_2023.zarr \
-    --edges ../data/graph/icosahedral_edge_index_m4.pt \
-    --checkpoint checkpoints/aida_gnn_surrogate.pt \
-    --epochs 25 \
-    --batch_size 4 \
-    --lr 0.0003
+  --zarr ../data/icosahedral_2023_logstate.zarr \
+  --edges ../data/graph/icosahedral_edge_index_m4.pt \
+  --checkpoint checkpoints/aida_gnn_surrogate_logstate.pt \
+  --epochs 25 \
+  --batch_size 4 \
+  --lr 0.0003
 
 exit 0
 

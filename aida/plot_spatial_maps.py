@@ -19,7 +19,7 @@ def create_spatial_plot(lon, lat, field, title, colorbar_label, output_path, cma
     """
     Renders a global 2D latitude-longitude field on a PlateCarree projection.
     """
-    fig = plt.figure(figsize=(12, 6), dpi=300)
+    fig = plt.figure(figsize=(4, 3), dpi=300)
     ax = plt.axes(projection=ccrs.PlateCarree())
 
     # Add geographic context features
@@ -39,9 +39,9 @@ def create_spatial_plot(lon, lat, field, title, colorbar_label, output_path, cma
 
     # Add Colorbar
     cbar = plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.08, shrink=0.75)
-    cbar.set_label(colorbar_label, fontsize=11, fontweight='bold')
+    cbar.set_label(colorbar_label, fontsize=4, fontweight='bold')
 
-    plt.title(title, fontsize=13, fontweight='bold', pad=12)
+    plt.title(title, fontsize=8, fontweight='bold', pad=12)
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches='tight')
     plt.show()
