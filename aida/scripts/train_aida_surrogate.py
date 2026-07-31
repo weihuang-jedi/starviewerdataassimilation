@@ -27,6 +27,7 @@ LOG_STATE_VARS = [
     'ln_p_icosahedral'
 ]
 
+
 # ==========================================
 # 1. GRAPH CONVOLUTION LAYER
 # ==========================================
@@ -60,7 +61,7 @@ class LogStateZarrDataset(Dataset):
 
         print("========================================================")
         print("[AIDA DATASET] Initialized Log-State Zarr Loader")
-        print(f"Store Path  : {zarr_path}")
+        print(f"Store Path   : {zarr_path}")
         print(f"Variables   : {self.var_names}")
         print(f"Timesteps   : {self.total_timesteps}")
         print(f"Mesh Layout : {self.num_levels} height levels x {self.num_nodes} nodes")
@@ -72,7 +73,7 @@ class LogStateZarrDataset(Dataset):
             arr = self.root[var]
             sample_data = np.asarray(arr[:min(100, self.total_timesteps)])
             sample_data = sample_data[np.isfinite(sample_data)]
-            
+
             mean = float(np.mean(sample_data)) if sample_data.size > 0 else 0.0
             std  = float(np.std(sample_data)) if sample_data.size > 0 else 1.0
 
@@ -134,14 +135,14 @@ class NonHydrostaticIcosahedralLoss(nn.Module):
 
         # Register dataset mean and std for online un-normalization
         # Order expected in state tensor: [0: ln_t, 1: u, 2: v, 3: w, 4: q, 5: ln_rho, 6: ln_p]
-        self.register_buffer("mu_ln_t", torch.tensor(means['ln_t_icosahedral'], dtype=torch.float32))
-        self.register_buffer("std_ln_t", torch.tensor(stds['ln_t_icosahedral'], dtype=torch.float32))
+        self.register_buffer("mu_ln_t", torch.tensor(means['ln_t_icosahedral']['mean'], dtype=torch.float32))
+        self.register_buffer("std_ln_t", torch.tensor(means['ln_t_icosahedral']['std'], dtype=torch.float32))
 
-        self.register_buffer("mu_ln_rho", torch.tensor(means['ln_rho_icosahedral'], dtype=torch.float32))
-        self.register_buffer("std_ln_rho", torch.tensor(stds['ln_rho_icosahedral'], dtype=torch.float32))
+        self.register_buffer("mu_ln_rho", torch.tensor(means['ln_rho_icosahedral']['mean'], dtype=torch.float32))
+        self.register_buffer("std_ln_rho", torch.tensor(means['ln_rho_icosahedral']['std'], dtype=torch.float32))
 
-        self.register_buffer("mu_ln_p", torch.tensor(means['ln_p_icosahedral'], dtype=torch.float32))
-        self.register_buffer("std_ln_p", torch.tensor(stds['ln_p_icosahedral'], dtype=torch.float32))
+        self.register_buffer("mu_ln_p", torch.tensor(means['ln_p_icosahedral']['mean'], dtype=torch.float32))
+        self.register_buffer("std_ln_p", torch.tensor(means['ln_p_icosahedral']['std'], dtype=torch.float32))
 
         self.mse_fn = nn.MSELoss()
 
@@ -149,11 +150,11 @@ class NonHydrostaticIcosahedralLoss(nn.Module):
         # 1. Base MSE Loss on Normalized State
         loss_mse = self.mse_fn(pred, target)
 
-        # 2. Un-normalize log-thermodynamic variables to physical log-space
+        # 2. Un-normalize log-thermodynamic variables & clamp to physical bounds
         # Shape: [Batch, Levels, Nodes]
-        ln_T_phys   = pred[:, 0, :, :] * self.std_ln_t + self.mu_ln_t
-        ln_rho_phys = pred[:, 5, :, :] * self.std_ln_rho + self.mu_ln_rho
-        ln_p_phys   = pred[:, 6, :, :] * self.std_ln_p + self.mu_ln_p
+        ln_T_phys   = torch.clamp(pred[:, 0, :, :] * self.std_ln_t + self.mu_ln_t, min=4.95, max=6.0)
+        ln_rho_phys = torch.clamp(pred[:, 5, :, :] * self.std_ln_rho + self.mu_ln_rho, min=-15.0, max=2.0)
+        ln_p_phys   = torch.clamp(pred[:, 6, :, :] * self.std_ln_p + self.mu_ln_p, min=-5.0, max=13.0)
 
         # 3. Un-normalized Ideal Gas State Equation Residual
         # ln(p) = ln(rho) + ln(R_d) + ln(T) -> Residual = ln_p - (ln_rho + ln_R_d + ln_T)
@@ -183,13 +184,11 @@ class NonHydrostaticIcosahedralLoss(nn.Module):
 
         return {
             "loss": total_loss,
-            "mse": loss_mse.item(),
-            "state_eq": loss_state_eq.item(),
-            "mass": loss_mass.item(),
-            "geo": loss_geo.item()
+            "mse": loss_mse,
+            "state_eq": loss_state_eq,
+            "mass": loss_mass,
+            "geo": loss_geo
         }
-
-        # return total_loss, loss_mse, loss_state_eq, loss_mass, loss_geo_mid
 
 
 # ==========================================
@@ -256,7 +255,10 @@ def run_training(zarr_path, edge_file, checkpoint_path, epochs, batch_size, lr):
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = NonHydrostaticIcosahedralLoss(num_nodes=dataset.num_nodes).to(device)
+    criterion = NonHydrostaticIcosahedralLoss(
+        means=dataset.stats,
+        stds=dataset.stats
+    ).to(device)
 
     print(f"[AIDA TRAINING] Starting execution for {epochs} epochs...\n")
 
@@ -271,19 +273,26 @@ def run_training(zarr_path, edge_file, checkpoint_path, epochs, batch_size, lr):
             optimizer.zero_grad()
             y_pred = model(x_batch)
 
-            total_loss, l_mse, l_state, l_mass, l_geo = criterion(y_pred, y_batch)
+            # Pass edge_index to physical loss
+            loss_dict = criterion(y_pred, y_batch, edge_index)
+            total_loss = loss_dict["loss"]
+
+            if torch.isnan(total_loss):
+                print(f"[FATAL] Loss became NaN at batch {batch_idx}. Skipping step.")
+                continue
+
             total_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             tot_loss += total_loss.item()
-            mse_acc += l_mse.item()
-            state_acc += l_state.item()
-            mass_acc += l_mass.item()
-            geo_acc += l_geo.item()
+            mse_acc += loss_dict["mse"].item()
+            state_acc += loss_dict["state_eq"].item()
+            mass_acc += loss_dict["mass"].item()
+            geo_acc += loss_dict["geo"].item()
 
-        num_batches = len(dataloader)
+        num_batches = max(1, len(dataloader))
         print(f"Epoch [{epoch:02d}/{epochs:02d}] "
               f"Total: {tot_loss/num_batches:.5f} | "
               f"MSE: {mse_acc/num_batches:.5f} | "
@@ -313,6 +322,7 @@ def main():
 
     args = parser.parse_args()
     run_training(args.zarr, args.edges, args.checkpoint, args.epochs, args.batch_size, args.lr)
+
 
 if __name__ == "__main__":
     main()

@@ -1,167 +1,210 @@
 #!/usr/bin/env python3
 """
-Operational Cycling Driver for AIDA GNN Surrogate Model.
-Executes multi-cycle forecast-assimilation updates on icosahedral unstructured grids.
+scripts/run_aida_cycling.py
+---------------------------
+AIDA Cycling Script for Inverting & Forecasting Non-Hydrostatic Log-State Fields.
+Reads NetCDF background state, standardizes using checkpoint stats, evaluates GNN,
+un-normalizes using saved dataset statistics, and exports clean analysis state.
 """
 
+import os
 import argparse
-import sys
-from pathlib import Path
-import torch
-import torch.nn as nn
-import xarray as xr
 import numpy as np
+import torch
+import netCDF4 as nc
+
+from train_aida_surrogate import IcosahedralGNNSurrogate, LOG_STATE_VARS
+
+# Thermodynamic Constants
+R_D = 287.058
 
 
-def load_gnn_model(checkpoint_path: str, graph_path_m4: str, device: str = "cpu") -> nn.Module:
-    """
-    Loads GNN checkpoint, dynamically resolving class dependencies and graph topology.
-    """
-    print(f"[AIDA INIT] Loading GNN checkpoint: {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location=device)
+def safe_log_transform(t_array, p_array):
+    """Converts absolute T and P into bounded log-states (Fallback if log-vars missing)."""
+    t_safe = np.maximum(t_array, 150.0)      # Kelvin lower floor
+    p_safe = np.maximum(p_array, 1e-4)       # Pa lower floor
 
-    # 1. Load topology required for initialization
-    print(f"[AIDA INIT] Loading Mesh Topology for model init: {graph_path_m4}")
-    edge_index_m4 = torch.load(graph_path_m4, map_location=device)
+    rho_safe = p_safe / (R_D * t_safe)
+    rho_safe = np.maximum(rho_safe, 1e-6)
 
-    # 2. Extract state dict
-    if isinstance(ckpt, torch.nn.Module):
-        model = ckpt
-    elif isinstance(ckpt, dict):
-        state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
+    ln_t = np.log(t_safe)
+    ln_p = np.log(p_safe)
+    ln_rho = np.log(rho_safe)
 
-        # Dynamically import surrogate class from train script
-        try:
-            from scripts.train_aida_surrogate import IcosahedralGNNSurrogate
-        except ImportError:
-            try:
-                from train_aida_surrogate import IcosahedralGNNSurrogate
-            except ImportError as e:
-                raise RuntimeError(
-                    f"Could not import IcosahedralGNNSurrogate from train_aida_surrogate: {e}"
-                )
-
-        # Instantiate with positional or keyword argument for topology
-        try:
-            model = IcosahedralGNNSurrogate(edge_index=edge_index_m4)
-        except TypeError:
-            model = IcosahedralGNNSurrogate(edge_index_m4)
-
-        model.load_state_dict(state_dict)
-    else:
-        raise TypeError(f"Unrecognized checkpoint format: {type(ckpt)}")
-
-    model.to(device)
-    model.eval()
-    return model
+    return ln_t, ln_p, ln_rho
 
 
-def run_single_aida_cycle(
-    bg_file: str,
+def run_cycling_inference(
+    background_file: str,
     output_file: str,
-    gnn_model: nn.Module,
-    edge_m4: torch.Tensor,
-    edge_m3: torch.Tensor,
-    expected_num_vars: int = 7,
-    device: str = "cpu",
+    gnn_ckpt: str,
+    graph_path_m4: str
 ):
-    """
-    Ingests background file, shapes 7-variable tensor, executes forward pass, 
-    and saves analysis NetCDF output.
-    """
-    print(f"\n[AIDA RUN] Processing Background File: {bg_file}")
-    ds_bg = xr.open_dataset(bg_file)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[AIDA RUN] Execution Device: {device}")
 
-    print("[AIDA RUN] Ingesting state variables into PyTorch buffers...")
-    ln_t = torch.tensor(ds_bg["ln_t_icosahedral"].values, dtype=torch.float32)
-    ln_p = torch.tensor(ds_bg["ln_p_icosahedral"].values, dtype=torch.float32)
-    ln_rho = torch.tensor(ds_bg["ln_rho_icosahedral"].values, dtype=torch.float32)
+    # ==========================================
+    # 1. LOAD CHECKPOINT & STATISTICS
+    # ==========================================
+    if not os.path.exists(gnn_ckpt):
+        raise FileNotFoundError(f"Checkpoint file not found: {gnn_ckpt}")
 
-    # Secondary / Auxiliary variables if available in NetCDF, else fill with zeros
-    aux_vars = ["u_icosahedral", "v_icosahedral", "q_icosahedral", "w_icosahedral"]
-    var_list = [ln_t, ln_p, ln_rho]
+    print(f"[AIDA INIT] Loading GNN checkpoint: {gnn_ckpt}")
+    checkpoint = torch.load(gnn_ckpt, map_location=device, weights_only=False)
 
-    for v_name in aux_vars:
-        if v_name in ds_bg.data_vars:
-            var_list.append(torch.tensor(ds_bg[v_name].values, dtype=torch.float32))
-        else:
-            # Zero-pad missing auxiliary variables to match 7-var model requirement
-            var_list.append(torch.zeros_like(ln_t))
+    stats = checkpoint['stats']
+    var_names = checkpoint.get('var_names', LOG_STATE_VARS)
+    edge_index = torch.load(graph_path_m4, weights_only=False).to(device)
 
-    # Ensure feature vector matches expected input dimensions (7 variables x 32 levels = 224 channels)
-    while len(var_list) < expected_num_vars:
-        var_list.append(torch.zeros_like(ln_t))
+    # Reconstruct Model architecture
+    model = IcosahedralGNNSurrogate(
+        edge_index=edge_index,
+        in_vars=len(var_names),
+        levels=32
+    ).to(device)
 
-    # Stack variables -> shape: (7, levels, num_nodes)
-    raw_vars = torch.stack(var_list, dim=0)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
 
-    # Format 4D Batch input: (batch_size=1, num_vars=7, levels=32, num_nodes=2562)
-    if raw_vars.dim() == 3:
-        x_in = raw_vars.unsqueeze(0).to(device)
-    elif raw_vars.dim() == 2:
-        x_in = raw_vars.unsqueeze(0).unsqueeze(2).to(device)
-    else:
-        raise ValueError(f"Unexpected tensor shape: {raw_vars.shape}")
+    # ==========================================
+    # 2. INGEST BACKGROUND NETCDF FILE
+    # ==========================================
+    print(f"[AIDA RUN] Processing Background File: {background_file}")
+    with nc.Dataset(background_file, 'r') as ds:
+        raw_vars = {}
+        for var in var_names:
+            if var in ds.variables:
+                raw_vars[var] = np.asarray(ds.variables[var][:], dtype=np.float32)
+            else:
+                print(f"[WARNING] Variable {var} missing in input file. Attempting on-the-fly log derivation...")
+                # Derive from basic T and P if log fields are not pre-computed
+                t_raw = ds.variables['t_icosahedral'][:]
+                p_raw = ds.variables['p_icosahedral'][:]
+                ln_t, ln_p, ln_rho = safe_log_transform(t_raw, p_raw)
+                raw_vars['ln_t_icosahedral'] = ln_t
+                raw_vars['ln_p_icosahedral'] = ln_p
+                raw_vars['ln_rho_icosahedral'] = ln_rho
 
-    print(f"[AIDA GNN] Evaluating surrogate forecast model with input shape {list(x_in.shape)}...")
+    # Construct input array matching: [Vars, Levels, Nodes]
+    state_list = []
+    for var in var_names:
+        arr = raw_vars[var]
+        mean = stats[var]['mean']
+        std = stats[var]['std'] if stats[var]['std'] > 1e-6 else 1.0
+
+        # Sanitize NaNs/Infs directly in raw background input
+        arr_clean = np.nan_to_num(arr, nan=mean, posinf=mean, neginf=mean)
+        
+        # Standardize: Z-Score
+        norm_arr = (arr_clean - mean) / std
+        state_list.append(norm_arr)
+
+    # Shape: [1, 7, 32, 2562]
+    x_input = np.stack(state_list, axis=0)[np.newaxis, ...]
+    x_tensor = torch.from_numpy(x_input).float().to(device)
+
+    # Check input buffer for lingering NaNs
+    if torch.isnan(x_tensor).any():
+        print("[FATAL] Input state tensor contains NaNs prior to forward pass! Replacing with 0.0.")
+        x_tensor = torch.nan_to_num(x_tensor, nan=0.0)
+
+    # ==========================================
+    # 3. GNN FORWARD PASS & UN-NORMALIZATION
+    # ==========================================
+    print(f"[AIDA GNN] Evaluating surrogate forecast model with input shape {list(x_tensor.shape)}...")
     with torch.no_grad():
-        output_delta = gnn_model(x_in)
+        y_pred_norm = model(x_tensor)  # Shape: [1, 7, 32, 2562]
 
-    # Format outputs
-    if output_delta.dim() == 4:
-        output_delta = output_delta.squeeze(0)  # (7, levels, num_nodes)
+    # Convert back to NumPy CPU
+    y_pred_norm = y_pred_norm.squeeze(0).cpu().numpy()
 
-    # Extract log-state updates
-    delta_ln_t = output_delta[0].cpu().numpy()
-    delta_ln_p = output_delta[1].cpu().numpy()
-    delta_ln_rho = output_delta[2].cpu().numpy()
+    # Un-normalize back to physical log-space values
+    unnorm_state = {}
+    for idx, var in enumerate(var_names):
+        mean = stats[var]['mean']
+        std = stats[var]['std'] if stats[var]['std'] > 1e-6 else 1.0
 
-    # Apply predicted analysis increments
-    ds_anal = ds_bg.copy(deep=True)
-    ds_anal["ln_t_icosahedral"].values += delta_ln_t
-    ds_anal["ln_p_icosahedral"].values += delta_ln_p
-    ds_anal["ln_rho_icosahedral"].values += delta_ln_rho
+        # Un-normalize: x = norm * std + mean
+        phys_val = (y_pred_norm[idx] * std) + mean
 
-    # Add cycle tracking attributes
-    ds_anal.attrs["aida_status"] = "ANALYSIS_CYCLE_COMPLETE"
-    ds_anal.attrs["aida_gnn_applied"] = "TRUE"
+        # Physical clamping on log-state variables to prevent exponential/overflow issues
+        if var == 'ln_t_icosahedral':
+            phys_val = np.clip(phys_val, 4.95, 6.0)     # ~140 K to 403 K
+        elif var == 'ln_p_icosahedral':
+            phys_val = np.clip(phys_val, -5.0, 13.0)   # ~0.006 Pa to 440 kPa
+        elif var == 'ln_rho_icosahedral':
+            phys_val = np.clip(phys_val, -15.0, 2.0)
 
-    # Export analysis file
-    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    ds_anal.to_netcdf(output_file)
+        # Final sanity check against any lingering NaNs in output
+        nan_count = np.isnan(phys_val).sum()
+        if nan_count > 0:
+            print(f"[WARNING] {var} output contains {nan_count} NaNs. Filling with mean: {mean:.4f}")
+            phys_val = np.nan_to_num(phys_val, nan=mean)
+
+        unnorm_state[var] = phys_val
+
+    # ==========================================
+    # 4. EXPORT TO OUTPUT NETCDF
+    # ==========================================
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
+    # Copy background file structure and update log variables
+    with nc.Dataset(background_file, 'r') as src, nc.Dataset(output_file, 'w') as dst:
+        # Copy dimensions
+        for name, dimension in src.dimensions.items():
+            dst.createDimension(name, (len(dimension) if not dimension.isunlimited() else None))
+
+        # Copy global attributes
+        dst.setncatts({k: src.getncattr(k) for k in src.ncattrs()})
+        dst.aida_status = "ANALYSIS_CYCLE_COMPLETE"
+        dst.aida_gnn_applied = "TRUE"
+
+        # Write variables safely
+        for var_name, var_obj in src.variables.items():
+            # Determine fill value safely based on data type
+            fill_val = None
+            if hasattr(var_obj, '_FillValue'):
+                fill_val = var_obj._FillValue
+            elif np.issubdtype(var_obj.datatype, np.floating):
+                fill_val = np.nan
+
+            # Create variable using source datatype and valid fill_value
+            out_var = dst.createVariable(
+                var_name,
+                var_obj.datatype,
+                var_obj.dimensions,
+                fill_value=fill_val
+            )
+
+            # Copy existing variable attributes (excluding _FillValue as it's set above)
+            out_var.setncatts({
+                k: var_obj.getncattr(k) for k in var_obj.ncattrs() if k != '_FillValue'
+            })
+
+            # Assign updated GNN prediction or copy original source data
+            if var_name in unnorm_state:
+                out_var[:] = unnorm_state[var_name]
+            else:
+                out_var[:] = src.variables[var_name][:]
+
     print(f"[AIDA SUCCESS] Exported analysis file: {output_file}")
-
-    return output_file
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AIDA GNN Surrogate Cycling Loop Driver")
-    parser.add_argument("--background", type=str, required=True, help="Path to input NetCDF background file")
-    parser.add_argument("--output_file", type=str, required=True, help="Path for output NetCDF analysis file")
-    parser.add_argument("--gnn_ckpt", type=str, required=True, help="Path to GNN surrogate PyTorch checkpoint")
-    parser.add_argument("--graph_path_m4", type=str, required=True, help="Path to mesh M4 topology edge tensor")
-    parser.add_argument("--graph_path_m3", type=str, required=True, help="Path to mesh M3 topology edge tensor")
-    parser.add_argument("--device", type=str, default="cpu", help="Device to execute GNN model (cpu/cuda)")
+    parser = argparse.ArgumentParser(description="Run AIDA Cycling Inference")
+    parser.add_argument("-b", "--background", required=True, help="Input NetCDF background file")
+    parser.add_argument("-o", "--output_file", required=True, help="Output Analysis NetCDF file")
+    parser.add_argument("-c", "--gnn_ckpt", required=True, help="Path to trained GNN checkpoint (.pt)")
+    parser.add_argument("-g4", "--graph_path_m4", required=True, help="Path to M4 mesh edge_index (.pt)")
+    parser.add_argument("-g3", "--graph_path_m3", default=None, help="Path to M3 mesh edge_index (optional)")
+
     args = parser.parse_args()
 
-    # 1. Load topological graphs
-    print(f"[AIDA INIT] Loading Mesh Topology M4: {args.graph_path_m4}")
-    edge_m4 = torch.load(args.graph_path_m4, map_location=args.device)
-    print(f"[AIDA INIT] Loading Mesh Topology M3: {args.graph_path_m3}")
-    edge_m3 = torch.load(args.graph_path_m3, map_location=args.device)
-
-    # 2. Load surrogate model
-    gnn_model = load_gnn_model(args.gnn_ckpt, args.graph_path_m4, device=args.device)
-
-    # 3. Execute cycling step
-    run_single_aida_cycle(
-        bg_file=args.background,
+    run_cycling_inference(
+        background_file=args.background,
         output_file=args.output_file,
-        gnn_model=gnn_model,
-        edge_m4=edge_m4,
-        edge_m3=edge_m3,
-        expected_num_vars=7,
-        device=args.device,
+        gnn_ckpt=args.gnn_ckpt,
+        graph_path_m4=args.graph_path_m4
     )
 
 
