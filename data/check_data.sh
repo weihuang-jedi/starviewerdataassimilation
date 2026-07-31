@@ -2,10 +2,18 @@
 s3dir=s3://noaa-gfs-bdp-pds
 
 totalyears=1
-startyear=2023
+startyear=2024
 #res=0p25
 res=1p00
-forecasthour=f006
+forecasthour=f000
+
+if [ "${forecasthour}" == "f000" ]; then
+   regular_dir=regular_truth
+   icosahedral_dir=icosahedral_truth
+else
+   regular_dir=regular_grid
+   icosahedral_dir=icosahedral_grid
+fi
 
 dayinmonth=(31 28 31 30 31 30 31 31 30 31 30 31)
 
@@ -50,15 +58,18 @@ do
          for HH in 00 06 12 18
          do
 	    iflnm=gfs.t${HH}z.pgrb2b.${res}.${forecasthour}
-	    ncflnm=regular_grid/gfs.${YYYY}${MM}${DD}.t${HH}z.${res}.${forecasthour}.nc
-	    mlgridflnm=icosahedral_grid/global_icosahedral_m4.${YYYY}${MM}${DD}.t${HH}z.${res}.${forecasthour}.nc
+	    ncflnm=${regular_dir}/gfs.${YYYY}${MM}${DD}.t${HH}z.${res}.${forecasthour}.nc
+	    mlgridflnm=${icosahedral_dir}/global_icosahedral_m4.${YYYY}${MM}${DD}.t${HH}z.${res}.${forecasthour}.nc
 
             if [ ! -f ${mlgridflnm} ]
             then
 	       keepgoing=false
 	       tflnm=tmp_${YYYY}${MM}${DD}_gfs.t${HH}z.pgrb2b.${res}.${forecasthour}
-               echo "aws s3 cp --no-sign-request ${s3dir}/${fdir}/${HH}/atmos/${iflnm} ${tflnm}"
-	       echo "python interpolate_to_heights.py -i ${tflnm} -o ${ncflnm}"
+	       if [ ! -f ${ncflnm} ]
+	       then
+                  echo "aws s3 cp --no-sign-request ${s3dir}/${fdir}/${HH}/atmos/${iflnm} ${tflnm}"
+	          echo "python interpolate_to_heights.py -i ${tflnm} -o ${ncflnm}"
+	       fi
 	       echo "python interpolate2icosahedral.py --input ${ncflnm} --mesh graph/global_icosahedral_mesh_m4.nc --output ${mlgridflnm}"
 	       break
             else

@@ -1,0 +1,7 @@
+log.*
+*.png
+bufr.data
+bufr_data/
+gfs.20230701.t12z.1p00.anal.nc.conv-only
+gfs.t12z.bufrsnd.tar.gz
+

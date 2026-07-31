@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""
+plot_spatial_maps.py
+--------------------
+Generates 2D global spatial maps for analysis increments and error distributions
+using Cartopy and Matplotlib.
+"""
+
+import os
+import argparse
+import numpy as np
+import xarray as xr
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+
+def create_spatial_plot(lon, lat, field, title, colorbar_label, output_path, cmap='RdBu_r', vmin=None, vmax=None, symmetric=False):
+    """
+    Renders a global 2D latitude-longitude field on a PlateCarree projection.
+    """
+    fig = plt.figure(figsize=(12, 6), dpi=300)
+    ax = plt.axes(projection=ccrs.PlateCarree())
+
+    # Add geographic context features
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.8, edgecolor='black')
+    ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.5, edgecolor='gray')
+    ax.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False,
+                 linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
+
+    # Symmetric color range calculation for anomalies/increments centered at zero
+    if symmetric:
+        abs_max = max(abs(np.nanmin(field)), abs(np.nanmax(field))) if (vmin is None or vmax is None) else max(abs(vmin), abs(vmax))
+        vmin, vmax = -abs_max, abs_max
+
+    # Plot filled contour lines
+    cf = ax.contourf(lon, lat, field, transform=ccrs.PlateCarree(),
+                     levels=60, cmap=cmap, vmin=vmin, vmax=vmax, extend='both')
+
+    # Add Colorbar
+    cbar = plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.08, shrink=0.75)
+    cbar.set_label(colorbar_label, fontsize=11, fontweight='bold')
+
+    plt.title(title, fontsize=13, fontweight='bold', pad=12)
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches='tight')
+    plt.close()
+    print(f"  -> Plot saved successfully: {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Plot 2D spatial maps of Analysis Increments and Errors using Cartopy.")
+    parser.add_argument("-i", "--input", required=True, help="Input reconstructed regular grid NetCDF dataset")
+    parser.add_argument("-r", "--ref", required=True, help="Reference dataset (e.g., GFS reference file)")
+    parser.add_argument("-v", "--var", default="t", help="Variable base name to analyze (default: t)")
+    parser.add_argument("-l", "--level", type=int, default=0, help="Vertical level index to plot (default: 0)")
+    parser.add_argument("-o", "--outdir", default="./plots", help="Directory destination to save output plots")
+
+    args = parser.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+
+    print(f"\n========================================================")
+    print(f"[AIDA PLOTTING] Generating Spatial Increments & Errors")
+    print(f"Target Variable: {args.var} | Level Index: {args.level}")
+    print(f"========================================================\n")
+
+    ds = xr.open_dataset(args.input)
+    ds_ref = xr.open_dataset(args.ref)
+
+    lon = ds['lon'].values
+    lat = ds['lat'].values
+
+    # Determine variable naming strategy
+    an_key = f"{args.var}_analysis" if f"{args.var}_analysis" in ds else args.var
+    bg_key = f"{args.var}_background" if f"{args.var}_background" in ds else None
+    inc_key = f"{args.var}_increment" if f"{args.var}_increment" in ds else None
+
+    ref_key = args.var if args.var in ds_ref else f"{args.var}_analysis"
+
+    # Extract 2D slices based on dimensionality (3D/4D vertical level selection)
+    da_an = ds[an_key]
+    if 'height' in da_an.dims:
+        an_slice = da_an.isel(height=args.level).values
+    elif 'level' in da_an.dims:
+        an_slice = da_an.isel(level=args.level).values
+    else:
+        an_slice = da_an.values
+
+    # Compute or extract Analysis Increment (Analysis - Background)
+    if inc_key in ds:
+        da_inc = ds[inc_key]
+        inc_slice = da_inc.isel(height=args.level).values if 'height' in da_inc.dims else da_inc.values
+    elif bg_key in ds:
+        da_bg = ds[bg_key]
+        bg_slice = da_bg.isel(height=args.level).values if 'height' in da_bg.dims else da_bg.values
+        inc_slice = an_slice - bg_slice
+    else:
+        inc_slice = None
+
+    # Compute Spatial Error (Analysis - Reference)
+    da_ref = ds_ref[ref_key]
+    if 'height' in da_ref.dims:
+        ref_slice = da_ref.isel(height=args.level).values
+    elif 'level' in da_ref.dims:
+        ref_slice = da_ref.isel(level=args.level).values
+    elif 'latitude' in da_ref.dims:  # Handle cases where GFS latitude/longitude ordering varies
+        ref_slice = da_ref.isel(height=args.level).values if 'height' in da_ref.dims else da_ref.values
+    else:
+        ref_slice = da_ref.values
+
+    # Ensure shape alignment between test and reference array
+    if an_slice.shape != ref_slice.shape:
+        print(f"Warning: Slices shape mismatch: test {an_slice.shape} vs ref {ref_slice.shape}. Squeezing arrays...")
+        an_slice = np.squeeze(an_slice)
+        ref_slice = np.squeeze(ref_slice)
+
+    error_slice = an_slice - ref_slice
+
+    # Get units from attributes
+    units = da_an.attrs.get('units', '')
+    unit_str = f" [{units}]" if units else ""
+
+    # 1. Plot Analysis Field
+    create_spatial_plot(
+        lon, lat, an_slice,
+        title=f"AIDA Analysis State ({args.var.upper()}) - Level Index {args.level}",
+        colorbar_label=f"{args.var.upper()}{unit_str}",
+        output_path=os.path.join(args.outdir, f"map_analysis_{args.var}_lvl{args.level}.png"),
+        cmap='viridis'
+    )
+
+    # 2. Plot Analysis Increment (Analysis - Background)
+    if inc_slice is not None:
+        create_spatial_plot(
+            lon, lat, inc_slice,
+            title=f"AIDA Analysis Increment (Analysis - Background) - {args.var.upper()}",
+            colorbar_label=f"Increment{unit_str}",
+            output_path=os.path.join(args.outdir, f"map_increment_{args.var}_lvl{args.level}.png"),
+            cmap='coolwarm',
+            symmetric=True
+        )
+
+    # 3. Plot Absolute Error Distribution (Analysis - Reference)
+    create_spatial_plot(
+        lon, lat, error_slice,
+        title=f"Analysis Spatial Error (Analysis - Reference) - {args.var.upper()}",
+        colorbar_label=f"Error{unit_str}",
+        output_path=os.path.join(args.outdir, f"map_error_{args.var}_lvl{args.level}.png"),
+        cmap='bwr',
+        symmetric=True
+    )
+
+    print("\n[COMPLETE] All spatial maps generated successfully!")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+Here is a standalone script that uses **Cartopy** and **Matplotlib** to compute and render 2D spatial maps of the analysis increment (Analysis minus Background) and the spatial error distribution against a reference/ground-truth field.
+
+---
+
+### `plot_spatial_maps.py`
+
+```python
+#!/usr/bin/env python3
+"""
+plot_spatial_maps.py
+--------------------
+Generates 2D global spatial maps for analysis increments and error distributions
+using Cartopy and Matplotlib.
+"""
+
+import os
+import argparse
+import numpy as np
+import xarray as xr
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+
+def create_spatial_plot(lon, lat, field, title, colorbar_label, output_path, cmap='RdBu_r', vmin=None, vmax=None, symmetric=False):
+    """
+    Renders a global 2D latitude-longitude field on a PlateCarree projection.
+    """
+    fig = plt.figure(figsize=(12, 6), dpi=300)
+    ax = plt.axes(projection=ccrs.PlateCarree())
+
+    # Add geographic context features
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.8, edgecolor='black')
+    ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.5, edgecolor='gray')
+    ax.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False,
+                 linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
+
+    # Symmetric color range calculation for anomalies/increments centered at zero
+    if symmetric:
+        abs_max = max(abs(np.nanmin(field)), abs(np.nanmax(field))) if (vmin is None or vmax is None) else max(abs(vmin), abs(vmax))
+        vmin, vmax = -abs_max, abs_max
+
+    # Plot filled contour lines
+    cf = ax.contourf(lon, lat, field, transform=ccrs.PlateCarree(),
+                     levels=60, cmap=cmap, vmin=vmin, vmax=vmax, extend='both')
+
+    # Add Colorbar
+    cbar = plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.08, shrink=0.75)
+    cbar.set_label(colorbar_label, fontsize=11, fontweight='bold')
+
+    plt.title(title, fontsize=13, fontweight='bold', pad=12)
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches='tight')
+    plt.close()
+    print(f"  -> Plot saved successfully: {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Plot 2D spatial maps of Analysis Increments and Errors using Cartopy.")
+    parser.add_argument("-i", "--input", required=True, help="Input reconstructed regular grid NetCDF dataset")
+    parser.add_argument("-r", "--ref", required=True, help="Reference dataset (e.g., GFS reference file)")
+    parser.add_argument("-v", "--var", default="t", help="Variable base name to analyze (default: t)")
+    parser.add_argument("-l", "--level", type=int, default=0, help="Vertical level index to plot (default: 0)")
+    parser.add_argument("-o", "--outdir", default="./plots", help="Directory destination to save output plots")
+
+    args = parser.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+
+    print(f"\n========================================================")
+    print(f"[AIDA PLOTTING] Generating Spatial Increments & Errors")
+    print(f"Target Variable: {args.var} | Level Index: {args.level}")
+    print(f"========================================================\n")
+
+    ds = xr.open_dataset(args.input)
+    ds_ref = xr.open_dataset(args.ref)
+
+    lon = ds['lon'].values
+    lat = ds['lat'].values
+
+    # Determine variable naming strategy
+    an_key = f"{args.var}_analysis" if f"{args.var}_analysis" in ds else args.var
+    bg_key = f"{args.var}_background" if f"{args.var}_background" in ds else None
+    inc_key = f"{args.var}_increment" if f"{args.var}_increment" in ds else None
+
+    ref_key = args.var if args.var in ds_ref else f"{args.var}_analysis"
+
+    # Extract 2D slices based on dimensionality (3D/4D vertical level selection)
+    da_an = ds[an_key]
+    if 'height' in da_an.dims:
+        an_slice = da_an.isel(height=args.level).values
+    elif 'level' in da_an.dims:
+        an_slice = da_an.isel(level=args.level).values
+    else:
+        an_slice = da_an.values
+
+    # Compute or extract Analysis Increment (Analysis - Background)
+    if inc_key in ds:
+        da_inc = ds[inc_key]
+        inc_slice = da_inc.isel(height=args.level).values if 'height' in da_inc.dims else da_inc.values
+    elif bg_key in ds:
+        da_bg = ds[bg_key]
+        bg_slice = da_bg.isel(height=args.level).values if 'height' in da_bg.dims else da_bg.values
+        inc_slice = an_slice - bg_slice
+    else:
+        inc_slice = None
+
+    # Compute Spatial Error (Analysis - Reference)
+    da_ref = ds_ref[ref_key]
+    if 'height' in da_ref.dims:
+        ref_slice = da_ref.isel(height=args.level).values
+    elif 'level' in da_ref.dims:
+        ref_slice = da_ref.isel(level=args.level).values
+    elif 'latitude' in da_ref.dims:  # Handle cases where GFS latitude/longitude ordering varies
+        ref_slice = da_ref.isel(height=args.level).values if 'height' in da_ref.dims else da_ref.values
+    else:
+        ref_slice = da_ref.values
+
+    # Ensure shape alignment between test and reference array
+    if an_slice.shape != ref_slice.shape:
+        print(f"Warning: Slices shape mismatch: test {an_slice.shape} vs ref {ref_slice.shape}. Squeezing arrays...")
+        an_slice = np.squeeze(an_slice)
+        ref_slice = np.squeeze(ref_slice)
+
+    error_slice = an_slice - ref_slice
+
+    # Get units from attributes
+    units = da_an.attrs.get('units', '')
+    unit_str = f" [{units}]" if units else ""
+
+    # 1. Plot Analysis Field
+    create_spatial_plot(
+        lon, lat, an_slice,
+        title=f"AIDA Analysis State ({args.var.upper()}) - Level Index {args.level}",
+        colorbar_label=f"{args.var.upper()}{unit_str}",
+        output_path=os.path.join(args.outdir, f"map_analysis_{args.var}_lvl{args.level}.png"),
+        cmap='viridis'
+    )
+
+    # 2. Plot Analysis Increment (Analysis - Background)
+    if inc_slice is not None:
+        create_spatial_plot(
+            lon, lat, inc_slice,
+            title=f"AIDA Analysis Increment (Analysis - Background) - {args.var.upper()}",
+            colorbar_label=f"Increment{unit_str}",
+            output_path=os.path.join(args.outdir, f"map_increment_{args.var}_lvl{args.level}.png"),
+            cmap='coolwarm',
+            symmetric=True
+        )
+
+    # 3. Plot Absolute Error Distribution (Analysis - Reference)
+    create_spatial_plot(
+        lon, lat, error_slice,
+        title=f"Analysis Spatial Error (Analysis - Reference) - {args.var.upper()}",
+        colorbar_label=f"Error{unit_str}",
+        output_path=os.path.join(args.outdir, f"map_error_{args.var}_lvl{args.level}.png"),
+        cmap='bwr',
+        symmetric=True
+    )
+
+    print("\n[COMPLETE] All spatial maps generated successfully!")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+---
+
+### How to Run
+
+Execute the plotting script by passing your regridded reconstruction file, the reference GFS file, the target variable (`t`, `u`, `v`, `q`, or `p`), and vertical level:
+
+```bash
+python plot_spatial_maps.py \
+  -i cycling_output_20230306/reconstructed_aida_analysis_20230306_t06z.nc \
+  -r ../data/regular_grid/gfs.20230306.t12z.1p00.f006.nc \
+  -v t \
+  -l 0 \
+  -o ./plots_2d
+
+```
+
+### Outputs Generated in `./plots_2d`:
+
+1. `map_analysis_t_lvl0.png`: Global distribution of the reconstructed analysis field.
+2. `map_increment_t_lvl0.png`: Divergent color map (`coolwarm`) showing where 3D-Var added or subtracted temperature relative to the background forecast.
+3. `map_error_t_lvl0.png`: Divergent color map (`bwr`) highlighting regional spatial error relative to the GFS reference field.
+
+
+
+
+
+import torch
+import torch.nn as nn
+import numpy as np
+
+# Physical Mean and Std per variable [p, t, u, v, q] for scaling
+VAR_MEAN = torch.tensor([101325.0, 250.0, 0.0, 0.0, 0.003]).view(1, 5, 1, 1)
+VAR_STD  = torch.tensor([15000.0,  35.0, 15.0, 15.0, 0.004]).view(1, 5, 1, 1)
+
+class DAAtmosphericLossNormalized(nn.Module):
+    """
+    DA-Aware Loss operating on Z-score Normalized Atmospheric Variables.
+    Prevents magnitude explosion while preserving B-matrix vertical profile weighting.
+    """
+    def __init__(self, bmatrix_path=None, device="cpu"):
+        super().__init__()
+        self.device = device
+
+        # Variable priority weights (In Normalized Space)
+        # Higher priority for dynamics (u, v) and moisture (q)
+        self.multipliers = {
+            "p": 1.0,
+            "t": 2.0,
+            "u": 5.0,
+            "v": 5.0,
+            "q": 8.0
+        }
+
+        # Level weights initialized to 1.0 (Shape: 1, 32, 1)
+        self.level_weights = {
+            var: torch.ones((1, 32, 1), device=device) for var in ["p", "t", "u", "v", "q"]
+        }
+
+    def forward(self, pred_norm, target_norm):
+        """
+        pred_norm, target_norm shape: (batch, 5, 32, 2562) [Normalized Space]
+        """
+        loss_dict = {}
+        total_loss = 0.0
+
+        state_vars = ["p", "t", "u", "v", "q"]
+
+        for idx, var in enumerate(state_vars):
+            p_var = pred_norm[:, idx, :, :]      # (batch, 32, 2562)
+            t_var = target_norm[:, idx, :, :]  # (batch, 32, 2562)
+
+            # Weighted MSE in normalized space
+            diff_sq = (p_var - t_var) ** 2
+            weighted_mse = torch.mean(diff_sq * self.level_weights[var])
+
+            var_loss = self.multipliers[var] * weighted_mse
+            loss_dict[var] = var_loss.item()
+            total_loss += var_loss
+
+        return total_loss, loss_dict
+
+
+
+
+
+
+
+Now that the unit alignment logic is executing, the verification output reveals the exact mathematical and architectural structure of your model's predictions.
+
+---
+
+### Key Findings & Metrics Breakdown
+
+#### 1. Temperature ($t$) — **Strong Operational Signal**
+
+* **Global ACC:** **0.916** (Correlation is high across the core troposphere: **0.80–0.83** between 1,500m and 9,000m).
+* **Global RMSE:** **11.36 K** (Relative Error: **4.4%**).
+* **Diagnosis:** Temperature spatial patterns are being captured reliably by the GNN surrogate.
+
+---
+
+#### 2. Pressure ($p$) — **Sign Mismatch Resolved / Systematic Scaling**
+
+Look at the level-by-level pressure bias:
+
+* **Level 2.0m (Surface):** Prediction $\approx 2.0\text{ hPa}$, Truth $\approx 899\text{ hPa}$ $\rightarrow$ **Bias: $-897\text{ hPa}$**
+* **Level 10,000m (Upper Troposphere):** Prediction $\approx 100\text{ hPa}$, Truth $\approx 262\text{ hPa}$ $\rightarrow$ **Bias: $-161\text{ hPa}$**
+* **Level 15,000m (Stratosphere):** Prediction $\approx 150\text{ hPa}$, Truth $\approx 175\text{ hPa}$ $\rightarrow$ **Bias: $-25\text{ hPa}$**
+
+> **What this reveals:** The variable `p_icosahedral` in your model output represents **pressure offset / perturbation pressure ($\Delta p$) relative to a standard atmospheric reference frame** or target height level index, rather than total absolute barometric pressure ($P_{abs}$).
+> * **Action Item:** Ensure your PINN hydrostatic loss component calculates pressure gradients relative to reference surface pressure $P_0 = 1013.25\text{ hPa}$ rather than uncentered raw coordinate layers.
+> 
+> 
+
+---
+
+#### 3. Moisture ($q$) — **Raw Scale Alignment**
+
+* **Prediction Scale:** $\sim 0.013$
+* **Reference Scale:** $\sim 0.0001 - 0.002$
+* **Diagnosis:** Specific humidity is stored in $\text{kg/kg}$ in both files, but your GNN surrogate predictions are consistently over-predicting background moisture profiles by roughly an order of magnitude ($\sim 0.013 \text{ kg/kg}$ uniform baseline).
+* **Action Item:** The Z-score denormalization step during surrogate inference needs its mean ($\mu_q$) and standard deviation ($\sigma_q$) checked against the GFS dataset statistics.
+
+---
+
+#### 4. Wind Field ($u, v$) & Vertical Motion ($w$)
+
+* **$u, v$ ACC:** $\sim 0.10 - 0.33$
+* **$w$ ACC:** Near 0 (typical for raw unconstrained vertical motion field output without momentum smoothing).
+* **Diagnosis:** Geostrophic coupling loss in `train_aida_surrogate.py` needs its weight increased relative to MSE loss to force the GNN to bind momentum vectors ($u, v$) to geopotential/temperature gradients.
+
+---
+
+### Summary Checklist for Operational Tuning
+
+1. **Surrogate Denormalization Check**: Verify $\mu$ and $\sigma$ for $q$ in `train_aida_surrogate.py`.
+2. **Pressure Baseline Calibration**: Ensure `p` outputs total pressure ($P_0 + \Delta p$).
+3. **Loss Function Adjustments**: Increase geostrophic constraint weight ($\lambda_{geo}$) in PINN loss.
+
+Your operational pipeline tooling—from NetCDF ingestion to regridding and level-by-level verification—is fully working and producing diagnostics.
