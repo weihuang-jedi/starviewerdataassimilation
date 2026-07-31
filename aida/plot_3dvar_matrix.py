@@ -1,151 +1,211 @@
 #!/usr/bin/env python3
 """
-3D-Var Multi-Variable Level Matrix Plotter
-------------------------------------------
-Generates a 5x7 panel grid:
-  - Rows (5): Variables [t, p, u, v, q]
-  - Columns (7): Levels [0, 5, 10, 15, 20, 25, 30]
-
-Usage:
-  python3 plot_3dvar_matrix.py gfs_5var_3dvar_analysis.nc
+3D-Var Matrix Plotter for Unstructured Icosahedral NetCDF Files.
+Safely handles non-finite values (NaN/Inf), constant field slices, and unstructured triangulation.
 """
 
 import argparse
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-import matplotlib.pyplot as plt
+import sys
+from pathlib import Path
 import numpy as np
 import xarray as xr
-
-VARS = ["t", "p", "u", "v", "q"]
-LEVELS = [0, 5, 10, 15, 20, 25, 30]
-
-
-def get_coord_name(ds, candidates):
-    for c in candidates:
-        if c in ds.coords or c in ds.dims:
-            return c
-    raise KeyError(f"Could not find coordinates matching {candidates}")
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
 
 
-def plot_increment_matrix(nc_file: str, output_png: str = "3dvar_increment_matrix.png"):
-    print(f"Loading 3D-Var dataset: {nc_file}")
-    ds = xr.open_dataset(nc_file)
+def inspect_netcdf_sanitizations(ds: xr.Dataset):
+    """
+    Prints diagnostic summary of missing/non-finite values across target variables.
+    """
+    print("\n--- [AIDA DIAGNOSTICS] NetCDF Field Integrity Check ---")
+    target_vars = [v for v in ds.data_vars if "icosahedral" in v or "ln_" in v]
+    if not target_vars:
+        target_vars = list(ds.data_vars.keys())
 
-    lon_name = get_coord_name(ds, ["longitude", "lon"])
-    lat_name = get_coord_name(ds, ["latitude", "lat"])
-    h_name = get_coord_name(ds, ["height", "level", "lev", "z"])
+    for v in target_vars:
+        arr = ds[v].values
+        n_nan = np.isnan(arr).sum()
+        n_inf = np.isinf(arr).sum()
+        total = arr.size
+        min_val = np.nanmin(arr) if total > n_nan else np.nan
+        max_val = np.nanmax(arr) if total > n_nan else np.nan
+        print(
+            f"Variable: {v:25s} | Shape: {str(arr.shape):15s} | "
+            f"NaNs: {n_nan:6d} ({(n_nan/total)*100:.1f}%) | "
+            f"Infs: {n_inf:6d} | Min: {min_val:.4f} | Max: {max_val:.4f}"
+        )
+    print("-------------------------------------------------------\n")
 
-    lons = ds[lon_name].values
-    lats = ds[lat_name].values
-    heights = ds[h_name].values
-    lon_grid, lat_grid = np.meshgrid(lons, lats)
 
-    # Compute increments for all variables beforehand
-    inc_data = {}
-    for var in VARS:
-        ana_var = f"{var}_ana" if f"{var}_ana" in ds else f"{var}_analysis"
-        bg_var = f"{var}_bg" if f"{var}_bg" in ds else f"{var}_background"
+def get_mesh_coordinates(ds: xr.Dataset):
+    """
+    Extracts longitude and latitude arrays, handling 1D unstructured node arrays.
+    Converts longitudes to standard [-180, 180] range if required.
+    """
+    lon_keys = ["lon", "longitude", "grid_lon", "lons"]
+    lat_keys = ["lat", "latitude", "grid_lat", "lats"]
 
-        if f"{var}_increment" in ds:
-            inc = ds[f"{var}_increment"].astype(np.float32)
-        elif ana_var in ds and bg_var in ds:
-            inc = (ds[ana_var] - ds[bg_var]).astype(np.float32)
+    lon, lat = None, None
+
+    for k in lon_keys:
+        if k in ds.coords or k in ds.data_vars:
+            lon = ds[k].values
+            break
+
+    for k in lat_keys:
+        if k in ds.coords or k in ds.data_vars:
+            lat = ds[k].values
+            break
+
+    if lon is None or lat is None:
+        raise KeyError(f"Could not locate 1D coordinate variables for mesh nodes in: {list(ds.keys())}")
+
+    lon = lon.flatten()
+    lat = lat.flatten()
+
+    # Convert [0, 360] to [-180, 180] for standard map projections
+    lon = np.where(lon > 180.0, lon - 360.0, lon)
+
+    return lon, lat
+
+
+def safe_tricontourf(ax, lon, lat, data_sub, levels=15, cmap="viridis", title_str=""):
+    """
+    Renders tricontourf with explicit NaN/Inf filtering and constant field padding.
+    """
+    lon_flat = np.asarray(lon).flatten()
+    lat_flat = np.asarray(lat).flatten()
+    z_flat = np.asarray(data_sub).flatten()
+
+    # 1. Filter out non-finite points
+    valid_mask = np.isfinite(z_flat) & np.isfinite(lon_flat) & np.isfinite(lat_flat)
+
+    if not np.any(valid_mask):
+        ax.text(0.5, 0.5, "ALL-NAN SLICE", ha="center", va="center", transform=ax.transAxes, color="red", fontsize=9, weight="bold")
+        ax.set_title(title_str, fontsize=8)
+        return None
+
+    lon_clean = lon_flat[valid_mask]
+    lat_clean = lat_flat[valid_mask]
+    z_clean = z_flat[valid_mask]
+
+    # Need at least 3 distinct non-collinear points for Delaunay triangulation
+    if len(z_clean) < 3:
+        ax.text(0.5, 0.5, "< 3 VALID POINTS", ha="center", va="center", transform=ax.transAxes, color="orange", fontsize=8)
+        ax.set_title(title_str, fontsize=8)
+        return None
+
+    # 2. Check value range to prevent zero-range division error in tricontourf
+    vmin, vmax = np.min(z_clean), np.max(z_clean)
+    if np.isclose(vmin, vmax):
+        vmin -= 1e-4
+        vmax += 1e-4
+
+    lev_bounds = np.linspace(vmin, vmax, levels)
+
+    # 3. Create triangulation and plot
+    try:
+        triang = tri.Triangulation(lon_clean, lat_clean)
+        cf = ax.tricontourf(triang, z_clean, levels=lev_bounds, cmap=cmap, extend="both")
+        ax.set_title(title_str, fontsize=8)
+        return cf
+    except Exception as err:
+        ax.text(0.5, 0.5, f"Triangulation Error:\n{type(err).__name__}", ha="center", va="center", transform=ax.transAxes, color="red", fontsize=7)
+        ax.set_title(title_str, fontsize=8)
+        return None
+
+
+def plot_analysis_matrix(nc_path: str, output_path: str):
+    """
+    Generates multi-level diagnostic analysis matrix plot.
+    """
+    print(f"[AIDA PLOT] Opening NetCDF analysis file: {nc_path}")
+    ds = xr.open_dataset(nc_path)
+
+    # Print data health diagnostic report
+    inspect_netcdf_sanitizations(ds)
+
+    # Extract mesh topology coordinates (2562 nodes)
+    lon, lat = get_mesh_coordinates(ds)
+    num_nodes = len(lon)
+
+    # Identify target variables to display
+    plot_vars = [v for v in ["ln_t_icosahedral", "ln_p_icosahedral", "ln_rho_icosahedral"] if v in ds.data_vars]
+    if not plot_vars:
+        plot_vars = [v for v in ds.data_vars if ds[v].ndim >= 2][:3]
+
+    # Select level slices dynamically matching grid nodes dimension
+    sample_var = ds[plot_vars[0]].values
+    if sample_var.ndim >= 2:
+        node_axis = [i for i, dim in enumerate(sample_var.shape) if dim == num_nodes]
+        if node_axis:
+            level_axis = 1 if node_axis[0] == 0 else 0
+            n_levels = sample_var.shape[level_axis]
+            level_indices = np.linspace(0, n_levels - 1, 5, dtype=int)
         else:
-            print(f"Warning: Missing fields for variable '{var}'. Filling with zeros.")
-            inc = xr.DataArray(np.zeros((len(heights), len(lats), len(lons))), dims=[h_name, lat_name, lon_name])
+            level_indices = [0]
+    else:
+        level_indices = [0]
 
-        inc_data[var] = inc
+    num_rows = len(level_indices)
+    num_cols = len(plot_vars)
 
-    # Setup 5 rows x 7 columns Grid
-    n_rows = len(VARS)
-    n_cols = len(LEVELS)
-
+    print(f"[AIDA PLOT] Generating {num_rows}x{num_cols} matrix visualization...")
     fig, axes = plt.subplots(
-        n_rows,
-        n_cols,
-        figsize=(28, 15),
-        subplot_kw={"projection": ccrs.PlateCarree()},
-        gridspec_kw={"wspace": 0.05, "hspace": 0.15},
+        num_rows, num_cols, figsize=(4 * num_cols, 2.5 * num_rows), sharex=True, sharey=True, squeeze=False
     )
 
-    print("Building 35-panel matrix figure...")
-
-    for r, var in enumerate(VARS):
-        inc = inc_data[var]
-        
-        # Calculate robust max bound across all 7 selected levels for uniform row scaling
-        sub_levels = [l for l in LEVELS if l < len(heights)]
-        max_val = np.nanmax(np.abs(inc.isel({h_name: sub_levels}).values))
-        if max_val == 0 or np.isnan(max_val):
-            max_val = 1e-4
-
-        vmin, vmax = -max_val, max_val
-        cmap = "RdBu_r" if var in ["t", "p", "q"] else "PuOr"
-
-        for c, lvl in enumerate(LEVELS):
+    for r, l_idx in enumerate(level_indices):
+        for c, var_name in enumerate(plot_vars):
             ax = axes[r, c]
+            field_data = ds[var_name].values
 
-            if lvl >= len(heights):
-                ax.text(0.5, 0.5, f"Level {lvl}\nOut of bounds", ha="center", va="center", transform=ax.transAxes)
-                ax.axis("off")
-                continue
+            # Robust slice selection to guarantee output shape of (num_nodes,) -> (2562,)
+            if field_data.ndim == 2:
+                if field_data.shape[1] == num_nodes:
+                    slice_data = field_data[l_idx, :]
+                else:
+                    slice_data = field_data[:, l_idx]
+            elif field_data.ndim == 3:
+                if field_data.shape[2] == num_nodes:
+                    slice_data = field_data[0, l_idx, :]
+                else:
+                    slice_data = field_data[0, :, l_idx]
+            else:
+                slice_data = field_data.flatten()
 
-            data_2d = inc.isel({h_name: lvl}).values
+            title = f"{var_name} (L={l_idx})"
+            cf = safe_tricontourf(ax, lon, lat, slice_data, levels=15, cmap="viridis", title_str=title)
 
-            # Map Features
-            ax.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.5, alpha=0.7)
-            ax.add_feature(cfeature.BORDERS.with_scale("110m"), linestyle=":", linewidth=0.3, alpha=0.5)
+            if cf is not None:
+                plt.colorbar(cf, ax=ax, orientation="vertical", pad=0.02, aspect=12)
 
-            # Filled Contours
-            cf = ax.contourf(
-                lon_grid,
-                lat_grid,
-                data_2d,
-                levels=np.linspace(0.05*vmin, 0.05*vmax, 20),
-               #levels=np.linspace(0.5*vmin, 0.5*vmax, 20),
-               #levels=np.linspace(vmin, vmax, 15),
-                cmap=cmap,
-                extend="both",
-                transform=ccrs.PlateCarree(),
-            )
+            ax.set_xlim(-180, 180)
+            ax.set_ylim(-90, 90)
 
-            # Titles & Axis Labels
-            if r == 0:
-                h_val = heights[lvl]
-                ax.set_title(f"Level {lvl}\n({h_val:.0f})", fontsize=11, fontweight="bold")
-
+            if r == num_rows - 1:
+                ax.set_xlabel("Longitude")
             if c == 0:
-                ax.text(
-                    -0.15,
-                    0.5,
-                    f"Var: {var.upper()}",
-                    va="center",
-                    ha="right",
-                    rotation="vertical",
-                    transform=ax.transAxes,
-                    fontsize=13,
-                    fontweight="bold",
-                )
+                ax.set_ylabel(f"L{l_idx}\nLatitude")
 
-        # Add single row colorbar on the far right for each variable
-        cbar_ax = fig.add_axes([0.91, 0.74 - (r * 0.165), 0.012, 0.11])
-        cbar = fig.colorbar(cf, cax=cbar_ax, orientation="vertical")
-        cbar.ax.tick_params(labelsize=8)
-        cbar.set_label(f"Δ{var.upper()}", fontsize=10, fontweight="bold")
+    plt.suptitle(f"AIDA GNN Cycling State Field Matrix\nFile: {Path(nc_path).name}", fontsize=12, y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
 
-    fig.suptitle("3D-Var Analysis Increments Matrix Across Variables & Levels", fontsize=18, fontweight="bold", y=0.98)
-
-    plt.savefig(output_png, dpi=200, bbox_inches="tight")
-    print(f"Matrix plot created: '{output_png}'")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.show()
     plt.close()
+    print(f"[AIDA SUCCESS] Matrix plot saved to: {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="AIDA 3D-Var Matrix Triangulation Plotter")
+    parser.add_argument("--input", type=str, default="output/global_icosahedral_m4.20240106.t06z.1p00.anal.nc", help="Input analysis NetCDF path")
+    parser.add_argument("--output", type=str, default="output/aida_3dvar_matrix.png", help="Output PNG file path")
+    args = parser.parse_args()
+
+    plot_analysis_matrix(args.input, args.output)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Plot 5x7 3D-Var Increment Matrix")
-    parser.add_argument("--input", type=str, default="cycling_output_20240106/aida_analysis_20240106_t00z.nc", help="Path to 3D-Var Analysis NetCDF file")
-    parser.add_argument("--output", type=str, default="3dvar_increment_matrix.png", help="Output PNG path")
-
-    args = parser.parse_args()
-    plot_increment_matrix(args.input, args.output)
+    main()

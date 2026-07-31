@@ -23,22 +23,26 @@ START_DATE="${START_YMD}_${START_HOUR}"
 NUM_CYCLES=4  # Runs 4x 6-hour cycles (24 hours total)
 
 GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate.pt"
-EDGES="../data/graph/icosahedral_edge_index_m4.pt"
-BMATRIX="../bmatrix/bmatrix_from_gfs_analysis.nc"
-OBS_DIR="../data/conv_2024"
 WORK_DIR="./cycling_output_${START_YMD}"
-BG_DIR="../data/icosahedral_grid"
+
+background=../data/icosahedral_grid_logstate/global_icosahedral_m4.20240106.t00z.1p00.f006.nc
 
 rm -rf ${WORK_DIR}/temp_bg_*
 
 set -x
 
 PYTHONPATH=. python scripts/run_aida_cycling.py \
+  --background ../data/icosahedral_grid_logstate/global_icosahedral_m4.20240106.t00z.1p00.f006.nc \
+  --output_file output/global_icosahedral_m4.20240106.t06z.1p00.anal.nc \
   --gnn_ckpt checkpoints/aida_gnn_surrogate_logstate.pt \
   --graph_path_m4 ../data/graph/icosahedral_edge_index_m4.pt \
-  --graph_path_m3 ../data/graph/icosahedral_edge_index_m3.pt \
-  --data_dir ../data/icosahedral_grid_logstate \
-  --output_dir output/cycling_logstate_run1 \
-  --cycles 4
+  --graph_path_m3 ../data/graph/icosahedral_edge_index_m3.pt
 
 exit 0
+
+PYTHONPATH=. python scripts/run_aida_cycling.py \
+  --background ../data/icosahedral_grid_logstate/global_icosahedral_m4.20240106.t00z.1p00.f006.nc \
+  --output_dir output \
+  --gnn_ckpt checkpoints/aida_gnn_surrogate_logstate.pt \
+  --graph_path_m4 ../data/graph/icosahedral_edge_index_m4.pt \
+  --graph_path_m3 ../data/graph/icosahedral_edge_index_m3.pt

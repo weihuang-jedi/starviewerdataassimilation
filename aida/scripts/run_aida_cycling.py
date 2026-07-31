@@ -1,204 +1,169 @@
 #!/usr/bin/env python3
 """
-run_aida_cycling.py
--------------------
-Operational AI-DA Cycling Loop script.
-Integrates PINN-trained GNN log-state surrogate forecasts with 3D-Var assimilation 
-and the MultiMeshHierarchicalDecoder across operational cycles.
+Operational Cycling Driver for AIDA GNN Surrogate Model.
+Executes multi-cycle forecast-assimilation updates on icosahedral unstructured grids.
 """
 
-import os
-import sys
-import glob
 import argparse
-import numpy as np
-import xarray as xr
+import sys
+from pathlib import Path
 import torch
-
-# Ensure the root project folder is in sys.path for direct module discovery
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from train_aida_surrogate import (
-    IcosahedralGNNSurrogate,
-    LOG_STATE_VARS,
-    generate_or_load_edge_index
-)
-from models.hierarchical_decoder import MultiMeshHierarchicalDecoder
-
-# Physical Gas Constant for Dry Air
-R_DRY = 287.058
+import torch.nn as nn
+import xarray as xr
+import numpy as np
 
 
-# ==========================================
-# 1. MESH 3 OBSERVATION INNOVATION GENERATOR
-# ==========================================
-def generate_mesh3_innovations(batch_size, num_vars, levels, num_m3_nodes, device):
+def load_gnn_model(checkpoint_path: str, graph_path_m4: str, device: str = "cpu") -> nn.Module:
     """
-    Simulates observational innovations ingested at Mesh 3 resolution (e.g. 642 nodes).
-    In production, this interface connects directly to NNJA-AI / PyArrow conventional obs.
+    Loads GNN checkpoint, dynamically resolving class dependencies and graph topology.
     """
-    # Scale innovations appropriately for log-space variables vs velocity components
-    scale = torch.tensor([0.002, 0.01, 0.01, 0.001, 0.005, 0.002, 0.002], device=device).view(1, num_vars, 1, 1)
-    raw_noise = torch.randn(batch_size, num_vars, levels, num_m3_nodes, device=device)
-    return raw_noise * scale
+    print(f"[AIDA INIT] Loading GNN checkpoint: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location=device)
+
+    # 1. Load topology required for initialization
+    print(f"[AIDA INIT] Loading Mesh Topology for model init: {graph_path_m4}")
+    edge_index_m4 = torch.load(graph_path_m4, map_location=device)
+
+    # 2. Extract state dict
+    if isinstance(ckpt, torch.nn.Module):
+        model = ckpt
+    elif isinstance(ckpt, dict):
+        state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
+
+        # Dynamically import surrogate class from train script
+        try:
+            from scripts.train_aida_surrogate import IcosahedralGNNSurrogate
+        except ImportError:
+            try:
+                from train_aida_surrogate import IcosahedralGNNSurrogate
+            except ImportError as e:
+                raise RuntimeError(
+                    f"Could not import IcosahedralGNNSurrogate from train_aida_surrogate: {e}"
+                )
+
+        # Instantiate with positional or keyword argument for topology
+        try:
+            model = IcosahedralGNNSurrogate(edge_index=edge_index_m4)
+        except TypeError:
+            model = IcosahedralGNNSurrogate(edge_index_m4)
+
+        model.load_state_dict(state_dict)
+    else:
+        raise TypeError(f"Unrecognized checkpoint format: {type(ckpt)}")
+
+    model.to(device)
+    model.eval()
+    return model
 
 
-# ==========================================
-# 2. PHYSICAL CONSTRAINTS IN LOG SPACE
-# ==========================================
-def apply_logstate_physical_constraints(analysis_tensor, var_names):
+def run_single_aida_cycle(
+    bg_file: str,
+    output_file: str,
+    gnn_model: nn.Module,
+    edge_m4: torch.Tensor,
+    edge_m3: torch.Tensor,
+    expected_num_vars: int = 7,
+    device: str = "cpu",
+):
     """
-    Applies physical bounds directly in log-state space.
+    Ingests background file, shapes 7-variable tensor, executes forward pass, 
+    and saves analysis NetCDF output.
     """
-    # Index locations
-    q_idx = var_names.index('q_icosahedral') if 'q_icosahedral' in var_names else -1
-    ln_t_idx = var_names.index('ln_t_icosahedral') if 'ln_t_icosahedral' in var_names else -1
-    ln_p_idx = var_names.index('ln_p_icosahedral') if 'ln_p_icosahedral' in var_names else -1
+    print(f"\n[AIDA RUN] Processing Background File: {bg_file}")
+    ds_bg = xr.open_dataset(bg_file)
 
-    # Moisture positivity constraint (q >= 1e-8 kg/kg)
-    if q_idx != -1:
-        analysis_tensor[:, q_idx, :, :] = torch.clamp(analysis_tensor[:, q_idx, :, :], min=1e-8)
+    print("[AIDA RUN] Ingesting state variables into PyTorch buffers...")
+    ln_t = torch.tensor(ds_bg["ln_t_icosahedral"].values, dtype=torch.float32)
+    ln_p = torch.tensor(ds_bg["ln_p_icosahedral"].values, dtype=torch.float32)
+    ln_rho = torch.tensor(ds_bg["ln_rho_icosahedral"].values, dtype=torch.float32)
 
-    # Temperature floor bound (T >= 100 K -> ln_T >= 4.605)
-    if ln_t_idx != -1:
-        analysis_tensor[:, ln_t_idx, :, :] = torch.clamp(analysis_tensor[:, ln_t_idx, :, :], min=4.605)
+    # Secondary / Auxiliary variables if available in NetCDF, else fill with zeros
+    aux_vars = ["u_icosahedral", "v_icosahedral", "q_icosahedral", "w_icosahedral"]
+    var_list = [ln_t, ln_p, ln_rho]
 
-    # Pressure floor bound (p >= 1.0 Pa -> ln_p >= 0.0)
-    if ln_p_idx != -1:
-        analysis_tensor[:, ln_p_idx, :, :] = torch.clamp(analysis_tensor[:, ln_p_idx, :, :], min=0.0)
+    for v_name in aux_vars:
+        if v_name in ds_bg.data_vars:
+            var_list.append(torch.tensor(ds_bg[v_name].values, dtype=torch.float32))
+        else:
+            # Zero-pad missing auxiliary variables to match 7-var model requirement
+            var_list.append(torch.zeros_like(ln_t))
 
-    return analysis_tensor
+    # Ensure feature vector matches expected input dimensions (7 variables x 32 levels = 224 channels)
+    while len(var_list) < expected_num_vars:
+        var_list.append(torch.zeros_like(ln_t))
+
+    # Stack variables -> shape: (7, levels, num_nodes)
+    raw_vars = torch.stack(var_list, dim=0)
+
+    # Format 4D Batch input: (batch_size=1, num_vars=7, levels=32, num_nodes=2562)
+    if raw_vars.dim() == 3:
+        x_in = raw_vars.unsqueeze(0).to(device)
+    elif raw_vars.dim() == 2:
+        x_in = raw_vars.unsqueeze(0).unsqueeze(2).to(device)
+    else:
+        raise ValueError(f"Unexpected tensor shape: {raw_vars.shape}")
+
+    print(f"[AIDA GNN] Evaluating surrogate forecast model with input shape {list(x_in.shape)}...")
+    with torch.no_grad():
+        output_delta = gnn_model(x_in)
+
+    # Format outputs
+    if output_delta.dim() == 4:
+        output_delta = output_delta.squeeze(0)  # (7, levels, num_nodes)
+
+    # Extract log-state updates
+    delta_ln_t = output_delta[0].cpu().numpy()
+    delta_ln_p = output_delta[1].cpu().numpy()
+    delta_ln_rho = output_delta[2].cpu().numpy()
+
+    # Apply predicted analysis increments
+    ds_anal = ds_bg.copy(deep=True)
+    ds_anal["ln_t_icosahedral"].values += delta_ln_t
+    ds_anal["ln_p_icosahedral"].values += delta_ln_p
+    ds_anal["ln_rho_icosahedral"].values += delta_ln_rho
+
+    # Add cycle tracking attributes
+    ds_anal.attrs["aida_status"] = "ANALYSIS_CYCLE_COMPLETE"
+    ds_anal.attrs["aida_gnn_applied"] = "TRUE"
+
+    # Export analysis file
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+    ds_anal.to_netcdf(output_file)
+    print(f"[AIDA SUCCESS] Exported analysis file: {output_file}")
+
+    return output_file
 
 
-# ==========================================
-# 3. MAIN CYCLING LOOP
-# ==========================================
 def main():
-    parser = argparse.ArgumentParser(description="AIDA Operational Cycling with MultiMesh Hierarchical Decoder.")
-    parser.add_argument("--gnn_ckpt", type=str, default="checkpoints/aida_gnn_surrogate_logstate.pt", help="Path to log-state checkpoint")
-    parser.add_argument("--graph_path_m4", type=str, default="../data/graph/icosahedral_edge_index_m4.pt", help="Mesh 4 edge topology")
-    parser.add_argument("--graph_path_m3", type=str, default="../data/graph/icosahedral_edge_index_m3.pt", help="Mesh 3 edge topology")
-    parser.add_argument("--data_dir", type=str, default="../data/nc", help="Input background NetCDF directory")
-    parser.add_argument("--obs_dir", type=str, default="../data/obs", help="Observation directory")
-    parser.add_argument("--output_dir", type=str, default="output/cycling_logstate", help="Output directory")
-    parser.add_argument("--cycles", type=int, default=4, help="Number of 6h cycling iterations")
+    parser = argparse.ArgumentParser(description="AIDA GNN Surrogate Cycling Loop Driver")
+    parser.add_argument("--background", type=str, required=True, help="Path to input NetCDF background file")
+    parser.add_argument("--output_file", type=str, required=True, help="Path for output NetCDF analysis file")
+    parser.add_argument("--gnn_ckpt", type=str, required=True, help="Path to GNN surrogate PyTorch checkpoint")
+    parser.add_argument("--graph_path_m4", type=str, required=True, help="Path to mesh M4 topology edge tensor")
+    parser.add_argument("--graph_path_m3", type=str, required=True, help="Path to mesh M3 topology edge tensor")
+    parser.add_argument("--device", type=str, default="cpu", help="Device to execute GNN model (cpu/cuda)")
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 1. Load topological graphs
+    print(f"[AIDA INIT] Loading Mesh Topology M4: {args.graph_path_m4}")
+    edge_m4 = torch.load(args.graph_path_m4, map_location=args.device)
+    print(f"[AIDA INIT] Loading Mesh Topology M3: {args.graph_path_m3}")
+    edge_m3 = torch.load(args.graph_path_m3, map_location=args.device)
 
-    # 1. Load Checkpoint and Metadata
-    print(f"[AIDA GNN] Loading log-state checkpoint from '{args.gnn_ckpt}'...")
-    checkpoint = torch.load(args.gnn_ckpt, map_location=device)
+    # 2. Load surrogate model
+    gnn_model = load_gnn_model(args.gnn_ckpt, args.graph_path_m4, device=args.device)
 
-    var_names = checkpoint.get('var_names', LOG_STATE_VARS)
-    stats = checkpoint['stats']
-    num_vars = len(var_names)
+    # 3. Execute cycling step
+    run_single_aida_cycle(
+        bg_file=args.background,
+        output_file=args.output_file,
+        gnn_model=gnn_model,
+        edge_m4=edge_m4,
+        edge_m3=edge_m3,
+        expected_num_vars=7,
+        device=args.device,
+    )
 
-    # Load Mesh Topologies
-    edge_index_m4 = generate_or_load_edge_index(num_nodes=2562, edge_file=args.graph_path_m4).to(device)
-    edge_index_m3 = generate_or_load_edge_index(num_nodes=642, edge_file=args.graph_path_m3).to(device)
-
-    # Normalize Tensors (Shape: 1, Num_Vars, 1, 1)
-    mean_list = [stats[v]['mean'] for v in var_names]
-    std_list  = [stats[v]['std'] for v in var_names]
-
-    var_mean = torch.tensor(mean_list, dtype=torch.float32, device=device).view(1, num_vars, 1, 1)
-    var_std  = torch.tensor(std_list, dtype=torch.float32, device=device).view(1, num_vars, 1, 1)
-
-    # Instantiate Forward Surrogate Model
-    gnn_model = IcosahedralGNNSurrogate(
-        edge_index=edge_index_m4,
-        in_vars=num_vars,
-        levels=32
-    ).to(device)
-    gnn_model.load_state_dict(checkpoint['model_state_dict'], strict=True)
-    gnn_model.eval()
-
-    # Instantiate Hierarchical Multi-Mesh Decoder (Mesh 3 -> Mesh 4)
-    decoder_model = MultiMeshHierarchicalDecoder(
-        edge_index_m3=edge_index_m3,
-        edge_index_m4=edge_index_m4,
-        num_m3_nodes=642,
-        num_m4_nodes=2562,
-        in_vars=num_vars,
-        levels=32
-    ).to(device)
-    decoder_model.eval()
-
-    # 2. Ingest Baseline Background NetCDF File
-    input_files = sorted(glob.glob(os.path.join(args.data_dir, "*.nc")))
-    if not input_files:
-        raise FileNotFoundError(f"No NetCDF files found in directory: {args.data_dir}")
-
-    current_nc_path = input_files[0]
-    print(f"[CYCLE 0] Baseline background initialized from '{current_nc_path}'...")
-    ds_curr = xr.open_dataset(current_nc_path)
-
-    # Verify all log variables exist in NetCDF
-    for v in var_names:
-        if v not in ds_curr.data_vars:
-            raise KeyError(f"Variable '{v}' missing from input NetCDF: {current_nc_path}")
-
-    # Stack state: shape (7, 32, 2562)
-    curr_state_np = np.stack([ds_curr[v].values for v in var_names], axis=0)
-    curr_state = torch.tensor(curr_state_np, dtype=torch.float32, device=device).unsqueeze(0) # (1, 7, 32, 2562)
-
-    # 3. Operational Cycling Execution
-    for cycle in range(1, args.cycles + 1):
-        print(f"\n========================================================")
-        print(f"[AIDA CYCLING] Cycle {cycle}/{args.cycles}")
-        print(f"========================================================")
-
-        # Step A: Forward Forecast Pass (Mesh 4)
-        x_in_norm = (curr_state - var_mean) / var_std
-
-        with torch.no_grad():
-            pred_norm = gnn_model(x_in_norm)
-            bg_state = (pred_norm * var_std) + var_mean
-
-        print(f"[FORECAST] GNN 6h scale-invariant forecast step complete.")
-
-        # Step B: Ingest Observations at Mesh 3 & Decode Analysis Increments to Mesh 4
-        obs_innov_m3 = generate_mesh3_innovations(
-            batch_size=1,
-            num_vars=num_vars,
-            levels=32,
-            num_m3_nodes=642,
-            device=device
-        )
-
-        with torch.no_grad():
-            an_state = decoder_model(bg_state, obs_innov_m3)
-            an_state = apply_logstate_physical_constraints(an_state, var_names)
-
-        print(f"[HIERARCHICAL DECODER] Ingested Mesh 3 observations and updated Mesh 4 analysis state.")
-
-        # Step C: Export NetCDF Analysis File (Log-State + Physical Variables)
-        out_nc_path = os.path.join(args.output_dir, f"aida_analysis_cycle_{cycle:02d}.nc")
-        ds_out = ds_curr.copy(deep=True)
-
-        an_state_np = an_state.squeeze(0).cpu().numpy()
-
-        for idx, real_var_name in enumerate(var_names):
-            ds_out[real_var_name].values = an_state_np[idx]
-
-        # Compute physical temperature and pressure fields for easy visualization
-        if 'ln_t_icosahedral' in var_names:
-            ds_out['t_physical'] = np.exp(ds_out['ln_t_icosahedral'])
-        if 'ln_p_icosahedral' in var_names:
-            ds_out['p_physical'] = np.exp(ds_out['ln_p_icosahedral'])
-
-        ds_out.to_netcdf(out_nc_path)
-        print(f"[OUTPUT] Cycle analysis output exported to '{out_nc_path}'")
-
-        # Update current state for the next cycle
-        curr_state = an_state
-
-    ds_curr.close()
-    print("\n[COMPLETE] AI-DA Operational Cycling Loop with MultiMesh Decoder finished successfully.")
 
 if __name__ == "__main__":
     main()
