@@ -3,7 +3,8 @@
 train_aida_surrogate.py
 -----------------------
 Trains the AIDA GNN surrogate model on scale-invariant log-state Zarr stores
-[ln_T, u, v, w, q, ln_rho, ln_p] using Non-Hydrostatic Icosahedral Loss constraints.
+[ln_T, u, v, w, q, ln_rho, ln_p] using Non-Hydrostatic Icosahedral Loss 
+and Pressure Regularization (Laplacian Smoothness + Asymmetric Low Penalty).
 """
 
 import os
@@ -12,19 +13,19 @@ import numpy as np
 import zarr
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.nn import MessagePassing
 
 
-# Log-state variable configuration
 LOG_STATE_VARS = [
-    'ln_t_icosahedral',
-    'u_icosahedral',
-    'v_icosahedral',
-    'w_icosahedral',
-    'q_icosahedral',
-    'ln_rho_icosahedral',
-    'ln_p_icosahedral'
+    'ln_t_icosahedral',    # Index 0
+    'u_icosahedral',       # Index 1
+    'v_icosahedral',       # Index 2
+    'w_icosahedral',       # Index 3
+    'q_icosahedral',       # Index 4
+    'ln_rho_icosahedral',  # Index 5
+    'ln_p_icosahedral'     # Index 6
 ]
 
 
@@ -55,7 +56,6 @@ class LogStateZarrDataset(Dataset):
         self.var_names = var_names if var_names else LOG_STATE_VARS
         self.sequence_len = sequence_len
 
-        # Probe dimensions using first variable
         first_var = self.root[self.var_names[0]]
         self.total_timesteps, self.num_levels, self.num_nodes = first_var.shape
 
@@ -67,7 +67,6 @@ class LogStateZarrDataset(Dataset):
         print(f"Mesh Layout : {self.num_levels} height levels x {self.num_nodes} nodes")
         print("========================================================\n")
 
-        # Calculate Z-score stats per log variable
         self.stats = {}
         for var in self.var_names:
             arr = self.root[var]
@@ -112,20 +111,28 @@ class LogStateZarrDataset(Dataset):
 
 
 # ==========================================
-# 3. NON-HYDROSTATIC PHYSICAL LOSS
+# 3. COMBINED NON-HYDROSTATIC & REGULARIZED LOSS
 # ==========================================
-class NonHydrostaticIcosahedralLoss(nn.Module):
+class AIDAPressureRegularizedLoss(nn.Module):
     def __init__(
         self,
         means: dict,
         stds: dict,
+        p_idx: int = 6,                  # Index 6 = ln_p_icosahedral
+        tau_min_p: float = -3.5,         # Standardized threshold for extreme low pressure
+        lambda_smooth_p: float = 0.08,   # Eliminates spatial checkerboard noise
+        lambda_asym_p: float = 0.5,      # Suppresses runaway low pressure
         weight_mse: float = 1.0,
         weight_state_eq: float = 0.5,
-        weight_mass: float = 0.2,
-        weight_geo: float = 0.5,
+        weight_mass: float = 0.0,
+        weight_geo: float = 0.0,
         R_d: float = 287.058
     ):
         super().__init__()
+        self.p_idx = p_idx
+        self.tau_min_p = tau_min_p
+        self.lambda_smooth_p = lambda_smooth_p
+        self.lambda_asym_p = lambda_asym_p
         self.weight_mse = weight_mse
         self.weight_state_eq = weight_state_eq
         self.weight_mass = weight_mass
@@ -133,8 +140,6 @@ class NonHydrostaticIcosahedralLoss(nn.Module):
         self.R_d = R_d
         self.ln_R_d = np.log(R_d)
 
-        # Register dataset mean and std for online un-normalization
-        # Order expected in state tensor: [0: ln_t, 1: u, 2: v, 3: w, 4: q, 5: ln_rho, 6: ln_p]
         self.register_buffer("mu_ln_t", torch.tensor(means['ln_t_icosahedral']['mean'], dtype=torch.float32))
         self.register_buffer("std_ln_t", torch.tensor(means['ln_t_icosahedral']['std'], dtype=torch.float32))
 
@@ -147,24 +152,33 @@ class NonHydrostaticIcosahedralLoss(nn.Module):
         self.mse_fn = nn.MSELoss()
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor, edge_index: torch.Tensor) -> dict:
-        # 1. Base MSE Loss on Normalized State
+        # 1. Base MSE Loss
         loss_mse = self.mse_fn(pred, target)
 
-        # 2. Un-normalize log-thermodynamic variables & clamp to physical bounds
-        # Shape: [Batch, Levels, Nodes]
+        # 2. Graph Laplacian Smoothness Loss on ln_p (Prevents Checkerboard Noise)
+        # Shape: [Batch, Vars, Levels, Nodes] -> pred[:, 6, :, :]
+        p_pred = pred[:, self.p_idx, :, :]
+        src, dst = edge_index[0], edge_index[1]
+        diff_p = p_pred[:, :, src] - p_pred[:, :, dst]
+        loss_smooth_p = torch.mean(torch.square(diff_p))
+
+        # 3. Asymmetric Low-Pressure Penalty (Prevents Extreme Low Pressure)
+        # Activates when standardized ln_p prediction drops below tau_min_p
+        violation = F.relu(self.tau_min_p - p_pred)
+        loss_asym_p = torch.mean(torch.square(violation))
+
+        # 4. Ideal Gas State Residual
         ln_T_phys   = torch.clamp(pred[:, 0, :, :] * self.std_ln_t + self.mu_ln_t, min=4.95, max=6.0)
         ln_rho_phys = torch.clamp(pred[:, 5, :, :] * self.std_ln_rho + self.mu_ln_rho, min=-15.0, max=2.0)
         ln_p_phys   = torch.clamp(pred[:, 6, :, :] * self.std_ln_p + self.mu_ln_p, min=-5.0, max=13.0)
 
-        # 3. Un-normalized Ideal Gas State Equation Residual
-        # ln(p) = ln(rho) + ln(R_d) + ln(T) -> Residual = ln_p - (ln_rho + ln_R_d + ln_T)
         state_eq_residual = ln_p_phys - (ln_rho_phys + self.ln_R_d + ln_T_phys)
         loss_state_eq = torch.mean(torch.abs(state_eq_residual))
 
-        # 4. Global Mass Conservation Penalty (Density Integral Stability)
+        # 5. Global Mass Conservation Penalty (Density Integral Stability)
         loss_mass = torch.mean(torch.abs(torch.mean(pred[:, 5, :, :], dim=-1)))
 
-        # 5. Geostrophic Balance Loss (Spatial Gradients over Graph Edges)
+        # 6. Geostrophic Balance Loss (Spatial Gradients over Graph Edges)
         u_pred = pred[:, 1, :, :]
         v_pred = pred[:, 2, :, :]
         src, dst = edge_index[0], edge_index[1]
@@ -174,20 +188,21 @@ class NonHydrostaticIcosahedralLoss(nn.Module):
         wind_mag = torch.sqrt(u_pred[:, :, src]**2 + v_pred[:, :, src]**2 + 1e-6)
         loss_geo = torch.mean(torch.abs(dp_edge - wind_mag * 0.1))
 
-        # Total Weighted Non-Hydrostatic Loss
         total_loss = (
             self.weight_mse * loss_mse +
             self.weight_state_eq * loss_state_eq +
             self.weight_mass * loss_mass +
-            self.weight_geo * loss_geo
+            self.weight_geo * loss_geo +
+            self.lambda_smooth_p * loss_smooth_p +
+            self.lambda_asym_p * loss_asym_p
         )
 
         return {
             "loss": total_loss,
             "mse": loss_mse,
             "state_eq": loss_state_eq,
-            "mass": loss_mass,
-            "geo": loss_geo
+            "smooth_p": loss_smooth_p,
+            "asym_p": loss_asym_p
         }
 
 
@@ -239,7 +254,7 @@ def generate_or_load_edge_index(num_nodes=2562, edge_file=None):
 # ==========================================
 # 5. TRAINING EXECUTOR
 # ==========================================
-def run_training(zarr_path, edge_file, checkpoint_path, epochs, batch_size, lr):
+def run_training(zarr_path, edge_file, checkpoint_path, epochs, batch_size, lr, tau_min_p, lambda_smooth_p, lambda_asym_p):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[AIDA TRAINING] Execution Device: {device}")
 
@@ -255,16 +270,22 @@ def run_training(zarr_path, edge_file, checkpoint_path, epochs, batch_size, lr):
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = NonHydrostaticIcosahedralLoss(
+
+    # Initialize loss with calibrated pressure parameters
+    criterion = AIDAPressureRegularizedLoss(
         means=dataset.stats,
-        stds=dataset.stats
+        stds=dataset.stats,
+        p_idx=6,                       # Index 6 corresponds to ln_p
+        tau_min_p=tau_min_p,
+        lambda_smooth_p=lambda_smooth_p,
+        lambda_asym_p=lambda_asym_p
     ).to(device)
 
     print(f"[AIDA TRAINING] Starting execution for {epochs} epochs...\n")
 
     for epoch in range(1, epochs + 1):
         model.train()
-        tot_loss, mse_acc, state_acc, mass_acc, geo_acc = 0.0, 0.0, 0.0, 0.0, 0.0
+        tot_loss, mse_acc, state_acc, smooth_acc, asym_acc = 0.0, 0.0, 0.0, 0.0, 0.0
 
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
             x_batch = x_batch.to(device)
@@ -273,7 +294,6 @@ def run_training(zarr_path, edge_file, checkpoint_path, epochs, batch_size, lr):
             optimizer.zero_grad()
             y_pred = model(x_batch)
 
-            # Pass edge_index to physical loss
             loss_dict = criterion(y_pred, y_batch, edge_index)
             total_loss = loss_dict["loss"]
 
@@ -282,23 +302,31 @@ def run_training(zarr_path, edge_file, checkpoint_path, epochs, batch_size, lr):
                 continue
 
             total_loss.backward()
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             tot_loss += total_loss.item()
             mse_acc += loss_dict["mse"].item()
             state_acc += loss_dict["state_eq"].item()
-            mass_acc += loss_dict["mass"].item()
-            geo_acc += loss_dict["geo"].item()
+            smooth_acc += loss_dict["smooth_p"].item()
+            asym_acc += loss_dict["asym_p"].item()
+
+            if batch_idx % 50 == 0:
+                print(
+                    f"Epoch [{epoch:02d}/{epochs:02d}] Batch {batch_idx:04d} | "
+                    f"Total: {total_loss.item():.4f} | "
+                    f"MSE: {loss_dict['mse'].item():.4f} | "
+                    f"SmoothP: {loss_dict['smooth_p'].item():.4f} | "
+                    f"AsymP: {loss_dict['asym_p'].item():.4f}"
+                )
 
         num_batches = max(1, len(dataloader))
-        print(f"Epoch [{epoch:02d}/{epochs:02d}] "
-              f"Total: {tot_loss/num_batches:.5f} | "
+        print(f"\n---> Epoch [{epoch:02d}/{epochs:02d}] Summary | "
+              f"Total Loss: {tot_loss/num_batches:.5f} | "
               f"MSE: {mse_acc/num_batches:.5f} | "
               f"StateEq: {state_acc/num_batches:.5f} | "
-              f"Mass: {mass_acc/num_batches:.5f} | "
-              f"Geo: {geo_acc/num_batches:.5f}")
+              f"SmoothP: {smooth_acc/num_batches:.5f} | "
+              f"AsymP: {asym_acc/num_batches:.5f}\n")
 
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     torch.save({
@@ -308,7 +336,7 @@ def run_training(zarr_path, edge_file, checkpoint_path, epochs, batch_size, lr):
         'var_names': dataset.var_names
     }, checkpoint_path)
 
-    print(f"\n[AIDA TRAINING] Checkpoint written to: '{checkpoint_path}'")
+    print(f"[AIDA TRAINING] Checkpoint written to: '{checkpoint_path}'")
 
 
 def main():
@@ -319,9 +347,16 @@ def main():
     parser.add_argument("-e", "--epochs", type=int, default=25, help="Number of epochs")
     parser.add_argument("-b", "--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("-l", "--lr", type=float, default=0.0003, help="Learning rate")
+    parser.add_argument("--tau_min_p", type=float, default=-3.5, help="Threshold below which asymmetric penalty activates")
+    parser.add_argument("--lambda_smooth_p", type=float, default=0.08, help="Pressure smoothness loss weight")
+    parser.add_argument("--lambda_asym_p", type=float, default=0.5, help="Asymmetric pressure penalty weight")
 
     args = parser.parse_args()
-    run_training(args.zarr, args.edges, args.checkpoint, args.epochs, args.batch_size, args.lr)
+    run_training(
+        args.zarr, args.edges, args.checkpoint, 
+        args.epochs, args.batch_size, args.lr,
+        args.tau_min_p, args.lambda_smooth_p, args.lambda_asym_p
+    )
 
 
 if __name__ == "__main__":

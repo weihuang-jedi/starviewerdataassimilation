@@ -22,7 +22,18 @@ python scripts/train_aida_surrogate.py \
   --checkpoint checkpoints/aida_gnn_surrogate_logstate.pt \
   --epochs 25 \
   --batch_size 4 \
-  --lr 0.0003
+  --lr 0.0003 \
+  --tau_min_p -0.2894 --lambda_smooth_p 0.08 --lambda_asym_p 0.5
 
 exit 0
+
+    parser.add_argument("-z", "--zarr", default="../data/icosahedral_2023_logstate.zarr", help="Path to input log-state .zarr store")
+    parser.add_argument("-g", "--edges", default="../data/graph/icosahedral_edge_index_m4.pt", help="Path to PyTorch edge_index tensor")
+    parser.add_argument("-c", "--checkpoint", default="checkpoints/aida_gnn_surrogate_logstate.pt", help="Output model path")
+    parser.add_argument("-e", "--epochs", type=int, default=25, help="Number of epochs")
+    parser.add_argument("-b", "--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("-l", "--lr", type=float, default=0.0003, help="Learning rate")
+    parser.add_argument("--tau_min_p", type=float, default=-3.5, help="Threshold below which asymmetric penalty activates, a tuned value: -0.2894")
+    parser.add_argument("--lambda_smooth_p", type=float, default=0.08, help="Pressure smoothness loss weight")
+    parser.add_argument("--lambda_asym_p", type=float, default=0.5, help="Asymmetric pressure penalty weight")
 
