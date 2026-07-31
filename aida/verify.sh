@@ -11,28 +11,25 @@ source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
 yyyymmdd=20240106
 analhour=06
 
-origanalysis=cycling_output_${yyyymmdd}/aida_analysis_${yyyymmdd}_t${analhour}z.nc
-gridanalysis=cycling_output_${yyyymmdd}/reconstructed_aida_analysis_${yyyymmdd}_t${analhour}z.nc
-
-#python scripts/verify_aida_logstate.py \
-#   -a cycling_output_20240106/aida_analysis_cycle_01.nc \
-#   -t ../data/nc/truth_t06z.nc
+origanalysis=output/global_icosahedral_m4.${yyyymmdd}.t${analhour}z.1p00.anal.nc
+gridanalysis=output/reconstructed_aida_analysis_${yyyymmdd}.t${analhour}z.nc
 
 if [ ! -f ${gridanalysis} ]; then
    python icosahedral2regular.py \
       -i ${origanalysis} \
       -o ${gridanalysis} \
+      -g ../data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
       -r 1.0
 fi
 
-python plot_3dvar_matrix.py \
-   --input ${gridanalysis} \
-   --output aida_increment_matrix_${yyyymmdd}T${analhour}.png
+#python plot_3dvar_matrix.py \
+#   --input ${gridanalysis} \
+#   --output aida_increment_matrix_${yyyymmdd}T${analhour}.png
 
 python validate_reconstruction.py \
    -i ${gridanalysis} \
    -r ../data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
-   -o cycling_output_${yyyymmdd}/verification_levels_t${analhour}z.csv
+   -o output/verification_levels.t${analhour}z.csv
 
 exit 0
 

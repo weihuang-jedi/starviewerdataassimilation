@@ -1,198 +1,194 @@
 #!/usr/bin/env python3
 """
-validate_reconstruction.py
---------------------------
-Verification and Validation Suite for AI-DA Cycling Outputs.
-Evaluates regridded AI surrogate analysis/forecast states against reference truth datasets (e.g., GFS).
-Handles unit harmonization (Pa <-> hPa, kg/kg <-> g/kg), layer-by-layer metrics, and empty/NaN slice masking.
+Validation script for AIDA reconstructed analyses against GFS reference data.
+Applies cosine-latitude weighting to eliminate polar cell area distortion.
 """
 
-import os
 import argparse
+import sys
 import numpy as np
 import xarray as xr
 import pandas as pd
 
-# ==========================================
-# VERIFICATION METRICS FUNCTIONS
-# ==========================================
-def compute_rmse(pred, ref):
-    diff = pred - ref
-    sq_err = diff ** 2
-    if np.isnan(sq_err).all():
-        return np.nan
-    return float(np.sqrt(np.nanmean(sq_err)))
 
-def compute_mae(pred, ref):
-    abs_err = np.abs(pred - ref)
-    if np.isnan(abs_err).all():
-        return np.nan
-    return float(np.nanmean(abs_err))
-
-def compute_bias(pred, ref):
-    diff = pred - ref
-    if np.isnan(diff).all():
-        return np.nan
-    return float(np.nanmean(diff))
-
-def compute_acc(pred, ref):
-    """Anomaly Correlation Coefficient (ACC)."""
-    mask = ~np.isnan(pred) & ~np.isnan(ref)
-    if not np.any(mask):
-        return np.nan
-    
-    p_clean = pred[mask]
-    r_clean = ref[mask]
-    
-    p_prime = p_clean - np.mean(p_clean)
-    r_prime = r_clean - np.mean(r_clean)
-    
-    denom = np.sqrt(np.sum(p_prime ** 2) * np.sum(r_prime ** 2))
-    if denom == 0:
-        return 0.0
-    return float(np.sum(p_prime * r_prime) / denom)
-
-def compute_rel_diff(rmse, ref):
-    """Computes relative difference percentage against reference standard deviation or scale."""
-    ref_scale = np.nanmean(np.abs(ref))
-    if np.isnan(ref_scale) or ref_scale == 0:
-        return np.nan
-    return float((rmse / ref_scale) * 100.0)
-
-# ==========================================
-# UNIT HARMONIZATION & MAPPING HELPER
-# ==========================================
-def harmonize_units(pred_arr, ref_arr, var_name):
+def compute_latitude_weights(lats):
     """
-    Standardizes units between predictions and reference truth files.
-    - Pressure (p): Detects Pa vs. hPa scale mismatches.
-    - Moisture (q): Detects kg/kg vs. g/kg scale mismatches.
-    """
-    pred = np.copy(pred_arr)
-    ref = np.copy(ref_arr)
+    Computes normalized cosine-latitude weights.
     
-    # 1. Pressure Alignment (Pa -> hPa if reference is in hPa)
-    if var_name == 'p':
-        pred_mean = np.nanmean(pred)
-        ref_mean = np.nanmean(ref)
-        if pred_mean > 5000.0 and ref_mean < 2000.0:
-            pred = pred / 100.0  # Pa to hPa
+    Args:
+        lats (np.ndarray): 1D array of latitude values in degrees.
+        
+    Returns:
+        np.ndarray: 1D array of normalized weights summing to 1.
+    """
+    rad_lats = np.radians(lats)
+    cos_lats = np.cos(rad_lats)
+    weights = cos_lats / np.sum(cos_lats)
+    return weights
 
-    # 2. Specific Humidity Alignment (kg/kg -> g/kg if reference is in g/kg)
-    elif var_name == 'q':
-        pred_mean = np.nanmean(pred)
-        ref_mean = np.nanmean(ref)
-        if pred_mean < 0.1 and ref_mean > 0.5:
-            pred = pred * 1000.0  # kg/kg to g/kg
-        elif pred_mean > 0.5 and ref_mean < 0.1:
-            ref = ref * 1000.0    # align reference
 
-    return pred, ref
+def compute_weighted_metrics(pred, ref, lat_weights):
+    """
+    Computes latitude-weighted RMSE, MAE, BIAS, ACC, and Relative Difference.
+    
+    Args:
+        pred (np.ndarray): Predicted values, shape (lat, lon) or (height, lat, lon)
+        ref (np.ndarray): Reference values, shape matching pred
+        lat_weights (np.ndarray): 1D array of latitude weights matching lat dimension
+        
+    Returns:
+        tuple: (rmse, mae, bias, acc, rel_diff)
+    """
+    # Ensure mask for non-NaN values
+    valid_mask = np.isfinite(pred) & np.isfinite(ref)
+    if not np.any(valid_mask):
+        return np.nan, np.nan, np.nan, np.nan, np.nan
 
-# ==========================================
-# MAIN EVALUATION PIPELINE
-# ==========================================
-def run_validation(input_file, ref_file, output_csv):
-    if not os.path.exists(input_file):
-        raise FileNotFoundError(f"Input verification file not found: {input_file}")
-    if not os.path.exists(ref_file):
-        raise FileNotFoundError(f"Reference truth file not found: {ref_file}")
+    # Broadcast latitude weights across longitude axis
+    # Assumes shape is (..., lat, lon)
+    if pred.ndim == 2:
+        weights_2d = lat_weights[:, None] * np.ones((1, pred.shape[1]))
+    elif pred.ndim == 3:
+        weights_2d = lat_weights[None, :, None] * np.ones((pred.shape[0], 1, pred.shape[2]))
+    else:
+        weights_2d = lat_weights
 
-    print("========================================================")
-    print("[AIDA VALIDATION] Running Verification Suite")
+    # Mask invalid points in weights
+    weights_masked = np.where(valid_mask, weights_2d, 0.0)
+    weight_sum = np.sum(weights_masked, axis=(-2, -1), keepdims=True)
+    weight_sum = np.where(weight_sum == 0, 1.0, weight_sum) # Avoid division by zero
+    norm_weights = weights_masked / weight_sum
+
+    # 1. Latitude-Weighted BIAS
+    diff = pred - ref
+    bias = np.sum(diff * norm_weights, axis=(-2, -1))
+
+    # 2. Latitude-Weighted MAE
+    mae = np.sum(np.abs(diff) * norm_weights, axis=(-2, -1))
+
+    # 3. Latitude-Weighted RMSE
+    rmse = np.sqrt(np.sum((diff ** 2) * norm_weights, axis=(-2, -1)))
+
+    # 4. Latitude-Weighted Anomaly Correlation Coefficient (ACC)
+    # Compute weighted anomalies relative to weighted spatial means
+    pred_mean = np.sum(pred * norm_weights, axis=(-2, -1), keepdims=True)
+    ref_mean = np.sum(ref * norm_weights, axis=(-2, -1), keepdims=True)
+
+    pred_anom = pred - pred_mean
+    ref_anom = ref - ref_mean
+
+    cov = np.sum(pred_anom * ref_anom * norm_weights, axis=(-2, -1))
+    var_pred = np.sum((pred_anom ** 2) * norm_weights, axis=(-2, -1))
+    var_ref = np.sum((ref_anom ** 2) * norm_weights, axis=(-2, -1))
+
+    denom = np.sqrt(var_pred * var_ref)
+    acc = np.where(denom > 1e-12, cov / denom, 0.0)
+
+    # 5. Latitude-Weighted Relative Difference (%)
+    ref_abs_mean = np.sum(np.abs(ref) * norm_weights, axis=(-2, -1))
+    rel_diff = np.where(ref_abs_mean > 1e-12, (mae / ref_abs_mean) * 100.0, 0.0)
+
+    return rmse, mae, bias, acc, rel_diff
+
+
+def run_verification(input_file, ref_file, output_csv):
+    print("=" * 56)
+    print("[AIDA VALIDATION] Running Verification Suite (Cos-Lat Weighted)")
     print(f"Test File : {input_file}")
     print(f"Ref File  : {ref_file}")
-    print("========================================================\n")
+    print("=" * 56)
 
     ds_test = xr.open_dataset(input_file)
-    ds_ref  = xr.open_dataset(ref_file)
+    ds_ref = xr.open_dataset(ref_file)
+
+    # Resolve latitude dimension and coordinates
+    lat_key = 'lat' if 'lat' in ds_test.coords else 'latitude'
+    lats = ds_test[lat_key].values
+    lat_weights = compute_latitude_weights(lats)
 
     target_vars = ['t', 'u', 'v', 'w', 'q', 'p']
+    overall_rows = []
     detailed_rows = []
-    summary_rows = []
 
     for var in target_vars:
         if var not in ds_test or var not in ds_ref:
-            print(f"Skipping '{var}': Not present in both test and reference datasets.")
+            print(f"Skipping '{var}': Not present in both datasets.")
             continue
 
         print(f"Evaluating: '{var}' vs Reference: '{var}'...")
-        da_test = ds_test[var]
-        da_ref  = ds_ref[var]
 
-        # Squeeze out single time or ensemble dimensions
-        raw_test = np.squeeze(da_test.values)
-        raw_ref  = np.squeeze(da_ref.values)
+        pred_data = ds_test[var].values
+        ref_data = ds_ref[var].values
 
-        # Apply unit harmonization
-        test_val, ref_val = harmonize_units(raw_test, raw_ref, var)
+        # Ensure height axis is first dimension if 3D
+        if pred_data.ndim == 3:
+            # Overall metrics across 3D atmospheric volume
+            # Collapse height dimension with mean for overall summary
+            rmse_all, mae_all, bias_all, acc_all, reldiff_all = compute_weighted_metrics(
+                pred_data, ref_data, lat_weights
+            )
+            
+            # Take mean across all vertical levels for overall summary
+            overall_rows.append({
+                'Variable': var,
+                'RMSE': np.nanmean(rmse_all),
+                'MAE': np.nanmean(mae_all),
+                'BIAS': np.nanmean(bias_all),
+                'ACC': np.nanmean(acc_all),
+                'RelDiff (%)': np.nanmean(reldiff_all)
+            })
 
-        # Global variable metrics across full 3D domain
-        glob_rmse = compute_rmse(test_val, ref_val)
-        glob_mae  = compute_mae(test_val, ref_val)
-        glob_bias = compute_bias(test_val, ref_val)
-        glob_acc  = compute_acc(test_val, ref_val)
-        glob_rel  = compute_rel_diff(glob_rmse, ref_val)
-
-        summary_rows.append({
-            'Variable': var,
-            'RMSE': glob_rmse,
-            'MAE': glob_mae,
-            'BIAS': glob_bias,
-            'ACC': glob_acc,
-            'RelDiff (%)': glob_rel
-        })
-
-        # Height/Level-by-Level Verification
-        if 'height' in ds_test[var].dims or (test_val.ndim == 3):
-            heights = ds_test['height'].values if 'height' in ds_test.coords else np.arange(test_val.shape[0])
-            for h_idx, h_val in enumerate(heights):
-                layer_test = test_val[h_idx]
-                layer_ref  = ref_val[h_idx]
-
-                # Check if layer is completely unpopulated/NaN
-                if np.isnan(layer_ref).all() or np.isnan(layer_test).all():
-                    l_rmse, l_mae, l_bias, l_acc = np.nan, np.nan, np.nan, np.nan
-                else:
-                    l_rmse = compute_rmse(layer_test, layer_ref)
-                    l_mae  = compute_mae(layer_test, layer_ref)
-                    l_bias = compute_bias(layer_test, layer_ref)
-                    l_acc  = compute_acc(layer_test, layer_ref)
-
+            # Level-by-level evaluation
+            heights = ds_test['height'].values if 'height' in ds_test else np.arange(pred_data.shape[0])
+            for idx, h in enumerate(heights):
+                p_level = pred_data[idx]
+                r_level = ref_data[idx]
+                
+                rmse, mae, bias, acc, _ = compute_weighted_metrics(p_level, r_level, lat_weights)
                 detailed_rows.append({
                     'Variable': var,
-                    'Level': float(h_val),
-                    'RMSE': l_rmse,
-                    'MAE': l_mae,
-                    'BIAS': l_bias,
-                    'ACC': l_acc
+                    'Level': float(h),
+                    'RMSE': float(rmse),
+                    'MAE': float(mae),
+                    'BIAS': float(bias),
+                    'ACC': float(acc)
                 })
 
-    # Display Overall Summary Table
-    df_summary = pd.DataFrame(summary_rows)
-    print("\n======================================================================")
-    print("OVERALL SPATIAL METRICS SUMMARY (HARMONIZED UNITS)")
-    print("======================================================================")
-    print(df_summary.to_string(index=False, float_format=lambda x: f"{x:12.6f}"))
-    print("======================================================================\n")
+        elif pred_data.ndim == 2:
+            rmse, mae, bias, acc, reldiff = compute_weighted_metrics(pred_data, ref_data, lat_weights)
+            overall_rows.append({
+                'Variable': var,
+                'RMSE': float(rmse),
+                'MAE': float(mae),
+                'BIAS': float(bias),
+                'ACC': float(acc),
+                'RelDiff (%)': float(reldiff)
+            })
 
-    # Export Level-by-Level Metrics to CSV
-    if output_csv:
+    # Display Overall Summary Table
+    df_overall = pd.DataFrame(overall_rows)
+    print("\n" + "=" * 70)
+    print("OVERALL SPATIAL METRICS SUMMARY (COSINE-LATITUDE WEIGHTED)")
+    print("=" * 70)
+    print(df_overall.to_string(index=False, float_format=lambda x: f"{x:12.6f}"))
+    print("=" * 70)
+
+    # Save level-by-level CSV report
+    if detailed_rows:
         df_detailed = pd.DataFrame(detailed_rows)
         df_detailed.to_csv(output_csv, index=False)
-        print(f"Detailed level-by-level metrics written to: '{output_csv}'")
+        print(f"\nDetailed level-by-level metrics written to: '{output_csv}'")
 
-    ds_test.close()
-    ds_ref.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate regridded AI forecast against reference files.")
-    parser.add_argument("-i", "--input", required=True, help="Input regridded NetCDF file")
-    parser.add_argument("-r", "--ref", required=True, help="Reference NetCDF file (GFS standard)")
-    parser.add_argument("-o", "--output", required=False, default="verification_levels.csv", help="Output CSV path")
-
+    parser = argparse.ArgumentParser(description="AIDA Cosine-Latitude Weighted Verification")
+    parser.add_argument("-i", "--input", required=True, help="Input reconstructed analysis NetCDF file")
+    parser.add_argument("-r", "--reference", required=True, help="Reference truth GFS NetCDF file")
+    parser.add_argument("-o", "--output", default="output/verification_levels.csv", help="Output level CSV file")
+    
     args = parser.parse_args()
-    run_validation(args.input, args.ref, args.output)
+    run_verification(args.input, args.reference, args.output)
+
 
 if __name__ == "__main__":
     main()
