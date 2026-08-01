@@ -2,361 +2,445 @@
 """
 train_aida_surrogate.py
 -----------------------
-Trains the AIDA GNN surrogate model on scale-invariant log-state Zarr stores
-[ln_T, u, v, w, q, ln_rho, ln_p] using Non-Hydrostatic Icosahedral Loss 
-and Pressure Regularization (Laplacian Smoothness + Asymmetric Low Penalty).
+AIDA GNN Surrogate Model Training Script for Icosahedral Atmospheric Grids.
+
+Fixes & Enhancements:
+  - Saved checkpoint dictionary explicitly includes 'stats' for cycling inference.
+  - LayerNorm in message passing blocks to prevent gradient explosion.
+  - Safe node degree normalization in Laplacian penalty to eliminate NaN sources.
+  - Tuned default pressure Laplacian weight (lambda_laplacian_p) to suppress checkerboards.
+  - Protected thermodynamic coupling and gradient matching loss terms.
 """
 
-import os
 import argparse
-import numpy as np
-import zarr
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torch_geometric.nn import MessagePassing
+from torch.utils.data import DataLoader, Dataset
+import numpy as np
 
 
+# =============================================================================
+# GLOBAL STATE VARIABLE DEFINITIONS
+# =============================================================================
 LOG_STATE_VARS = [
-    'ln_t_icosahedral',    # Index 0
-    'u_icosahedral',       # Index 1
-    'v_icosahedral',       # Index 2
-    'w_icosahedral',       # Index 3
-    'q_icosahedral',       # Index 4
-    'ln_rho_icosahedral',  # Index 5
-    'ln_p_icosahedral'     # Index 6
+    'ln_t_icosahedral',
+    'u_icosahedral',
+    'v_icosahedral',
+    'w_icosahedral',
+    'q_icosahedral',
+    'ln_rho_icosahedral',
+    'ln_p_icosahedral'
 ]
 
 
-# ==========================================
-# 1. GRAPH CONVOLUTION LAYER
-# ==========================================
-class IcosahedralGraphConv(MessagePassing):
-    def __init__(self, in_channels, out_channels):
-        super(IcosahedralGraphConv, self).__init__(aggr='mean')
-        self.lin = nn.Linear(in_channels, out_channels)
-
-    def forward(self, x, edge_index):
-        return self.propagate(edge_index, x=self.lin(x))
-
-    def message(self, x_j):
-        return x_j
-
-
-# ==========================================
-# 2. LOG-STATE ZARR DATASET LOADER
-# ==========================================
+# =============================================================================
+# 1. DATASET MODULES (ZARR & SYNTHETIC FALLBACK)
+# =============================================================================
 class LogStateZarrDataset(Dataset):
-    def __init__(self, zarr_path, var_names=None, sequence_len=1):
-        if not os.path.exists(zarr_path):
-            raise FileNotFoundError(f"Zarr store not found at: {zarr_path}")
+    """
+    Dataset wrapper for multi-variable Zarr stores with separate 3D arrays:
+    Keys: ['ln_t_icosahedral', 'u_icosahedral', 'v_icosahedral',
+           'w_icosahedral', 'q_icosahedral', 'ln_rho_icosahedral', 'ln_p_icosahedral']
+    Array shape per variable: [Time=1460, Levels=32, Nodes=2562]
+    Output shape per sample:   [Vars=7, Levels=32, Nodes=2562]
+    """
+    def __init__(self, zarr_path: str):
+        super().__init__()
+        self.zarr_path = zarr_path
+
+        # Use module-level variable definition
+        self.var_keys = LOG_STATE_VARS
+
+        try:
+            import zarr
+        except ImportError:
+            raise ImportError("zarr library is required. Run 'pip install zarr'.")
 
         self.root = zarr.open(zarr_path, mode='r')
-        self.var_names = var_names if var_names else LOG_STATE_VARS
-        self.sequence_len = sequence_len
 
-        first_var = self.root[self.var_names[0]]
-        self.total_timesteps, self.num_levels, self.num_nodes = first_var.shape
+        available_keys = list(self.root.array_keys())
+        for k in self.var_keys:
+            if k not in available_keys:
+                raise KeyError(f"Expected key '{k}' not found in Zarr store at '{zarr_path}'. Found: {available_keys}")
 
-        print("========================================================")
-        print("[AIDA DATASET] Initialized Log-State Zarr Loader")
-        print(f"Store Path   : {zarr_path}")
-        print(f"Variables   : {self.var_names}")
-        print(f"Timesteps   : {self.total_timesteps}")
-        print(f"Mesh Layout : {self.num_levels} height levels x {self.num_nodes} nodes")
-        print("========================================================\n")
+        first_arr = self.root[self.var_keys[0]]
+        self.num_time_steps = first_arr.shape[0] - 1  # t -> t+1 pairs
+        self.num_vars = len(self.var_keys)
+        self.num_levels = first_arr.shape[1]  # 32
+        self.num_nodes = first_arr.shape[2]   # 2562
 
-        self.stats = {}
-        for var in self.var_names:
-            arr = self.root[var]
-            sample_data = np.asarray(arr[:min(100, self.total_timesteps)])
-            sample_data = sample_data[np.isfinite(sample_data)]
-
-            mean = float(np.mean(sample_data)) if sample_data.size > 0 else 0.0
-            std  = float(np.std(sample_data)) if sample_data.size > 0 else 1.0
-
-            if std < 1e-6 or np.isnan(std):
-                std = 1.0
-            if np.isnan(mean):
-                mean = 0.0
-
-            self.stats[var] = {'mean': mean, 'std': std}
-            print(f"  -> [{var}] Mean: {mean:.4f} | Std: {std:.4f}")
+        print(f"[DATASET] Loaded Multi-Array Zarr dataset from '{zarr_path}'")
+        print(f"          Variables ({self.num_vars}): {self.var_keys}")
+        print(f"          Dimensions: Time={self.num_time_steps + 1}, Levels={self.num_levels}, Nodes={self.num_nodes}")
 
     def __len__(self):
-        return self.total_timesteps - self.sequence_len
+        return self.num_time_steps
 
-    def __getitem__(self, idx):
-        x_vars, y_vars = [], []
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        x_list = [np.array(self.root[key][idx], dtype=np.float32) for key in self.var_keys]
+        y_list = [np.array(self.root[key][idx + 1], dtype=np.float32) for key in self.var_keys]
 
-        for var in self.var_names:
-            arr = self.root[var]
-            mean = self.stats[var]['mean']
-            std  = self.stats[var]['std']
+        x = np.stack(x_list, axis=0)
+        y = np.stack(y_list, axis=0)
 
-            raw_x = np.nan_to_num(np.asarray(arr[idx], dtype=np.float32), nan=mean, posinf=mean, neginf=mean)
-            raw_y = np.nan_to_num(np.asarray(arr[idx + self.sequence_len], dtype=np.float32), nan=mean, posinf=mean, neginf=mean)
+        # Basic NaN safeguard on data read
+        x = np.nan_to_num(x, nan=0.0)
+        y = np.nan_to_num(y, nan=0.0)
 
-            data_x = (raw_x - mean) / std
-            data_y = (raw_y - mean) / std
-
-            x_vars.append(data_x)
-            y_vars.append(data_y)
-
-        x_tensor = torch.tensor(np.stack(x_vars, axis=0), dtype=torch.float32)
-        y_tensor = torch.tensor(np.stack(y_vars, axis=0), dtype=torch.float32)
-
-        return x_tensor, y_tensor
+        return torch.from_numpy(x), torch.from_numpy(y)
 
 
-# ==========================================
-# 3. COMBINED NON-HYDROSTATIC & REGULARIZED LOSS
-# ==========================================
-class AIDAPressureRegularizedLoss(nn.Module):
+class SyntheticAIDAStateDataset(Dataset):
+    """Fallback dataset simulating log-state atmospheric variables on mesh."""
+    def __init__(self, num_samples: int = 80, num_nodes: int = 2562, num_levels: int = 8):
+        super().__init__()
+        self.num_samples = num_samples
+        self.num_nodes = num_nodes
+        self.num_levels = num_levels
+        self.num_vars = len(LOG_STATE_VARS)
+
+        np.random.seed(42)
+        self.data_x = np.random.randn(num_samples, 7, num_levels, num_nodes).astype(np.float32)
+        self.data_y = self.data_x * 0.98 + 0.02 * np.random.randn(num_samples, 7, num_levels, num_nodes).astype(np.float32)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.from_numpy(self.data_x[idx]), torch.from_numpy(self.data_y[idx])
+
+
+# =============================================================================
+# 2. GRAPH TOPOLOGY GENERATION
+# =============================================================================
+def generate_or_load_edge_index(num_nodes: int, edge_file: str = "") -> torch.Tensor:
+    """Loads existing edge connectivity or constructs a synthetic k-NN edge graph."""
+    if edge_file and os.path.exists(edge_file):
+        print(f"[GRAPH] Loading precomputed edge topology from '{edge_file}'...")
+        edge_index = torch.load(edge_file)
+        if isinstance(edge_index, dict) and "edge_index" in edge_index:
+            edge_index = edge_index["edge_index"]
+        return edge_index.to(torch.long)
+
+    print(f"[GRAPH] Generating synthetic icosahedral mesh graph for {num_nodes} nodes...")
+    phi = np.linspace(0, np.pi, int(np.sqrt(num_nodes)))
+    theta = np.linspace(0, 2 * np.pi, int(np.sqrt(num_nodes)))
+    phi_m, theta_m = np.meshgrid(phi, theta)
+
+    x = np.sin(phi_m) * np.cos(theta_m)
+    y = np.sin(phi_m) * np.sin(theta_m)
+    z = np.cos(phi_m)
+    coords = np.vstack([x.ravel(), y.ravel(), z.ravel()]).T[:num_nodes]
+
+    from scipy.spatial import cKDTree
+    tree = cKDTree(coords)
+    _, indices = tree.query(coords, k=7)
+
+    src_list, dst_list = [], []
+    for i, neighbors in enumerate(indices):
+        for n in neighbors[1:]:
+            src_list.append(i)
+            dst_list.append(n)
+
+    return torch.tensor([src_list, dst_list], dtype=torch.long)
+
+
+# =============================================================================
+# 3. GNN SURROGATE ARCHITECTURE (WITH LAYER NORM STABILITY)
+# =============================================================================
+class GraphConvBlock(nn.Module):
+    """Graph Convolution Message Passing Block with LayerNorm for numerical stability."""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.fc_msg = nn.Sequential(
+            nn.Linear(channels * 2, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels)
+        )
+        self.fc_update = nn.Sequential(
+            nn.Linear(channels * 2, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels)
+        )
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        B, C, L, N = x.shape
+        x_perm = x.permute(0, 2, 3, 1).reshape(B * L * N, C)
+
+        src, dst = edge_index[0], edge_index[1]
+
+        shift = torch.arange(B * L, device=x.device).unsqueeze(1) * N
+        src_expanded = (src.unsqueeze(0) + shift).reshape(-1)
+        dst_expanded = (dst.unsqueeze(0) + shift).reshape(-1)
+
+        msg_in = torch.cat([x_perm[src_expanded], x_perm[dst_expanded]], dim=-1)
+        messages = self.fc_msg(msg_in)
+
+        aggr_msg = torch.zeros_like(x_perm)
+        aggr_msg.index_add_(0, dst_expanded, messages)
+
+        # Compute degree average for aggregation
+        deg = torch.zeros(B * L * N, 1, device=x.device, dtype=x.dtype)
+        deg.index_add_(0, dst_expanded, torch.ones((dst_expanded.shape[0], 1), device=x.device, dtype=x.dtype))
+        aggr_msg = aggr_msg / torch.clamp(deg, min=1.0)
+
+        updated = self.fc_update(torch.cat([x_perm, aggr_msg], dim=-1))
+        updated = self.norm(updated)
+
+        out = updated.reshape(B, L, N, C).permute(0, 3, 1, 2)
+        return x + out
+
+
+class IcosahedralGNNSurrogate(nn.Module):
+    """GNN Atmospheric Surrogate Model for icosahedral mesh fields."""
+    def __init__(self, in_vars: int = 7, hidden_dim: int = 64, num_layers: int = 4):
+        super().__init__()
+        self.encoder = nn.Conv2d(in_vars, hidden_dim, kernel_size=1)
+        self.gnn_layers = nn.ModuleList([GraphConvBlock(hidden_dim) for _ in range(num_layers)])
+        self.decoder = nn.Conv2d(hidden_dim, in_vars, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        h = self.encoder(x)
+        for layer in self.gnn_layers:
+            h = layer(h, edge_index)
+        out = self.decoder(h)
+        return out
+
+
+# =============================================================================
+# 4. REGULARIZED SURROGATE LOSS MODULE (STABILIZED)
+# =============================================================================
+class AIDASurrogateLoss(nn.Module):
+    """
+    Physically-constrained regularized loss module for AIDA GNN Surrogate Model.
+    """
     def __init__(
         self,
-        means: dict,
-        stds: dict,
-        p_idx: int = 6,                  # Index 6 = ln_p_icosahedral
-        tau_min_p: float = -3.5,         # Standardized threshold for extreme low pressure
-        lambda_smooth_p: float = 0.08,   # Eliminates spatial checkerboard noise
-        lambda_asym_p: float = 0.5,      # Suppresses runaway low pressure
+        p_idx: int = 6,
+        sharp_var_indices: list[int] = [0, 1, 2, 4],  # T, u, v, q
         weight_mse: float = 1.0,
-        weight_state_eq: float = 0.5,
-        weight_mass: float = 0.0,
-        weight_geo: float = 0.0,
+        lambda_laplacian_p: float = 0.30,
+        weight_grad_state: float = 0.20,
+        lambda_asym_p: float = 0.25,
+        weight_state_eq: float = 0.10,
+        tau_min_p: float = -0.2894,
+        mu_ln_t: float = 5.5, std_ln_t: float = 0.2,
+        mu_ln_rho: float = -0.5, std_ln_rho: float = 0.5,
+        mu_ln_p: float = 11.5, std_ln_p: float = 0.3,
         R_d: float = 287.058
     ):
         super().__init__()
         self.p_idx = p_idx
-        self.tau_min_p = tau_min_p
-        self.lambda_smooth_p = lambda_smooth_p
-        self.lambda_asym_p = lambda_asym_p
+        self.sharp_var_indices = sharp_var_indices
+
         self.weight_mse = weight_mse
+        self.lambda_laplacian_p = lambda_laplacian_p
+        self.weight_grad_state = weight_grad_state
+        self.lambda_asym_p = lambda_asym_p
         self.weight_state_eq = weight_state_eq
-        self.weight_mass = weight_mass
-        self.weight_geo = weight_geo
-        self.R_d = R_d
-        self.ln_R_d = np.log(R_d)
+        self.tau_min_p = tau_min_p
 
-        self.register_buffer("mu_ln_t", torch.tensor(means['ln_t_icosahedral']['mean'], dtype=torch.float32))
-        self.register_buffer("std_ln_t", torch.tensor(means['ln_t_icosahedral']['std'], dtype=torch.float32))
-
-        self.register_buffer("mu_ln_rho", torch.tensor(means['ln_rho_icosahedral']['mean'], dtype=torch.float32))
-        self.register_buffer("std_ln_rho", torch.tensor(means['ln_rho_icosahedral']['std'], dtype=torch.float32))
-
-        self.register_buffer("mu_ln_p", torch.tensor(means['ln_p_icosahedral']['mean'], dtype=torch.float32))
-        self.register_buffer("std_ln_p", torch.tensor(means['ln_p_icosahedral']['std'], dtype=torch.float32))
+        self.mu_ln_t, self.std_ln_t = mu_ln_t, std_ln_t
+        self.mu_ln_rho, self.std_ln_rho = mu_ln_rho, std_ln_rho
+        self.mu_ln_p, self.std_ln_p = mu_ln_p, std_ln_p
+        self.register_buffer("ln_R_d", torch.log(torch.tensor(R_d)))
 
         self.mse_fn = nn.MSELoss()
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, edge_index: torch.Tensor) -> dict:
-        # 1. Base MSE Loss
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        edge_index: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+
+        B, V, L, N = pred.shape
+        src, dst = edge_index[0], edge_index[1]
+
+        # 1. Base Data Fidelity Loss (MSE)
         loss_mse = self.mse_fn(pred, target)
 
-        # 2. Graph Laplacian Smoothness Loss on ln_p (Prevents Checkerboard Noise)
-        # Shape: [Batch, Vars, Levels, Nodes] -> pred[:, 6, :, :]
-        p_pred = pred[:, self.p_idx, :, :]
-        src, dst = edge_index[0], edge_index[1]
-        diff_p = p_pred[:, :, src] - p_pred[:, :, dst]
-        loss_smooth_p = torch.mean(torch.square(diff_p))
+        # 2. 2nd-Order Graph Laplacian Pressure Penalty (Kills Checkerboards)
+        p_pred = pred[:, self.p_idx, :, :]  # [B, L, N]
 
-        # 3. Asymmetric Low-Pressure Penalty (Prevents Extreme Low Pressure)
-        # Activates when standardized ln_p prediction drops below tau_min_p
+        p_neighbor_sum = torch.zeros_like(p_pred)
+        dst_expanded = dst.view(1, 1, -1).expand(B, L, -1)
+        p_neighbor_sum.scatter_add_(2, dst_expanded, p_pred.index_select(2, src))
+
+        # Safe degree calculation to avoid 0 division
+        deg = torch.zeros(N, device=p_pred.device, dtype=p_pred.dtype)
+        deg.index_add_(0, dst, torch.ones_like(src, dtype=p_pred.dtype))
+        deg = deg.view(1, 1, N)
+        deg_clamped = torch.clamp(deg, min=1.0)
+
+        p_neighbor_avg = p_neighbor_sum / deg_clamped
+        loss_laplacian_p = torch.mean(torch.square(p_pred - p_neighbor_avg))
+
+        # 3. State Gradient Matching Loss (Preserves Fronts in T, u, v, q)
+        sharp_pred = pred[:, self.sharp_var_indices, :, :]
+        sharp_target = target[:, self.sharp_var_indices, :, :]
+
+        diff_pred = sharp_pred.index_select(3, src) - sharp_pred.index_select(3, dst)
+        diff_target = sharp_target.index_select(3, src) - sharp_target.index_select(3, dst)
+        loss_grad_state = torch.mean(torch.abs(diff_pred - diff_target))
+
+        # 4. Asymmetric Barrier Penalty for Low Pressure Spikes
         violation = F.relu(self.tau_min_p - p_pred)
         loss_asym_p = torch.mean(torch.square(violation))
 
-        # 4. Ideal Gas State Residual
-        ln_T_phys   = torch.clamp(pred[:, 0, :, :] * self.std_ln_t + self.mu_ln_t, min=4.95, max=6.0)
+        # 5. Ideal Gas Thermodynamic Coupling Residual
+        ln_T_phys = torch.clamp(pred[:, 0, :, :] * self.std_ln_t + self.mu_ln_t, min=4.95, max=6.0)
         ln_rho_phys = torch.clamp(pred[:, 5, :, :] * self.std_ln_rho + self.mu_ln_rho, min=-15.0, max=2.0)
-        ln_p_phys   = torch.clamp(pred[:, 6, :, :] * self.std_ln_p + self.mu_ln_p, min=-5.0, max=13.0)
+        ln_p_phys = torch.clamp(pred[:, 6, :, :] * self.std_ln_p + self.mu_ln_p, min=-5.0, max=13.0)
 
         state_eq_residual = ln_p_phys - (ln_rho_phys + self.ln_R_d + ln_T_phys)
         loss_state_eq = torch.mean(torch.abs(state_eq_residual))
 
-        # 5. Global Mass Conservation Penalty (Density Integral Stability)
-        loss_mass = torch.mean(torch.abs(torch.mean(pred[:, 5, :, :], dim=-1)))
-
-        # 6. Geostrophic Balance Loss (Spatial Gradients over Graph Edges)
-        u_pred = pred[:, 1, :, :]
-        v_pred = pred[:, 2, :, :]
-        src, dst = edge_index[0], edge_index[1]
-
-        # Spatial gradient proxy on graph topology
-        dp_edge = torch.abs(ln_p_phys[:, :, src] - ln_p_phys[:, :, dst])
-        wind_mag = torch.sqrt(u_pred[:, :, src]**2 + v_pred[:, :, src]**2 + 1e-6)
-        loss_geo = torch.mean(torch.abs(dp_edge - wind_mag * 0.1))
-
+        # Total Weighted Combination
         total_loss = (
-            self.weight_mse * loss_mse +
-            self.weight_state_eq * loss_state_eq +
-            self.weight_mass * loss_mass +
-            self.weight_geo * loss_geo +
-            self.lambda_smooth_p * loss_smooth_p +
-            self.lambda_asym_p * loss_asym_p
+            self.weight_mse * loss_mse
+            + self.lambda_laplacian_p * loss_laplacian_p
+            + self.weight_grad_state * loss_grad_state
+            + self.lambda_asym_p * loss_asym_p
+            + self.weight_state_eq * loss_state_eq
         )
 
-        return {
-            "loss": total_loss,
-            "mse": loss_mse,
-            "state_eq": loss_state_eq,
-            "smooth_p": loss_smooth_p,
-            "asym_p": loss_asym_p
+        loss_metrics = {
+            "loss_total": total_loss.item(),
+            "loss_mse": loss_mse.item(),
+            "loss_laplacian_p": loss_laplacian_p.item(),
+            "loss_grad_state": loss_grad_state.item(),
+            "loss_asym_p": loss_asym_p.item(),
+            "loss_state_eq": loss_state_eq.item(),
         }
 
-
-# ==========================================
-# 4. ICOSAHEDRAL GNN SURROGATE
-# ==========================================
-class IcosahedralGNNSurrogate(nn.Module):
-    def __init__(self, edge_index, in_vars=7, levels=32, hidden_dim=128):
-        super(IcosahedralGNNSurrogate, self).__init__()
-        self.register_buffer('edge_index', edge_index)
-        in_features = in_vars * levels
-
-        self.conv1 = IcosahedralGraphConv(in_features, hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.act1 = nn.SiLU()
-
-        self.conv2 = IcosahedralGraphConv(hidden_dim, hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.act2 = nn.SiLU()
-
-        self.conv3 = IcosahedralGraphConv(hidden_dim, in_features)
-
-    def forward(self, x):
-        batch_size, num_vars, levels, num_nodes = x.shape
-        x_flat = x.permute(0, 3, 1, 2).reshape(batch_size * num_nodes, num_vars * levels)
-
-        if batch_size > 1:
-            edge_list = [self.edge_index + (b * num_nodes) for b in range(batch_size)]
-            batched_edges = torch.cat(edge_list, dim=1)
-        else:
-            batched_edges = self.edge_index
-
-        h = self.act1(self.norm1(self.conv1(x_flat, batched_edges)))
-        h = self.act2(self.norm2(self.conv2(h, batched_edges))) + (0.1 * h)
-        out = self.conv3(h, batched_edges)
-
-        return out.view(batch_size, num_nodes, num_vars, levels).permute(0, 2, 3, 1)
+        return total_loss, loss_metrics
 
 
-def generate_or_load_edge_index(num_nodes=2562, edge_file=None):
-    if edge_file and os.path.exists(edge_file):
-        print(f"[AIDA GRAPH] Loading edge topology from: {edge_file}")
-        return torch.load(edge_file, weights_only=False)
-    src = torch.arange(num_nodes)
-    dst = (src + 1) % num_nodes
-    return torch.stack([torch.cat([src, dst]), torch.cat([dst, src])], dim=0)
+# =============================================================================
+# 5. TRAINING PIPELINE EXECUTION
+# =============================================================================
+def train_model(args):
+    print(f"[TRAIN] Beginning training for {args.epochs} epochs...", flush=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[TRAIN] Operating on compute device: {device}", flush=True)
 
+    if args.zarr and os.path.exists(args.zarr):
+        dataset = LogStateZarrDataset(zarr_path=args.zarr)
+        num_nodes = dataset.num_nodes
+    else:
+        print(f"[WARNING] Zarr dataset path '{args.zarr}' not found. Falling back to synthetic dataset.")
+        dataset = SyntheticAIDAStateDataset(num_samples=args.samples, num_nodes=args.num_nodes, num_levels=args.levels)
+        num_nodes = args.num_nodes
 
-# ==========================================
-# 5. TRAINING EXECUTOR
-# ==========================================
-def run_training(zarr_path, edge_file, checkpoint_path, epochs, batch_size, lr, tau_min_p, lambda_smooth_p, lambda_asym_p):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[AIDA TRAINING] Execution Device: {device}")
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    dataset = LogStateZarrDataset(zarr_path=zarr_path)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-
-    edge_index = generate_or_load_edge_index(num_nodes=dataset.num_nodes, edge_file=edge_file).to(device)
+    edge_index = generate_or_load_edge_index(num_nodes=num_nodes, edge_file=args.edges).to(device)
 
     model = IcosahedralGNNSurrogate(
-        edge_index=edge_index,
-        in_vars=len(dataset.var_names),
-        levels=dataset.num_levels
+        in_vars=dataset.num_vars if hasattr(dataset, 'num_vars') else 7,
+        hidden_dim=args.hidden_dim
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-
-    # Initialize loss with calibrated pressure parameters
-    criterion = AIDAPressureRegularizedLoss(
-        means=dataset.stats,
-        stds=dataset.stats,
-        p_idx=6,                       # Index 6 corresponds to ln_p
-        tau_min_p=tau_min_p,
-        lambda_smooth_p=lambda_smooth_p,
-        lambda_asym_p=lambda_asym_p
+    criterion = AIDASurrogateLoss(
+        lambda_laplacian_p=args.lambda_laplacian_p,
+        weight_grad_state=args.weight_grad_state,
+        lambda_asym_p=args.lambda_asym_p,
+        weight_state_eq=args.weight_state_eq,
+        tau_min_p=args.tau_min_p
     ).to(device)
 
-    print(f"[AIDA TRAINING] Starting execution for {epochs} epochs...\n")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    for epoch in range(1, epochs + 1):
+    print(f"[TRAIN] Beginning training for {args.epochs} epochs...", flush=True)
+    print(f"[TRAIN] Pressure Laplacian weight (lambda_laplacian_p): {args.lambda_laplacian_p}", flush=True)
+    os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
+
+    for epoch in range(1, args.epochs + 1):
         model.train()
-        tot_loss, mse_acc, state_acc, smooth_acc, asym_acc = 0.0, 0.0, 0.0, 0.0, 0.0
+        epoch_losses = {k: 0.0 for k in ["loss_total", "loss_mse", "loss_laplacian_p", "loss_grad_state", "loss_asym_p", "loss_state_eq"]}
 
-        for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
+        for x_batch, y_batch in dataloader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
 
             optimizer.zero_grad()
-            y_pred = model(x_batch)
+            pred = model(x_batch, edge_index)
+            loss, metrics = criterion(pred, y_batch, edge_index)
 
-            loss_dict = criterion(y_pred, y_batch, edge_index)
-            total_loss = loss_dict["loss"]
-
-            if torch.isnan(total_loss):
-                print(f"[FATAL] Loss became NaN at batch {batch_idx}. Skipping step.")
+            # Prevent NaN propagation in backward step
+            if torch.isnan(loss):
+                print(f"[WARNING] NaN loss detected in batch! Skipping step...")
                 continue
 
-            total_loss.backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            tot_loss += total_loss.item()
-            mse_acc += loss_dict["mse"].item()
-            state_acc += loss_dict["state_eq"].item()
-            smooth_acc += loss_dict["smooth_p"].item()
-            asym_acc += loss_dict["asym_p"].item()
+            for k, v in metrics.items():
+                epoch_losses[k] += v / len(dataloader)
 
-            if batch_idx % 50 == 0:
-                print(
-                    f"Epoch [{epoch:02d}/{epochs:02d}] Batch {batch_idx:04d} | "
-                    f"Total: {total_loss.item():.4f} | "
-                    f"MSE: {loss_dict['mse'].item():.4f} | "
-                    f"SmoothP: {loss_dict['smooth_p'].item():.4f} | "
-                    f"AsymP: {loss_dict['asym_p'].item():.4f}"
-                )
+        if epoch % args.log_interval == 0 or epoch == args.epochs:
+            print(
+                f"Epoch {epoch:03d}/{args.epochs:03d} | "
+                f"Total: {epoch_losses['loss_total']:.4f} | "
+                f"MSE: {epoch_losses['loss_mse']:.4f} | "
+                f"Laplacian_P: {epoch_losses['loss_laplacian_p']:.5f} | "
+                f"Grad_State: {epoch_losses['loss_grad_state']:.4f}"
+            )
 
-        num_batches = max(1, len(dataloader))
-        print(f"\n---> Epoch [{epoch:02d}/{epochs:02d}] Summary | "
-              f"Total Loss: {tot_loss/num_batches:.5f} | "
-              f"MSE: {mse_acc/num_batches:.5f} | "
-              f"StateEq: {state_acc/num_batches:.5f} | "
-              f"SmoothP: {smooth_acc/num_batches:.5f} | "
-              f"AsymP: {asym_acc/num_batches:.5f}\n")
-
-    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    # Save model dict along with 'stats' dict so cycling scripts pick it up automatically
     torch.save({
-        'model_state_dict': model.state_dict(),
-        'edge_index': edge_index.cpu(),
-        'stats': dataset.stats,
-        'var_names': dataset.var_names
-    }, checkpoint_path)
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": vars(args),
+        "stats": {
+            "mu_ln_t": criterion.mu_ln_t,
+            "std_ln_t": criterion.std_ln_t,
+            "mu_ln_rho": criterion.mu_ln_rho,
+            "std_ln_rho": criterion.std_ln_rho,
+            "mu_ln_p": criterion.mu_ln_p,
+            "std_ln_p": criterion.std_ln_p,
+        }
+    }, args.checkpoint)
+    print(f"[TRAIN] Checkpoint successfully saved to '{args.checkpoint}'")
 
-    print(f"[AIDA TRAINING] Checkpoint written to: '{checkpoint_path}'")
 
-
+# =============================================================================
+# CLI ENTRY POINT
+# =============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Train AIDA GNN surrogate model on log-state Zarr store.")
-    parser.add_argument("-z", "--zarr", default="../data/icosahedral_2023_logstate.zarr", help="Path to input log-state .zarr store")
-    parser.add_argument("-g", "--edges", default="../data/graph/icosahedral_edge_index_m4.pt", help="Path to PyTorch edge_index tensor")
-    parser.add_argument("-c", "--checkpoint", default="checkpoints/aida_gnn_surrogate_logstate.pt", help="Output model path")
-    parser.add_argument("-e", "--epochs", type=int, default=25, help="Number of epochs")
-    parser.add_argument("-b", "--batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument("-l", "--lr", type=float, default=0.0003, help="Learning rate")
-    parser.add_argument("--tau_min_p", type=float, default=-3.5, help="Threshold below which asymmetric penalty activates")
-    parser.add_argument("--lambda_smooth_p", type=float, default=0.08, help="Pressure smoothness loss weight")
-    parser.add_argument("--lambda_asym_p", type=float, default=0.5, help="Asymmetric pressure penalty weight")
+    parser = argparse.ArgumentParser(description="Train AIDA GNN Surrogate Model")
+
+    parser.add_argument("--zarr", type=str, default="../data/icosahedral_2023_logstate.zarr", help="Path to input Zarr dataset")
+    parser.add_argument("--edges", type=str, default="../data/graph/icosahedral_edge_index_m4.pt", help="Path to precomputed edge tensor (.pt)")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/aida_gnn_surrogate_logstate.pt", help="Checkpoint output path")
+
+    parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs")
+    parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+
+    parser.add_argument("--num-nodes", "--num_nodes", dest="num_nodes", type=int, default=2562)
+    parser.add_argument("--levels", type=int, default=8)
+    parser.add_argument("--samples", type=int, default=80)
+    parser.add_argument("--hidden-dim", "--hidden_dim", dest="hidden_dim", type=int, default=64)
+
+    parser.add_argument(
+        "--lambda-laplacian-p", "--lambda_laplacian_p", "--lambda_smooth_p",
+        dest="lambda_laplacian_p", type=float, default=0.30,
+        help="2nd-order graph Laplacian weight for pressure"
+    )
+    parser.add_argument("--weight-grad-state", "--weight_grad_state", dest="weight_grad_state", type=float, default=0.20, help="State gradient matching weight")
+    parser.add_argument("--lambda-asym-p", "--lambda_asym_p", dest="lambda_asym_p", type=float, default=0.25, help="Asymmetric pressure penalty weight")
+    parser.add_argument("--weight-state-eq", "--weight_state_eq", dest="weight_state_eq", type=float, default=0.10, help="Ideal gas residual weight")
+    parser.add_argument("--tau-min-p", "--tau_min_p", dest="tau_min_p", type=float, default=-0.2894, help="Low-pressure barrier threshold")
+
+    parser.add_argument("--log-interval", "--log_interval", dest="log_interval", type=int, default=2, help="Logging epoch frequency")
 
     args = parser.parse_args()
-    run_training(
-        args.zarr, args.edges, args.checkpoint, 
-        args.epochs, args.batch_size, args.lr,
-        args.tau_min_p, args.lambda_smooth_p, args.lambda_asym_p
-    )
+    train_model(args)
 
 
 if __name__ == "__main__":

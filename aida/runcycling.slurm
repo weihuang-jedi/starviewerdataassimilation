@@ -51,13 +51,13 @@ get_analysis_time() {
 
 #GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate.pt"
 #GNN_CKPT="checkpoints/aida_exp1_smooth004.pt"
-GNN_CKPT="checkpoints/aida_exp2_relaxed.pt"
+GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate.pt"
 
 get_analysis_time ${START_YMD} ${START_HOUR} ${FCST_HOUR}
 
 background=../data/icosahedral_grid_logstate/global_icosahedral_m4.${START_YMD}.t${START_HOUR}z.1p00.f006.nc
-icosahedral_anal=output/exp2.global_icosahedral_m4.${ANALYS_YMD}.t${ANALYS_HOUR}z.1p00.anal.nc
-grid_anal=output/exp2.reconstructed_aida_analysis_${ANALYS_YMD}.t${ANALYS_HOUR}z.1p00.nc
+icosahedral_anal=output/global_icosahedral_m4.${ANALYS_YMD}.t${ANALYS_HOUR}z.1p00.anal.nc
+grid_anal=output/reconstructed_aida_analysis_${ANALYS_YMD}.t${ANALYS_HOUR}z.1p00.nc
 
 rm -f ${icosahedral_anal}
 rm -f ${grid_anal}

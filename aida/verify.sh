@@ -11,7 +11,7 @@ source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
 yyyymmdd=20240106
 analhour=06
 
-icosahedral_analysis=output/exp2.global_icosahedral_m4.${yyyymmdd}.t${analhour}z.1p00.anal.nc
+icosahedral_analysis=output/global_icosahedral_m4.${yyyymmdd}.t${analhour}z.1p00.anal.nc
 gridanalysis=output/reconstructed_aida_analysis_${yyyymmdd}.t${analhour}z.1p00.nc
 
 if [ ! -f ${gridanalysis} ]; then

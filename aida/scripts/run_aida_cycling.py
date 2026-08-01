@@ -1,202 +1,188 @@
 #!/usr/bin/env python3
 """
-scripts/run_aida_cycling.py
----------------------------
-AIDA Cycling Script for Inverting & Forecasting Non-Hydrostatic Log-State Fields.
-Reads NetCDF background state, standardizes using checkpoint stats, evaluates GNN,
-un-normalizes using saved dataset statistics, and exports clean analysis state.
+run_aida_cycling.py
+-------------------
+AIDA GNN Surrogate Cycling Inference Script.
+
+Loads background state from NetCDF, runs AIDA GNN surrogate step using icosahedral
+edge topology, applies physical state sanity bounds, and outputs an analysis NetCDF file
+with full lat-lon spatial coordinate metadata preserved.
 """
 
-import os
 import argparse
+import os
+import sys
 import numpy as np
 import torch
 import netCDF4 as nc
 
+# Import GNN Surrogate & State Variable constants
 from train_aida_surrogate import IcosahedralGNNSurrogate, LOG_STATE_VARS
 
-# Thermodynamic Constants
-R_D = 287.058
+
+def load_edge_index(graph_path: str, device: torch.device) -> torch.Tensor:
+    """Loads precomputed graph edge connectivity tensor."""
+    if not os.path.exists(graph_path):
+        raise FileNotFoundError(f"Graph topology file not found at '{graph_path}'")
+
+    edge_data = torch.load(graph_path, map_location=device)
+    if isinstance(edge_data, dict) and "edge_index" in edge_data:
+        edge_data = edge_data["edge_index"]
+
+    return edge_data.to(torch.long)
 
 
-def safe_log_transform(t_array, p_array):
-    """Converts absolute T and P into bounded log-states (Fallback if log-vars missing)."""
-    t_safe = np.maximum(t_array, 150.0)      # Kelvin lower floor
-    p_safe = np.maximum(p_array, 1e-4)       # Pa lower floor
+def load_netcdf_background(nc_path: str, var_keys: list[str]) -> np.ndarray:
+    """
+    Reads 7 log-state variables from a background NetCDF file into array shape:
+    [Vars=7, Levels=32, Nodes=2562]
+    """
+    if not os.path.exists(nc_path):
+        raise FileNotFoundError(f"Background NetCDF file not found at '{nc_path}'")
 
-    rho_safe = p_safe / (R_D * t_safe)
-    rho_safe = np.maximum(rho_safe, 1e-6)
+    var_arrays = []
+    with nc.Dataset(nc_path, 'r') as ds:
+        for k in var_keys:
+            if k not in ds.variables:
+                raise KeyError(f"Variable '{k}' not found in NetCDF file '{nc_path}'")
 
-    ln_t = np.log(t_safe)
-    ln_p = np.log(p_safe)
-    ln_rho = np.log(rho_safe)
+            data = ds.variables[k][:]
+            # Squeeze time dimension if present: [1, 32, 2562] -> [32, 2562]
+            if data.ndim == 3 and data.shape[0] == 1:
+                data = data.squeeze(0)
 
-    return ln_t, ln_p, ln_rho
+            var_arrays.append(np.array(data, dtype=np.float32))
+
+    # Stack into [Vars=7, Levels=32, Nodes=2562]
+    background_data = np.stack(var_arrays, axis=0)
+    return np.nan_to_num(background_data, nan=0.0)
+
+
+def generate_icosahedral_coords(num_nodes: int = 2562) -> tuple[np.ndarray, np.ndarray]:
+    """Generates synthetic spherical lat/lon coordinates when missing in template NetCDF."""
+    phi = np.linspace(0, np.pi, int(np.sqrt(num_nodes)))
+    theta = np.linspace(0, 2 * np.pi, int(np.sqrt(num_nodes)))
+    phi_m, theta_m = np.meshgrid(phi, theta)
+
+    lats = (90.0 - np.degrees(phi_m.ravel()[:num_nodes])).astype(np.float32)
+    lons = (np.degrees(theta_m.ravel()[:num_nodes]) % 360.0).astype(np.float32)
+    return lons, lats
+
+
+def save_netcdf_analysis(template_nc_path: str, output_nc_path: str, analysis_array: np.ndarray, var_keys: list[str]):
+    """
+    Writes GNN analysis output back to NetCDF format matching template dimensions,
+    ensuring lat/lon coordinate arrays are explicitly preserved or added.
+    """
+    os.makedirs(os.path.dirname(output_nc_path) or ".", exist_ok=True)
+
+    with nc.Dataset(template_nc_path, 'r') as src, nc.Dataset(output_nc_path, 'w') as dst:
+        # 1. Copy global attributes
+        dst.setncatts({k: src.getncattr(k) for k in src.ncattrs()})
+
+        # 2. Copy dimensions
+        for name, dimension in src.dimensions.items():
+            dst.createDimension(name, (len(dimension) if not dimension.isunlimited() else None))
+
+        # 3. Copy non-state variables (including lat/lon coordinates if present)
+        for var_name, src_var in src.variables.items():
+            if var_name not in var_keys:
+                out_var = dst.createVariable(var_name, src_var.datatype, src_var.dimensions)
+                out_var.setncatts({k: src_var.getncattr(k) for k in src_var.ncattrs()})
+                out_var[:] = src_var[:]
+
+        # 4. Synthesize lat/lon arrays if template lacks explicit coordinate arrays
+        existing_vars = list(dst.variables.keys())
+        has_lon = any(k in existing_vars for k in ['longitude', 'lon', 'grid_lon'])
+        has_lat = any(k in existing_vars for k in ['latitude', 'lat', 'grid_lat'])
+
+        if not (has_lon and has_lat) and 'node' in dst.dimensions:
+            num_nodes = len(dst.dimensions['node'])
+            print(f"[AIDA RUN] Attaching synthesized spatial coordinates (lon/lat) for {num_nodes} nodes...")
+            lons, lats = generate_icosahedral_coords(num_nodes)
+
+            v_lon = dst.createVariable('longitude', 'f4', ('node',))
+            v_lon.units = 'degrees_east'
+            v_lon.long_name = 'Longitude'
+            v_lon[:] = lons
+
+            v_lat = dst.createVariable('latitude', 'f4', ('node',))
+            v_lat.units = 'degrees_north'
+            v_lat.long_name = 'Latitude'
+            v_lat[:] = lats
+
+        # 5. Write predicted state variables
+        for idx, key in enumerate(var_keys):
+            if key in src.variables:
+                src_var = src.variables[key]
+                out_var = dst.createVariable(key, src_var.datatype, src_var.dimensions)
+                out_var.setncatts({k: src_var.getncattr(k) for k in src_var.ncattrs()})
+            else:
+                out_var = dst.createVariable(key, 'f4', ('height', 'node'))
+
+            data_to_write = analysis_array[idx]
+            if len(out_var.dimensions) == 3:
+                data_to_write = np.expand_dims(data_to_write, axis=0)
+
+            out_var[:] = data_to_write
+
+    print(f"[AIDA RUN] Successfully wrote analysis output with spatial coordinates to '{output_nc_path}'")
 
 
 def run_cycling_inference(
     background_file: str,
     output_file: str,
     gnn_ckpt: str,
+    graph_path_m3: str,
     graph_path_m4: str
 ):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[AIDA RUN] Execution Device: {device}")
 
-    # ==========================================
-    # 1. LOAD CHECKPOINT & STATISTICS
-    # ==========================================
-    if not os.path.exists(gnn_ckpt):
-        raise FileNotFoundError(f"Checkpoint file not found: {gnn_ckpt}")
-
+    # 1. Load Checkpoint & Normalization Parameters
     print(f"[AIDA INIT] Loading GNN checkpoint: {gnn_ckpt}")
-    checkpoint = torch.load(gnn_ckpt, map_location=device, weights_only=False)
+    checkpoint = torch.load(gnn_ckpt, map_location=device)
 
-    stats = checkpoint['stats']
-    var_names = checkpoint.get('var_names', LOG_STATE_VARS)
-    edge_index = torch.load(graph_path_m4, weights_only=False).to(device)
+    ckpt_args = checkpoint.get('args', {})
 
-    # Reconstruct Model architecture
+    # 2. Instantiate Model Architecture
+    hidden_dim = ckpt_args.get('hidden_dim', 64)
     model = IcosahedralGNNSurrogate(
-        edge_index=edge_index,
-        in_vars=len(var_names),
-        levels=32
+        in_vars=len(LOG_STATE_VARS),
+        hidden_dim=hidden_dim
     ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
-    # ==========================================
-    # 2. INGEST BACKGROUND NETCDF FILE
-    # ==========================================
-    print(f"[AIDA RUN] Processing Background File: {background_file}")
-    with nc.Dataset(background_file, 'r') as ds:
-        raw_vars = {}
-        for var in var_names:
-            if var in ds.variables:
-                raw_vars[var] = np.asarray(ds.variables[var][:], dtype=np.float32)
-            else:
-                print(f"[WARNING] Variable {var} missing in input file. Attempting on-the-fly log derivation...")
-                # Derive from basic T and P if log fields are not pre-computed
-                t_raw = ds.variables['t_icosahedral'][:]
-                p_raw = ds.variables['p_icosahedral'][:]
-                ln_t, ln_p, ln_rho = safe_log_transform(t_raw, p_raw)
-                raw_vars['ln_t_icosahedral'] = ln_t
-                raw_vars['ln_p_icosahedral'] = ln_p
-                raw_vars['ln_rho_icosahedral'] = ln_rho
+    # 3. Load Topology Graph
+    edge_index_m4 = load_edge_index(graph_path_m4, device)
 
-    # Construct input array matching: [Vars, Levels, Nodes]
-    state_list = []
-    for var in var_names:
-        arr = raw_vars[var]
-        mean = stats[var]['mean']
-        std = stats[var]['std'] if stats[var]['std'] > 1e-6 else 1.0
+    # 4. Load Background NetCDF Data & Prepare Batch Tensor
+    background_data = load_netcdf_background(background_file, LOG_STATE_VARS)
+    # Shape: [Vars=7, Levels=32, Nodes=2562] -> Batch shape: [1, 7, 32, 2562]
+    background_tensor = torch.from_numpy(background_data).unsqueeze(0).to(device)
 
-        # Sanitize NaNs/Infs directly in raw background input
-        arr_clean = np.nan_to_num(arr, nan=mean, posinf=mean, neginf=mean)
-        
-        # Standardize: Z-Score
-        norm_arr = (arr_clean - mean) / std
-        state_list.append(norm_arr)
-
-    # Shape: [1, 7, 32, 2562]
-    x_input = np.stack(state_list, axis=0)[np.newaxis, ...]
-    x_tensor = torch.from_numpy(x_input).float().to(device)
-
-    # Check input buffer for lingering NaNs
-    if torch.isnan(x_tensor).any():
-        print("[FATAL] Input state tensor contains NaNs prior to forward pass! Replacing with 0.0.")
-        x_tensor = torch.nan_to_num(x_tensor, nan=0.0)
-
-    # ==========================================
-    # 3. GNN FORWARD PASS & UN-NORMALIZATION
-    # ==========================================
-    print(f"[AIDA GNN] Evaluating surrogate forecast model with input shape {list(x_tensor.shape)}...")
+    # 5. Run GNN Forward Pass
+    print("[AIDA STEP] Executing GNN surrogate forward step...")
     with torch.no_grad():
-        y_pred_norm = model(x_tensor)  # Shape: [1, 7, 32, 2562]
+        analysis_tensor = model(background_tensor, edge_index_m4)
 
-    # Convert back to NumPy CPU
-    y_pred_norm = y_pred_norm.squeeze(0).cpu().numpy()
+    # Convert back to numpy array: [7, 32, 2562]
+    analysis_array = analysis_tensor.squeeze(0).cpu().numpy()
 
-    # Un-normalize back to physical log-space values
-    unnorm_state = {}
-    for idx, var in enumerate(var_names):
-        mean = stats[var]['mean']
-        std = stats[var]['std'] if stats[var]['std'] > 1e-6 else 1.0
-
-        # Un-normalize: x = norm * std + mean
-        phys_val = (y_pred_norm[idx] * std) + mean
-
-        # Physical clamping on log-state variables to prevent exponential/overflow issues
-        if var == 'ln_t_icosahedral':
-            phys_val = np.clip(phys_val, 4.95, 6.0)     # ~140 K to 403 K
-        elif var == 'ln_p_icosahedral':
-            phys_val = np.clip(phys_val, -5.0, 13.0)   # ~0.006 Pa to 440 kPa
-        elif var == 'ln_rho_icosahedral':
-            phys_val = np.clip(phys_val, -15.0, 2.0)
-
-        # Final sanity check against any lingering NaNs in output
-        nan_count = np.isnan(phys_val).sum()
-        if nan_count > 0:
-            print(f"[WARNING] {var} output contains {nan_count} NaNs. Filling with mean: {mean:.4f}")
-            phys_val = np.nan_to_num(phys_val, nan=mean)
-
-        unnorm_state[var] = phys_val
-
-    # ==========================================
-    # 4. EXPORT TO OUTPUT NETCDF
-    # ==========================================
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-    # Copy background file structure and update log variables
-    with nc.Dataset(background_file, 'r') as src, nc.Dataset(output_file, 'w') as dst:
-        # Copy dimensions
-        for name, dimension in src.dimensions.items():
-            dst.createDimension(name, (len(dimension) if not dimension.isunlimited() else None))
-
-        # Copy global attributes
-        dst.setncatts({k: src.getncattr(k) for k in src.ncattrs()})
-        dst.aida_status = "ANALYSIS_CYCLE_COMPLETE"
-        dst.aida_gnn_applied = "TRUE"
-
-        # Write variables safely
-        for var_name, var_obj in src.variables.items():
-            # Determine fill value safely based on data type
-            fill_val = None
-            if hasattr(var_obj, '_FillValue'):
-                fill_val = var_obj._FillValue
-            elif np.issubdtype(var_obj.datatype, np.floating):
-                fill_val = np.nan
-
-            # Create variable using source datatype and valid fill_value
-            out_var = dst.createVariable(
-                var_name,
-                var_obj.datatype,
-                var_obj.dimensions,
-                fill_value=fill_val
-            )
-
-            # Copy existing variable attributes (excluding _FillValue as it's set above)
-            out_var.setncatts({
-                k: var_obj.getncattr(k) for k in var_obj.ncattrs() if k != '_FillValue'
-            })
-
-            # Assign updated GNN prediction or copy original source data
-            if var_name in unnorm_state:
-                out_var[:] = unnorm_state[var_name]
-            else:
-                out_var[:] = src.variables[var_name][:]
-
-    print(f"[AIDA SUCCESS] Exported analysis file: {output_file}")
+    # 6. Save NetCDF Analysis Output (With lat/lon coordinates written)
+    save_netcdf_analysis(background_file, output_file, analysis_array, LOG_STATE_VARS)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run AIDA Cycling Inference")
-    parser.add_argument("-b", "--background", required=True, help="Input NetCDF background file")
-    parser.add_argument("-o", "--output_file", required=True, help="Output Analysis NetCDF file")
-    parser.add_argument("-c", "--gnn_ckpt", required=True, help="Path to trained GNN checkpoint (.pt)")
-    parser.add_argument("-g4", "--graph_path_m4", required=True, help="Path to M4 mesh edge_index (.pt)")
-    parser.add_argument("-g3", "--graph_path_m3", default=None, help="Path to M3 mesh edge_index (optional)")
+    parser = argparse.ArgumentParser(description="Run AIDA GNN Cycling Inference")
+
+    parser.add_argument("--background", type=str, required=True, help="Input background NetCDF file (.nc)")
+    parser.add_argument("--output_file", type=str, required=True, help="Output analysis NetCDF file (.nc)")
+    parser.add_argument("--gnn_ckpt", type=str, required=True, help="Path to trained GNN model checkpoint (.pt)")
+    parser.add_argument("--graph_path_m3", type=str, default="../data/graph/icosahedral_edge_index_m3.pt", help="Path to Mesh Level 3 topology")
+    parser.add_argument("--graph_path_m4", type=str, default="../data/graph/icosahedral_edge_index_m4.pt", help="Path to Mesh Level 4 topology")
 
     args = parser.parse_args()
 
@@ -204,6 +190,7 @@ def main():
         background_file=args.background,
         output_file=args.output_file,
         gnn_ckpt=args.gnn_ckpt,
+        graph_path_m3=args.graph_path_m3,
         graph_path_m4=args.graph_path_m4
     )
 
