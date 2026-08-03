@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --partition=u1-h100
 #SBATCH --qos=gpuwf
-#SBATCH --time=00:30:00
+#SBATCH --time=00:45:00
 #SBATCH --output=log.training_%J.out
 #SBATCH --export=NONE
 
@@ -23,17 +23,18 @@ fi
 
 set -x
 
-time python scripts/train_aida_surrogate.py \
-  --zarr ../data/icosahedral_2023_logstate.zarr \
-  --edges ../data/graph/icosahedral_edge_index_m4.pt \
-  --checkpoint checkpoints/aida_gnn_surrogate_logstate.pt \
-  --epochs 25 \
-  --batch_size 4 \
-  --lr 0.0003 \
-  --tau_min_p -0.2894 \
-  --lambda_smooth_p 0.15 \
-  --weight_grad_state 0.20 \
-  --lambda_asym_p 0.25
+time \
+python -u scripts/train_aida_surrogate.py \
+    --zarr ../data/icosahedral_2023_logstate.zarr \
+    --edges ../data/graph/icosahedral_edge_index_m4.pt \
+    --checkpoint checkpoints/aida_gnn_surrogate_logstate.pt \
+    --epochs 35 \
+    --tau_min_p -0.25 \
+    --lambda-laplacian-p 0.18 \
+    --weight-grad-state 0.20 \
+    --weight-state-eq 0.10 \
+    --weight-q-log 0.15 \
+    --weight-joint-bias 0.05
 
 if [ -f checkpoints/aida_gnn_surrogate_logstate.pt ]; then
    sbatch runcycling.slurm

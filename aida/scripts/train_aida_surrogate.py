@@ -213,19 +213,26 @@ class IcosahedralGNNSurrogate(nn.Module):
 # =============================================================================
 # 4. REGULARIZED SURROGATE LOSS MODULE (STABILIZED)
 # =============================================================================
+# =============================================================================
+# 4. REGULARIZED SURROGATE LOSS MODULE (STABILIZED + Q-SCALE FIXED)
+# =============================================================================
 class AIDASurrogateLoss(nn.Module):
     """
     Physically-constrained regularized loss module for AIDA GNN Surrogate Model.
+    Includes log-scale loss for specific humidity (q) to fix relative error explosion.
     """
     def __init__(
         self,
         p_idx: int = 6,
-        sharp_var_indices: list[int] = [0, 1, 2, 4],  # T, u, v, q
+        q_idx: int = 4,
+        sharp_var_indices: list[int] = [0, 1, 2, 4, 6],  # T, u, v, q, p
         weight_mse: float = 1.0,
-        lambda_laplacian_p: float = 0.30,
+        lambda_laplacian_p: float = 0.18,
         weight_grad_state: float = 0.20,
         lambda_asym_p: float = 0.25,
         weight_state_eq: float = 0.10,
+        weight_q_log: float = 0.15,                      # Weight for q log-scale matching
+        weight_joint_bias: float = 0.05,                  # Mild joint bias stabilizer
         tau_min_p: float = -0.2894,
         mu_ln_t: float = 5.5, std_ln_t: float = 0.2,
         mu_ln_rho: float = -0.5, std_ln_rho: float = 0.5,
@@ -234,6 +241,7 @@ class AIDASurrogateLoss(nn.Module):
     ):
         super().__init__()
         self.p_idx = p_idx
+        self.q_idx = q_idx
         self.sharp_var_indices = sharp_var_indices
 
         self.weight_mse = weight_mse
@@ -241,6 +249,8 @@ class AIDASurrogateLoss(nn.Module):
         self.weight_grad_state = weight_grad_state
         self.lambda_asym_p = lambda_asym_p
         self.weight_state_eq = weight_state_eq
+        self.weight_q_log = weight_q_log
+        self.weight_joint_bias = weight_joint_bias
         self.tau_min_p = tau_min_p
 
         self.mu_ln_t, self.std_ln_t = mu_ln_t, std_ln_t
@@ -263,7 +273,7 @@ class AIDASurrogateLoss(nn.Module):
         # 1. Base Data Fidelity Loss (MSE)
         loss_mse = self.mse_fn(pred, target)
 
-        # 2. 2nd-Order Graph Laplacian Pressure Penalty (Kills Checkerboards)
+        # 2. 2nd-Order Graph Laplacian Pressure Penalty (Degree-Normalized)
         p_pred = pred[:, self.p_idx, :, :]  # [B, L, N]
 
         p_neighbor_sum = torch.zeros_like(p_pred)
@@ -279,7 +289,7 @@ class AIDASurrogateLoss(nn.Module):
         p_neighbor_avg = p_neighbor_sum / deg_clamped
         loss_laplacian_p = torch.mean(torch.square(p_pred - p_neighbor_avg))
 
-        # 3. State Gradient Matching Loss (Preserves Fronts in T, u, v, q)
+        # 3. State Gradient Matching Loss (Preserves Fronts in T, u, v, q, p)
         sharp_pred = pred[:, self.sharp_var_indices, :, :]
         sharp_target = target[:, self.sharp_var_indices, :, :]
 
@@ -299,6 +309,18 @@ class AIDASurrogateLoss(nn.Module):
         state_eq_residual = ln_p_phys - (ln_rho_phys + self.ln_R_d + ln_T_phys)
         loss_state_eq = torch.mean(torch.abs(state_eq_residual))
 
+        # 6. Specific Humidity (q) Log-Space Scale Penalty (Fixes Stratospheric Relative Error)
+        q_pred = pred[:, self.q_idx, :, :]
+        q_target = target[:, self.q_idx, :, :]
+        # Offset epsilon ensures safe log transform across all 32 pressure levels
+        eps = 1e-6
+        loss_q_log = torch.mean(torch.abs(torch.log(F.relu(q_pred) + eps) - torch.log(F.relu(q_target) + eps)))
+
+        # 7. Joint Mean Bias Penalty (Stabilizes p & T without drift)
+        bias_p = torch.abs(torch.mean(p_pred) - torch.mean(target[:, self.p_idx, :, :]))
+        bias_t = torch.abs(torch.mean(pred[:, 0, :, :]) - torch.mean(target[:, 0, :, :]))
+        loss_joint_bias = bias_p + bias_t
+
         # Total Weighted Combination
         total_loss = (
             self.weight_mse * loss_mse
@@ -306,6 +328,8 @@ class AIDASurrogateLoss(nn.Module):
             + self.weight_grad_state * loss_grad_state
             + self.lambda_asym_p * loss_asym_p
             + self.weight_state_eq * loss_state_eq
+            + self.weight_q_log * loss_q_log
+            + self.weight_joint_bias * loss_joint_bias
         )
 
         loss_metrics = {
@@ -315,10 +339,11 @@ class AIDASurrogateLoss(nn.Module):
             "loss_grad_state": loss_grad_state.item(),
             "loss_asym_p": loss_asym_p.item(),
             "loss_state_eq": loss_state_eq.item(),
+            "loss_q_log": loss_q_log.item(),
+            "loss_joint_bias": loss_joint_bias.item(),
         }
 
         return total_loss, loss_metrics
-
 
 # =============================================================================
 # 5. TRAINING PIPELINE EXECUTION
@@ -350,6 +375,8 @@ def train_model(args):
         weight_grad_state=args.weight_grad_state,
         lambda_asym_p=args.lambda_asym_p,
         weight_state_eq=args.weight_state_eq,
+        weight_q_log=args.weight_q_log,
+        weight_joint_bias=args.weight_joint_bias,
         tau_min_p=args.tau_min_p
     ).to(device)
 
@@ -361,7 +388,7 @@ def train_model(args):
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        epoch_losses = {k: 0.0 for k in ["loss_total", "loss_mse", "loss_laplacian_p", "loss_grad_state", "loss_asym_p", "loss_state_eq"]}
+        epoch_losses = {}  # Dynamically populated on first batch iteration
 
         for x_batch, y_batch in dataloader:
             x_batch, y_batch = x_batch.to(device), y_batch.to(device)
@@ -379,6 +406,10 @@ def train_model(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
+            # Initialize keys dynamically on first batch
+            if not epoch_losses:
+                epoch_losses = {k: 0.0 for k in metrics.keys()}
+
             for k, v in metrics.items():
                 epoch_losses[k] += v / len(dataloader)
 
@@ -388,7 +419,8 @@ def train_model(args):
                 f"Total: {epoch_losses['loss_total']:.4f} | "
                 f"MSE: {epoch_losses['loss_mse']:.4f} | "
                 f"Laplacian_P: {epoch_losses['loss_laplacian_p']:.5f} | "
-                f"Grad_State: {epoch_losses['loss_grad_state']:.4f}"
+                f"Grad_State: {epoch_losses['loss_grad_state']:.4f} | "
+                f"Q_Log: {epoch_losses.get('loss_q_log', 0.0):.4f}"
             )
 
     # Save model dict along with 'stats' dict so cycling scripts pick it up automatically
@@ -428,16 +460,35 @@ def main():
     parser.add_argument("--hidden-dim", "--hidden_dim", dest="hidden_dim", type=int, default=64)
 
     parser.add_argument(
-        "--lambda-laplacian-p", "--lambda_laplacian_p", "--lambda_smooth_p",
-        dest="lambda_laplacian_p", type=float, default=0.30,
+        "--lambda-laplacian-p", "--lambda_laplacian_p",
+        dest="lambda_laplacian_p", type=float, default=0.18,  # Tuned down from 0.30
         help="2nd-order graph Laplacian weight for pressure"
     )
-    parser.add_argument("--weight-grad-state", "--weight_grad_state", dest="weight_grad_state", type=float, default=0.20, help="State gradient matching weight")
+    parser.add_argument(
+        "--weight-grad-state", "--weight_grad_state",
+        dest="weight_grad_state", type=float, default=0.25,   # Boosted from 0.20 to sharpen fronts
+        help="State gradient matching weight"
+    )
+    parser.add_argument(
+        "--weight-state-eq", "--weight_state_eq",
+        dest="weight_state_eq", type=float, default=0.15,     # Increased from 0.10 for physical consistency
+        help="Ideal gas residual weight"
+    )
     parser.add_argument("--lambda-asym-p", "--lambda_asym_p", dest="lambda_asym_p", type=float, default=0.25, help="Asymmetric pressure penalty weight")
-    parser.add_argument("--weight-state-eq", "--weight_state_eq", dest="weight_state_eq", type=float, default=0.10, help="Ideal gas residual weight")
     parser.add_argument("--tau-min-p", "--tau_min_p", dest="tau_min_p", type=float, default=-0.2894, help="Low-pressure barrier threshold")
 
     parser.add_argument("--log-interval", "--log_interval", dest="log_interval", type=int, default=2, help="Logging epoch frequency")
+
+    parser.add_argument(
+        "--weight-q-log", "--weight_q_log",
+        dest="weight_q_log", type=float, default=0.15,
+        help="Log-scale loss weight for specific humidity (q)"
+    )
+    parser.add_argument(
+        "--weight-joint-bias", "--weight_joint_bias",
+        dest="weight_joint_bias", type=float, default=0.05,
+        help="Joint p and T mean bias penalty weight"
+    )
 
     args = parser.parse_args()
     train_model(args)
