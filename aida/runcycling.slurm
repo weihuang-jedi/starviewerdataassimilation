@@ -68,6 +68,6 @@ PYTHONPATH=. python scripts/run_aida_cycling.py \
     --background ${background} \
     --output_file ${icosahedral_anal} \
     --gnn_ckpt ${GNN_CKPT} \
-    --graph_path_m3 ../data/graph/icosahedral_edge_index_m3.pt \
     --graph_path_m4 ../data/graph/icosahedral_edge_index_m4.pt
 
+#   --graph_path_m3 ../data/graph/icosahedral_edge_index_m3.pt \
