@@ -79,10 +79,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="High-Speed Multi-Temporal and Multi-Level Icosahedral NetCDF to Compressed Consolidated Zarr Packer."
     )
-   #parser.add_argument("-i", "--input", default="starviewergraphcast-grid/global_icosahedral_m4.202[1234]*.nc",
-    parser.add_argument("-i", "--input", default="starviewergraphcast-grid/global_icosahedral_m4.202*.nc",
+    parser.add_argument("-i", "--input", default="icosahedral_grid/global_icosahedral_m4.202*.nc",
                         help="Input shell glob matching netcdf variables (default: starviewergraphcast-grid/global_icosahedral_m4.*.nc)")
-    parser.add_argument("-o", "--output", default="global_icosahedral_m4_3d_heights.zarr",
+    parser.add_argument("-o", "--output", default="icosahedral_logstate.zarr",
                         help="Output Zarr path target directory (default: global_icosahedral_m4_3d_heights.zarr)")
     parser.add_argument("-c", "--chunk_size", type=int, default=32,
                         help="Time dimension sequence array chunk size limits (default: 32)")

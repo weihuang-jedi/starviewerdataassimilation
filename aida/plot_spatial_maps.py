@@ -53,7 +53,7 @@ def main():
     parser = argparse.ArgumentParser(description="Plot 2D spatial maps of Analysis Increments and Errors using Cartopy.")
     # parser.add_argument("-i", "--input", required=True, help="Input reconstructed regular grid NetCDF dataset")
     # parser.add_argument("-r", "--ref", required=True, help="Reference dataset (e.g., GFS reference file)")
-    parser.add_argument("-i", "--input", default="cycling_output_20240106/reconstructed_aida_analysis_20240106_t06z.nc", help="Input reconstructed regular grid NetCDF dataset")
+    parser.add_argument("-i", "--input", default="output/reconstructed_aida_analysis_20240106.t06z.1p00.nc", help="Input reconstructed regular grid NetCDF dataset")
     parser.add_argument("-r", "--ref", default="../data/regular_truth/gfs.20240106.t06z.1p00.f000.nc", help="Reference dataset (e.g., GFS reference file)")
     parser.add_argument("-v", "--var", default="t", help="Variable base name to analyze (default: t)")
     parser.add_argument("-l", "--level", type=int, default=10, help="Vertical level index to plot (default: 0)")

@@ -11,12 +11,12 @@ source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
 yyyymmdd=20240106
 analhour=06
 
-origanalysis=output/global_icosahedral_m4.${yyyymmdd}.t${analhour}z.1p00.anal.nc
-gridanalysis=output/reconstructed_aida_analysis_${yyyymmdd}.t${analhour}z.nc
+icosahedral_analysis=output/global_icosahedral_m4.${yyyymmdd}.t${analhour}z.1p00.anal.nc
+gridanalysis=output/reconstructed_aida_analysis_${yyyymmdd}.t${analhour}z.1p00.nc
 
 if [ ! -f ${gridanalysis} ]; then
    python icosahedral2regular.py \
-      -i ${origanalysis} \
+      -i ${icosahedral_analysis} \
       -o ${gridanalysis} \
       -g ../data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
       -r 1.0

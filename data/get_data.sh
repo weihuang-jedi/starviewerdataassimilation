@@ -43,7 +43,7 @@ process_hour() {
       fi
 
       # Run the icosahedral interpolation
-      python interpolate2icosahedral.py \
+      python interpolate_to_logstate_icosahedral.py \
          --input "${ncflnm}" \
          --mesh ./graph/global_icosahedral_mesh_m4.nc \
          --output "${mlgridflnm}"
