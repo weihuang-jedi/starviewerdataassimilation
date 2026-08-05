@@ -26,16 +26,19 @@ set -x
 # 1. Train surrogate
 time \
 python -u scripts/train_aida_surrogate.py \
-    --zarr ../data/icosahedral_2023_logstate.zarr \
+    --zarr ../data/icosahedral_logstate.zarr \
     --edges ../data/graph/icosahedral_edge_index_m4.pt \
     --checkpoint checkpoints/aida_gnn_surrogate_logstate.pt \
     --epochs 35 \
-    --tau_min_p -0.25 \
+    --tau_min_p 0.08 \
     --lambda-laplacian-p 0.18 \
-    --weight-grad-state 0.20 \
-    --weight-state-eq 0.10 \
-    --weight-q-log 0.15 \
-    --weight-joint-bias 0.05
+    --weight-grad-state 0.25 \
+    --weight-state-eq 0.12 \
+    --weight-q-log 0.25 \
+    --lambda_asym_p 0.35 \
+    --weight-joint-bias 0.10
+
+#   --tau_min_p -0.25 \
 
 if [ -f checkpoints/aida_gnn_surrogate_logstate.pt ]; then
    runcycling.slurm

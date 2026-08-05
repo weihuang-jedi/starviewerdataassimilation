@@ -3,7 +3,8 @@
 train_aida_surrogate.py
 -----------------------
 AIDA GNN Surrogate Model Training Script for Icosahedral Atmospheric Grids.
-Refactored to import modules from models/ directory.
+Integrated with HybridDynamicsLoss (Mid-Lat Geostrophic + Tropical Divergence)
+via M4MeshOperators sparse differential operators.
 """
 
 import argparse
@@ -22,6 +23,8 @@ from models import (
     generate_or_load_edge_index,
     IcosahedralGNNSurrogate,
     AIDASurrogateLoss,
+    M4MeshOperators,
+    build_icosahedral_differential_operators,
 )
 
 
@@ -30,20 +33,48 @@ def train_model(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[TRAIN] Operating on compute device: {device}", flush=True)
 
+    # 1. Dataset Loading
     if args.zarr and os.path.exists(args.zarr):
+        print(f"[TRAIN] Loading real dataset from Zarr: '{args.zarr}'", flush=True)
         dataset = LogStateZarrDataset(zarr_path=args.zarr)
         num_nodes = dataset.num_nodes
+        
+        # Extract lat/lon coordinates from dataset or fallback to mesh generator
+        if hasattr(dataset, "latitudes") and hasattr(dataset, "longitudes"):
+            lat_deg = torch.tensor(dataset.latitudes, dtype=torch.float32)
+            lon_deg = torch.tensor(dataset.longitudes, dtype=torch.float32)
+        else:
+            # Generate synthetic coordinates evenly distributed on sphere
+            lat_deg = torch.linspace(-90, 90, num_nodes)
+            lon_deg = torch.linspace(-180, 180, num_nodes)
     else:
-        print(f"[WARNING] Zarr dataset path '{args.zarr}' not found. Falling back to synthetic dataset.")
+        print(f"[WARNING] Zarr dataset path '{args.zarr}' not found. Falling back to synthetic dataset.", flush=True)
         dataset = SyntheticAIDAStateDataset(num_samples=args.samples, num_nodes=args.num_nodes, num_levels=args.levels)
         num_nodes = args.num_nodes
+        lat_deg = torch.linspace(-90, 90, num_nodes)
+        lon_deg = torch.linspace(-180, 180, num_nodes)
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
+    # 2. Graph Edges & Sparse Differential Operators Initialization
     edge_index = generate_or_load_edge_index(num_nodes=num_nodes, edge_file=args.edges).to(device)
 
+    print("[TRAIN] Pre-computing M4 mesh sparse differential operators (Grad/Div)...", flush=True)
+    Gx_sparse, Gy_sparse = build_icosahedral_differential_operators(
+        lat_deg=lat_deg,
+        lon_deg=lon_deg,
+        edge_index=edge_index.cpu()
+    )
+    graph_mesh_ops = M4MeshOperators(
+        Gx_sparse=Gx_sparse,
+        Gy_sparse=Gy_sparse,
+        lat_deg=lat_deg
+    ).to(device)
+    print("[TRAIN] Sparse differential operators successfully initialized on GPU.", flush=True)
+
+    # 3. Model & Loss Instantiation
     model = IcosahedralGNNSurrogate(
-        in_vars=dataset.num_vars if hasattr(dataset, 'num_vars') else 7,
+        in_vars=dataset.num_vars if hasattr(dataset, "num_vars") else 7,
         hidden_dim=args.hidden_dim
     ).to(device)
 
@@ -54,14 +85,17 @@ def train_model(args):
         weight_state_eq=args.weight_state_eq,
         weight_q_log=args.weight_q_log,
         weight_joint_bias=args.weight_joint_bias,
+        lambda_dyn=args.lambda_dyn,
         tau_min_p=args.tau_min_p
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
+    print(f"[TRAIN] Dynamics weight (lambda_dyn): {args.lambda_dyn}", flush=True)
     print(f"[TRAIN] Pressure Laplacian weight (lambda_laplacian_p): {args.lambda_laplacian_p}", flush=True)
     os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
 
+    # 4. Training Loop
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_losses = {}  # Dynamic metrics accumulator
@@ -71,10 +105,17 @@ def train_model(args):
 
             optimizer.zero_grad()
             pred = model(x_batch, edge_index)
-            loss, metrics = criterion(pred, y_batch, edge_index)
+
+            # Compute loss with M4MeshOperators sparse matrices
+            loss, metrics = criterion(
+                pred=pred,
+                target=y_batch,
+                edge_index=edge_index,
+                graph_mesh_ops=graph_mesh_ops
+            )
 
             if torch.isnan(loss):
-                print("[WARNING] NaN loss detected in batch! Skipping step...")
+                print("[WARNING] NaN loss detected in batch! Skipping step...", flush=True)
                 continue
 
             loss.backward()
@@ -88,17 +129,21 @@ def train_model(args):
             for k, v in metrics.items():
                 epoch_losses[k] += v / len(dataloader)
 
+        # Logging
         if epoch % args.log_interval == 0 or epoch == args.epochs:
             print(
                 f"Epoch {epoch:03d}/{args.epochs:03d} | "
                 f"Total: {epoch_losses['loss_total']:.4f} | "
                 f"MSE: {epoch_losses['loss_mse']:.4f} | "
                 f"Laplacian_P: {epoch_losses['loss_laplacian_p']:.5f} | "
-                f"Grad_State: {epoch_losses['loss_grad_state']:.4f} | "
-                f"Q_Log: {epoch_losses.get('loss_q_log', 0.0):.4f}"
+                f"Dyn_Total: {epoch_losses.get('loss_dynamics_total', 0.0):.5f} | "
+                f"Geo_Loss: {epoch_losses.get('loss_geostrophic', 0.0):.5f} | "
+                f"Trop_Div: {epoch_losses.get('loss_tropical_div', 0.0):.5f} | "
+                f"Q_Log: {epoch_losses.get('loss_q_log', 0.0):.4f}",
+                flush=True
             )
 
-    # Save checkpoint with normalization stats for cycling
+    # 5. Checkpoint Saving
     torch.save({
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -112,7 +157,7 @@ def train_model(args):
             "std_ln_p": criterion.std_ln_p,
         }
     }, args.checkpoint)
-    print(f"[TRAIN] Checkpoint successfully saved to '{args.checkpoint}'")
+    print(f"[TRAIN] Checkpoint successfully saved to '{args.checkpoint}'", flush=True)
 
 
 def main():
@@ -155,6 +200,11 @@ def main():
         "--weight-joint-bias", "--weight_joint_bias",
         dest="weight_joint_bias", type=float, default=0.05,
         help="Joint p and T mean bias penalty weight"
+    )
+    parser.add_argument(
+        "--lambda-dyn", "--lambda_dyn",
+        dest="lambda_dyn", type=float, default=0.01,
+        help="Hybrid dynamics constraint weight (Geostrophic + Tropical Div)"
     )
     parser.add_argument("--lambda-asym-p", "--lambda_asym_p", dest="lambda_asym_p", type=float, default=0.25, help="Asymmetric pressure penalty weight")
     parser.add_argument("--tau-min-p", "--tau_min_p", dest="tau_min_p", type=float, default=-0.2894, help="Low-pressure barrier threshold")

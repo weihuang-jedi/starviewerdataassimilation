@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class GraphConvBlock(nn.Module):
@@ -47,9 +48,22 @@ class GraphConvBlock(nn.Module):
 
 
 class IcosahedralGNNSurrogate(nn.Module):
-    """GNN Atmospheric Surrogate Model for icosahedral mesh fields."""
-    def __init__(self, in_vars: int = 7, hidden_dim: int = 64, num_layers: int = 4):
+    """
+    GNN Atmospheric Surrogate Model for icosahedral mesh fields.
+    Includes Softplus bounded activation head for specific humidity (q).
+    """
+    def __init__(
+        self,
+        in_vars: int = 7,
+        hidden_dim: int = 64,
+        num_layers: int = 4,
+        q_idx: int = 4,
+        q_floor: float = 1e-7
+    ):
         super().__init__()
+        self.q_idx = q_idx
+        self.q_floor = q_floor
+
         self.encoder = nn.Conv2d(in_vars, hidden_dim, kernel_size=1)
         self.gnn_layers = nn.ModuleList([GraphConvBlock(hidden_dim) for _ in range(num_layers)])
         self.decoder = nn.Conv2d(hidden_dim, in_vars, kernel_size=1)
@@ -59,4 +73,20 @@ class IcosahedralGNNSurrogate(nn.Module):
         for layer in self.gnn_layers:
             h = layer(h, edge_index)
         out = self.decoder(h)
+
+        # Apply smooth non-negative Softplus activation + physical floor specifically to specific humidity (q)
+        q_constrained = F.softplus(out[:, self.q_idx:self.q_idx+1, :, :]) + self.q_floor
+
+        # Reconstruct output tensor maintaining gradients for all channels
+        if self.q_idx == 0:
+            out = torch.cat([q_constrained, out[:, 1:, :, :]], dim=1)
+        elif self.q_idx == out.shape[1] - 1:
+            out = torch.cat([out[:, :self.q_idx, :, :], q_constrained], dim=1)
+        else:
+            out = torch.cat([
+                out[:, :self.q_idx, :, :],
+                q_constrained,
+                out[:, self.q_idx+1:, :, :]
+            ], dim=1)
+
         return out
