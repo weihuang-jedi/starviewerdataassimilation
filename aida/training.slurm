@@ -24,32 +24,11 @@ fi
 set -x
 
 # 1. Train surrogate
-time \
-python -u scripts/train_aida_surrogate.py \
-    --zarr ../data/icosahedral_logstate.zarr \
-    --edges ../data/graph/icosahedral_edge_index_m4.pt \
-    --checkpoint checkpoints/aida_gnn_surrogate_logstate.pt \
-    --epochs 35 \
-    --tau_min_p 0.08 \
-    --lambda-laplacian-p 0.18 \
-    --weight-grad-state 0.25 \
-    --weight-state-eq 0.12 \
-    --weight-q-log 0.25 \
-    --lambda_asym_p 0.35 \
-    --weight-joint-bias 0.10
-
-#   --tau_min_p -0.25 \
+time python -u scripts/train_aida_surrogate.py --config configs/config.yaml
 
 if [ -f checkpoints/aida_gnn_surrogate_logstate.pt ]; then
    runcycling.slurm
 fi
 
 exit 0
-
-# 2. Run single-step cycling inference
-python -u scripts/run_aida_cycling.py \
-    --background ../data/background_state.nc \
-    --output_file ../data/analysis_state.nc \
-    --gnn_ckpt checkpoints/aida_gnn_surrogate_logstate.pt \
-    --graph_path_m4 ../data/graph/icosahedral_edge_index_m4.pt
 

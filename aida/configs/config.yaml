@@ -1,0 +1,32 @@
+# AIDA GNN Surrogate Model Configuration
+
+paths:
+  zarr_path: "../data/icosahedral_logstate.zarr"
+  edges_path: "../data/graph/icosahedral_edge_index_m4.pt"
+  checkpoint_path: "checkpoints/aida_gnn_surrogate_logstate.pt"
+
+mesh:
+  num_nodes: 2562
+  num_levels: 32
+  samples: 80
+
+model:
+  hidden_dim: 64
+
+training:
+  epochs: 35
+  batch_size: 4
+  lr: 0.0003
+  weight_decay: 0.0001
+  log_interval: 2
+
+loss_weights:
+  w_rad: 1.0                  # AMSU-A Radiance Observation Loss
+  lambda_dyn: 0.01            # Hybrid Dynamics (Geostrophic + Tropical Div)
+  lambda_laplacian_p: 0.18    # 2nd-order Graph Laplacian Pressure Weight
+  weight_grad_state: 0.25     # State Gradient Matching Weight
+  weight_state_eq: 0.12       # Ideal Gas Law Residual Weight
+  weight_q_log: 0.25          # Specific Humidity Log-Scale Loss Weight
+  weight_joint_bias: 0.10     # Joint Temperature/Pressure Bias Penalty
+  lambda_asym_p: 0.35         # Asymmetric Pressure Barrier Penalty
+  tau_min_p: 0.08             # Low-Pressure Threshold Barrier
