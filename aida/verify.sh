@@ -31,5 +31,9 @@ python validate_reconstruction.py \
    -r ../data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
    -o output/verification_levels.t${analhour}z.csv
 
+python utils/plot_vertical_profiles.py \
+   -i output/verification_levels.t06z.csv \
+   -o output/plots/profiles
+
 exit 0
 
