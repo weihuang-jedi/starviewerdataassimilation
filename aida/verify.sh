@@ -8,7 +8,7 @@ cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
 # 2. Activate Conda environment
 source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
 
-yyyymmdd=20240106
+yyyymmdd=20250106
 analhour=06
 
 icosahedral_analysis=output/global_icosahedral_m4.${yyyymmdd}.t${analhour}z.1p00.anal.nc

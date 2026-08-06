@@ -17,7 +17,7 @@ cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
 source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
 
 # 3. Define cycling parameters
-START_YMD="20240106"
+START_YMD="20250106"
 START_HOUR="00"
 FCST_HOUR=6
 
@@ -55,7 +55,7 @@ GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate.pt"
 
 get_analysis_time ${START_YMD} ${START_HOUR} ${FCST_HOUR}
 
-background=../data/icosahedral_grid_logstate/global_icosahedral_m4.${START_YMD}.t${START_HOUR}z.1p00.f006.nc
+background=../data/icosahedral_grid/global_icosahedral_m4.${START_YMD}.t${START_HOUR}z.1p00.f006.nc
 icosahedral_anal=output/global_icosahedral_m4.${ANALYS_YMD}.t${ANALYS_HOUR}z.1p00.anal.nc
 grid_anal=output/reconstructed_aida_analysis_${ANALYS_YMD}.t${ANALYS_HOUR}z.1p00.nc
 

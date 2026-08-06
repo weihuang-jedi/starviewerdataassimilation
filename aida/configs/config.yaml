@@ -19,9 +19,10 @@ training:
   lr: 0.0003
   weight_decay: 0.0001
   log_interval: 2
+  save_interval: 5             # Save checkpoint every N epochs (and on final epoch)
 
 loss_weights:
-  w_rad: 1.0                  # AMSU-A Radiance Observation Loss
+  w_rad: 0.1                  # AMSU-A Radiance Observation Loss
   lambda_dyn: 0.01            # Hybrid Dynamics (Geostrophic + Tropical Div)
   lambda_laplacian_p: 0.18    # 2nd-order Graph Laplacian Pressure Weight
   weight_grad_state: 0.25     # State Gradient Matching Weight

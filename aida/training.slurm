@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --partition=u1-h100
 #SBATCH --qos=gpuwf
-#SBATCH --time=00:45:00
+#SBATCH --time=03:45:00
 #SBATCH --output=log.training_%J.out
 #SBATCH --export=NONE
 

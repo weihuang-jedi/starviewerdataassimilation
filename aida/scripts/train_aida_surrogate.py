@@ -4,6 +4,7 @@ train_aida_surrogate.py
 -----------------------
 AIDA GNN Surrogate Model Training Script for Icosahedral Atmospheric Grids.
 Reads runtime parameters, loss weights, and file paths from a YAML configuration file.
+Supports periodic checkpoint saving every N epochs.
 """
 
 import argparse
@@ -35,6 +36,26 @@ def load_config(config_path: str) -> dict:
         raise FileNotFoundError(f"[ERROR] Config file not found at: '{config_path}'")
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
+
+
+def save_checkpoint(filepath: str, model, optimizer, epoch: int, cfg: dict, criterion):
+    """Utility to serialize model checkpoint to disk."""
+    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config": cfg,
+        "stats": {
+            "mu_ln_t": criterion.mu_ln_t,
+            "std_ln_t": criterion.std_ln_t,
+            "mu_ln_rho": criterion.mu_ln_rho,
+            "std_ln_rho": criterion.std_ln_rho,
+            "mu_ln_p": criterion.mu_ln_p,
+            "std_ln_p": criterion.std_ln_p,
+        }
+    }, filepath)
+    print(f"[TRAIN] Checkpoint successfully saved to '{filepath}'", flush=True)
 
 
 def train_model(cfg: dict):
@@ -132,7 +153,8 @@ def train_model(cfg: dict):
     print(f"[TRAIN] Joint Bias Penalty Weight (weight_joint_bias): {loss_cfg['weight_joint_bias']}", flush=True)
 
     checkpoint_path = paths["checkpoint_path"]
-    os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+    save_interval = train_cfg.get("save_interval", 5)
+    print(f"[TRAIN] Periodic checkpoint interval set to: Every {save_interval} epochs", flush=True)
 
     # 4. Training Loop
     epochs = train_cfg["epochs"]
@@ -163,7 +185,7 @@ def train_model(cfg: dict):
             optimizer.zero_grad()
             pred = model(x_batch, edge_index)
 
-            # Base physical loss evaluation
+            # --- A. Existing Multi-Component Physical Loss ---
             loss, metrics = criterion(
                 pred=pred,
                 target=y_batch,
@@ -171,22 +193,38 @@ def train_model(cfg: dict):
                 graph_mesh_ops=graph_mesh_ops
             )
 
-            # AMSU-A Radiance innovation loss
-            # Slicing along variable dimension: Channel 0 = ln_T, Channel 6 = ln_p
-            ln_T_pred = pred[:, 0, :, :].permute(0, 2, 1)  # -> [B, N_nodes, N_levels]
-            ln_p_pred = pred[:, 6, :, :].permute(0, 2, 1)  # -> [B, N_nodes, N_levels]
+            # --- B. Differentiable AMSU-A Radiance Loss J_rad ---
+            # pred shape: [B, V=7, L=32, N=2562]
+            # Variable index 0: ln_T, Variable index 6: ln_p
+            ln_T_raw = pred[:, 0, :, :].permute(0, 2, 1)  # -> [B, N=2562, L=32]
+            ln_p_raw = pred[:, 6, :, :].permute(0, 2, 1)  # -> [B, N=2562, L=32]
 
-            t_k = torch.exp(ln_T_pred)            # Kelvin
-            p_hpa = torch.exp(ln_p_pred) / 100.0  # hPa
-            tb_sim = amsua_op(t_k, p_hpa)          # [B, N_nodes, 15]
+            # 1. Un-normalize log-state predictions using dataset statistics
+            # Correct Log-State Temperature Un-normalization
+            std_t, mu_t = criterion.std_ln_t, criterion.mu_ln_t
+            std_p, mu_p = criterion.std_ln_p, criterion.mu_ln_p
 
-            innov = (y_amsua - tb_sim) / amsua_obs_err
+            ln_T_phys = pred[:, 0, :, :].permute(0, 2, 1) * std_t + mu_t
+            ln_p_phys = pred[:, 6, :, :].permute(0, 2, 1) * std_p + mu_p
+
+            # Convert to physical Kelvin and hPa with valid bounds
+            t_k = torch.clamp(torch.exp(ln_T_phys), min=180.0, max=330.0)
+            p_hpa = torch.clamp(torch.exp(ln_p_phys) / 100.0, min=0.01, max=1050.0)
+
+            # Evaluate AMSU-A Brightness Temperatures
+            tb_sim = amsua_op(t_k, p_hpa)
+
+            # 4. Normalized AMSU-A Innovation Calculation
+            innov = (y_amsua - tb_sim) / amsua_obs_err  # [B, N_nodes, 15]
+            
+            # Divide by 15.0 (num channels) to prevent gradient domination over J_mse
             if amsua_mask is not None:
                 mask_exp = amsua_mask.unsqueeze(-1).expand_as(innov)
-                loss_rad = torch.sum((innov ** 2) * mask_exp) / (torch.sum(mask_exp) + 1e-8)
+                loss_rad = torch.sum((innov ** 2) * mask_exp) / (15.0 * torch.sum(mask_exp) + 1e-8)
             else:
-                loss_rad = torch.mean(innov ** 2)
+                loss_rad = torch.mean(innov ** 2) / 15.0
 
+            # 5. Composite Objective Integration
             total_loss = loss + loss_cfg["w_rad"] * loss_rad
             metrics["loss_total"] = total_loss.item()
             metrics["loss_rad"] = loss_rad.item()
@@ -222,21 +260,15 @@ def train_model(cfg: dict):
                 flush=True
             )
 
-    # 5. Checkpoint Saving
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "config": cfg,
-        "stats": {
-            "mu_ln_t": criterion.mu_ln_t,
-            "std_ln_t": criterion.std_ln_t,
-            "mu_ln_rho": criterion.mu_ln_rho,
-            "std_ln_rho": criterion.std_ln_rho,
-            "mu_ln_p": criterion.mu_ln_p,
-            "std_ln_p": criterion.std_ln_p,
-        }
-    }, checkpoint_path)
-    print(f"[TRAIN] Checkpoint successfully saved to '{checkpoint_path}'", flush=True)
+        # 5. Periodic Checkpoint Saving
+        if epoch % save_interval == 0 or epoch == epochs:
+            # Save versioned checkpoint: e.g., checkpoints/aida_gnn_surrogate_logstate_epoch_005.pt
+            base_name, ext = os.path.splitext(checkpoint_path)
+            epoch_ckpt_path = f"{base_name}_epoch_{epoch:03d}{ext}"
+            save_checkpoint(epoch_ckpt_path, model, optimizer, epoch, cfg, criterion)
+            
+            # Update main primary checkpoint
+            save_checkpoint(checkpoint_path, model, optimizer, epoch, cfg, criterion)
 
 
 def main():
