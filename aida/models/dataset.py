@@ -81,6 +81,10 @@ class LogStateZarrDataset(Dataset):
         Locates and loads satellite brightness temperatures (AMSU-A + IASI)
         for the given time index `idx` from NetCDF observation files.
         """
+        # Allocate placeholder array for 12 HMS channels across nodes
+        obs_hms_tb = np.full((12, self.num_nodes), 240.0, dtype=np.float32)
+        obs_hms_mask = np.zeros((12, self.num_nodes), dtype=np.float32)
+
         # Default placeholder arrays [15, 2562] and [30, 2562]
         obs_amsua_tb = np.full((15, self.num_nodes), 240.0, dtype=np.float32)
         obs_amsua_mask = np.zeros((15, self.num_nodes), dtype=np.float32)
@@ -150,6 +154,22 @@ class LogStateZarrDataset(Dataset):
                             obs_iasi_tb[c_idx, n] = v
                             obs_iasi_mask[c_idx, n] = 1.0
 
+
+                # Process HMS Observations
+                mask_hms = (sensors == "hms") & (vals > 100.0) & (vals < 350.0)
+                if np.any(mask_hms):
+                    ch_hms = channels[mask_hms]
+                    val_hms = vals[mask_hms]
+                    lon_hms = lons[mask_hms]
+
+                    node_idx_h = ((lon_hms + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    node_idx_h = np.clip(node_idx_h, 0, self.num_nodes - 1)
+
+                    for c, v, n in zip(ch_hms, val_hms, node_idx_h):
+                        if 1 <= c <= 12:
+                            obs_hms_tb[c - 1, n] = v
+                            obs_hms_mask[c - 1, n] = 1.0
+
                 ds_obs.close()
             except Exception:
                 pass
@@ -159,6 +179,8 @@ class LogStateZarrDataset(Dataset):
             'obs_amsua_mask': torch.from_numpy(obs_amsua_mask),
             'obs_iasi_tb': torch.from_numpy(obs_iasi_tb),
             'obs_iasi_mask': torch.from_numpy(obs_iasi_mask),
+            'obs_hms_tb': torch.from_numpy(obs_hms_tb),
+            'obs_hms_mask': torch.from_numpy(obs_hms_mask),
         }
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
@@ -208,4 +230,6 @@ class SyntheticAIDAStateDataset(Dataset):
             'obs_amsua_mask': torch.ones((15, self.num_nodes), dtype=torch.float32),
             'obs_iasi_tb': torch.full((30, self.num_nodes), 240.0, dtype=torch.float32),
             'obs_iasi_mask': torch.ones((30, self.num_nodes), dtype=torch.float32),
+            'obs_hms_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
+            'obs_hms_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
         }

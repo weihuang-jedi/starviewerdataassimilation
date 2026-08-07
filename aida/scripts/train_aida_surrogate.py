@@ -30,6 +30,7 @@ from models import (
 )
 from models.amsua import DifferentiableAMSUAOperator
 from models.iasi import DifferentiableIASIOperator
+from models.hms import DifferentiableHMSOperator
 
 
 def load_config(config_path: str) -> dict:
@@ -71,6 +72,8 @@ def train_epoch(
     amsua_obs_err,
     iasi_op,
     iasi_obs_err,
+    hms_op,
+    hms_obs_err,
     loss_cfg
 ):
     """Executes a single training epoch across the dataset."""
@@ -89,6 +92,9 @@ def train_epoch(
             obs_amsua_mask = batch_data.get('obs_amsua_mask', None)
             obs_iasi_tb = batch_data.get('obs_iasi_tb', None)
             obs_iasi_mask = batch_data.get('obs_iasi_mask', None)
+            # Unpack HMS batch tensors
+            obs_hms_tb = batch_data.get('obs_hms_tb', None)
+            obs_hms_mask = batch_data.get('obs_hms_mask', None)
         elif isinstance(batch_data, (tuple, list)):
             x_batch = batch_data[0].to(device)
             y_batch = batch_data[1].to(device)
@@ -96,6 +102,8 @@ def train_epoch(
             obs_amsua_mask = batch_data[3].to(device) if len(batch_data) >= 4 else None
             obs_iasi_tb = batch_data[4].to(device) if len(batch_data) >= 5 else None
             obs_iasi_mask = batch_data[5].to(device) if len(batch_data) >= 6 else None
+            obs_hms_tb = batch_data[6].to(device) if len(batch_data) >= 7 else None
+            obs_hms_mask = batch_data[7].to(device) if len(batch_data) >= 8 else None
         else:
             x_batch = batch_data.to(device)
             y_batch = x_batch
@@ -184,12 +192,45 @@ def train_epoch(
         else:
             loss_rad_iasi = torch.tensor(0.0, device=device)
 
-        # 4. Total Combined Objective
-        total_loss = loss + (w_rad_amsua * loss_rad_amsua) + (w_rad_iasi * loss_rad_iasi)
+        # -------------------------------------------------------------------------
+        # 4. HMS Satellite Radiance Innovation Loss
+        # -------------------------------------------------------------------------
+        w_rad_hms = loss_cfg.get("w_rad_hms", 0.01)
+        if obs_hms_tb is not None:
+            p_pa = p_hpa.permute(0, 2, 1) * 100.0
+            t_k_perm = t_k.permute(0, 2, 1)
+            tb_hms_sim = hms_op(t_k_perm, p_pa)  # [B, 12, N]
+
+            tb_hms_obs = obs_hms_tb.to(device)
+            if tb_hms_obs.shape[1] != 12 and tb_hms_obs.shape[2] == 12:
+                tb_hms_obs = tb_hms_obs.permute(0, 2, 1)
+
+            if tb_hms_sim.shape[1] != 12 and tb_hms_sim.shape[2] == 12:
+                tb_hms_sim = tb_hms_sim.permute(0, 2, 1)
+
+            err_hms = hms_obs_err.view(1, 12, 1)
+            innov_hms = (tb_hms_obs - tb_hms_sim) / err_hms
+
+            if obs_hms_mask is not None:
+                mask_hms = obs_hms_mask.to(device)
+                if mask_hms.shape[1] != 12 and mask_hms.shape[2] == 12:
+                    mask_hms = mask_hms.permute(0, 2, 1)
+                loss_rad_hms = torch.sum((innov_hms ** 2) * mask_hms) / (12.0 * torch.sum(mask_hms) + 1e-8)
+            else:
+                loss_rad_hms = torch.mean(innov_hms ** 2) / 12.0
+        else:
+            loss_rad_hms = torch.tensor(0.0, device=device)
+
+        # 5. Total Combined Objective
+        total_loss = loss +
+                     (w_rad_amsua * loss_rad_amsua) +
+                     (w_rad_iasi * loss_rad_iasi) +
+                     (w_rad_hms * loss_rad_hms)
 
         metrics["loss_total"] = total_loss.item()
         metrics["loss_rad_amsua"] = loss_rad_amsua.item()
         metrics["loss_rad_iasi"] = loss_rad_iasi.item()
+        metrics["loss_rad_hms"] = loss_rad_hms.item()
 
         if torch.isnan(total_loss):
             print("[WARNING] NaN loss detected in batch! Skipping step...", flush=True)
@@ -289,6 +330,10 @@ def train_model(cfg: dict):
     iasi_op = DifferentiableIASIOperator(num_levels=mesh_cfg.get("num_levels", 32)).to(device)
     iasi_obs_err = iasi_op.obs_errors.to(device)
 
+    # Instantiate HMS Forward Operator & Observation Error Buffers
+    hms_op = DifferentiableHMSOperator(num_levels=mesh_cfg.get("num_levels", 32)).to(device)
+    hms_obs_err = hms_op.obs_errors.to(device)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_cfg["lr"],
@@ -297,6 +342,7 @@ def train_model(cfg: dict):
 
     print(f"[TRAIN] AMSU-A Radiance Weight: {loss_cfg.get('w_rad', loss_cfg.get('w_rad_amsua', 0.01))}", flush=True)
     print(f"[TRAIN] IASI Radiance Weight: {loss_cfg.get('w_rad_iasi', 0.01)}", flush=True)
+    print(f"[TRAIN] HMS Radiance Weight: {loss_cfg.get('w_rad_hms', 0.01)}", flush=True)
     print(f"[TRAIN] Dynamics Weight (lambda_dyn): {loss_cfg['lambda_dyn']}", flush=True)
 
     checkpoint_path = paths["checkpoint_path"]
@@ -320,6 +366,8 @@ def train_model(cfg: dict):
             amsua_obs_err=amsua_obs_err,
             iasi_op=iasi_op,
             iasi_obs_err=iasi_obs_err,
+            hmp_op=hmp_op,
+            hmp_obs_err=hmp_obs_err,
             loss_cfg=loss_cfg
         )
 
