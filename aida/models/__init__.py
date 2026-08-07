@@ -3,6 +3,7 @@ from .graph import generate_or_load_edge_index
 from .gnn import IcosahedralGNNSurrogate
 from .loss import AIDASurrogateLoss, M4MeshOperators, build_icosahedral_differential_operators
 from .amsua import AIDALossEngine, DifferentiableAMSUAOperator
+from .iasi import DifferentiableIASIOperator, IASIRadianceLoss
 
 __all__ = [
     "LogStateZarrDataset",
@@ -14,4 +15,6 @@ __all__ = [
     "build_icosahedral_differential_operators",
     "AIDALossEngine",
     "DifferentiableAMSUAOperator",
+    "DifferentiableIASIOperator",
+    "IASIRadianceLoss",
 ]

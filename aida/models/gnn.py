@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.amsua import DifferentiableAMSUAOperator
+from models.iasi import DifferentiableIASIOperator
 
 class GraphConvBlock(nn.Module):
     """Graph Convolution Message Passing Block with LayerNorm for numerical stability."""
@@ -56,6 +58,7 @@ class IcosahedralGNNSurrogate(nn.Module):
         self,
         in_vars: int = 7,
         hidden_dim: int = 64,
+        num_levels: int = 32,
         num_layers: int = 4,
         q_idx: int = 4,
         q_floor: float = 1e-7
@@ -64,9 +67,22 @@ class IcosahedralGNNSurrogate(nn.Module):
         self.q_idx = q_idx
         self.q_floor = q_floor
 
+        self.in_vars = in_vars
+        self.hidden_dim = hidden_dim
+        self.num_levels = num_levels
+        self.num_layers = num_layers
+
         self.encoder = nn.Conv2d(in_vars, hidden_dim, kernel_size=1)
         self.gnn_layers = nn.ModuleList([GraphConvBlock(hidden_dim) for _ in range(num_layers)])
         self.decoder = nn.Conv2d(hidden_dim, in_vars, kernel_size=1)
+
+        # Differentiable Radiance Forward Operators
+        self.amsua_operator = DifferentiableAMSUAOperator(num_levels=num_levels)
+        self.iasi_operator = DifferentiableIASIOperator(num_levels=num_levels)
+
+    def forward_iasi_radiances(self, temp_k: torch.Tensor, press_pa: torch.Tensor) -> torch.Tensor:
+        """Exposes direct forward evaluation of IASI brightness temperatures."""
+        return self.iasi_operator(temp_k, press_pa)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         h = self.encoder(x)

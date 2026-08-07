@@ -3,6 +3,7 @@
 paths:
   zarr_path: "../data/icosahedral_logstate.zarr"
   edges_path: "../data/graph/icosahedral_edge_index_m4.pt"
+  obs_dir: "../data/conv_amsua_iasi_2024"  # Points to the new unified dataset folder
   checkpoint_path: "checkpoints/aida_gnn_surrogate_logstate.pt"
 
 mesh:
@@ -22,7 +23,8 @@ training:
   save_interval: 5             # Save checkpoint every N epochs (and on final epoch)
 
 loss_weights:
-  w_rad: 0.1                  # AMSU-A Radiance Observation Loss
+  w_rad_amsua: 0.1            # AMSU-A Radiance Observation Loss
+  w_rad_iasi: 0.1             # AMSU-A Radiance Observation Loss
   lambda_dyn: 0.01            # Hybrid Dynamics (Geostrophic + Tropical Div)
   lambda_laplacian_p: 0.18    # 2nd-order Graph Laplacian Pressure Weight
   weight_grad_state: 0.25     # State Gradient Matching Weight

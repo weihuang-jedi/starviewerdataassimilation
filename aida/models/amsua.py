@@ -42,8 +42,11 @@ AMSUA_OBS_ERR_K = torch.tensor([
 class DifferentiableAMSUAOperator(nn.Module):
     """Differentiable Forward Radiative Transfer Operator H(x) for AMSU-A."""
     
-    def __init__(self, peak_pressures: torch.Tensor = AMSUA_PEAK_P_HPA, scale_heights: torch.Tensor = AMSUA_SCALE_HPA):
+    def __init__(self, peak_pressures: torch.Tensor = AMSUA_PEAK_P_HPA,
+                       scale_heights: torch.Tensor = AMSUA_SCALE_HPA,
+                       num_levels: int = 32):
         super().__init__()
+        self.num_levels = num_levels
         self.register_buffer("peak_p", peak_pressures)
         self.register_buffer("scale_h", scale_heights)
 
@@ -132,8 +135,8 @@ class AIDALossEngine(nn.Module):
         grad_op: torch.Tensor,
         div_op: torch.Tensor,
         lats_deg: torch.Tensor,
-        w_rad: float = 1.0,
-        w_dyn: float = 0.1,
+        w_rad_amsua: float = 1.0,
+        lambda_dyn: float = 0.1,
         w_thermo: float = 0.05,
         w_acc: float = 0.2
     ):
@@ -141,8 +144,8 @@ class AIDALossEngine(nn.Module):
         self.h_amsua = DifferentiableAMSUAOperator()
         self.dynamics_loss = HybridDynamicsLoss(grad_op, div_op, lats_deg)
         
-        self.w_rad = w_rad
-        self.w_dyn = w_dyn
+        self.w_rad_amsua = w_rad_amsua
+        self.lambda_dyn = lambda_dyn
         self.w_thermo = w_thermo
         self.w_acc = w_acc
         
@@ -217,8 +220,8 @@ class AIDALossEngine(nn.Module):
 
         # Total Composite Objective Function
         total_loss = (
-            self.w_rad * j_rad +
-            self.w_dyn * j_dyn +
+            self.w_rad_amsua * j_rad +
+            self.lambda_dyn * j_dyn +
             self.w_thermo * j_thermo +
             self.w_acc * j_acc
         )
