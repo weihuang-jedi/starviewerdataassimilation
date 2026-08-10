@@ -222,10 +222,7 @@ def train_epoch(
             loss_rad_hms = torch.tensor(0.0, device=device)
 
         # 5. Total Combined Objective
-        total_loss = loss +
-                     (w_rad_amsua * loss_rad_amsua) +
-                     (w_rad_iasi * loss_rad_iasi) +
-                     (w_rad_hms * loss_rad_hms)
+        total_loss = loss + (w_rad_amsua * loss_rad_amsua) + (w_rad_iasi * loss_rad_iasi) + (w_rad_hms * loss_rad_hms)
 
         metrics["loss_total"] = total_loss.item()
         metrics["loss_rad_amsua"] = loss_rad_amsua.item()
@@ -264,7 +261,12 @@ def train_model(cfg: dict):
     zarr_path = paths["zarr_path"]
     if zarr_path and os.path.exists(zarr_path):
         print(f"[TRAIN] Loading dataset from Zarr: '{zarr_path}'", flush=True)
-        dataset = LogStateZarrDataset(zarr_path=zarr_path)
+        obs_dir = paths["obs_dir"]
+        if obs_dir and os.path.exists(obs_dir):
+            print(f"[TRAIN] Loading dataset from Obs: '{obs_dir}'", flush=True)
+            dataset = LogStateZarrDataset(zarr_path=zarr_path, obs_dir=obs_dir)
+        else:
+            dataset = LogStateZarrDataset(zarr_path=zarr_path)
         num_nodes = dataset.num_nodes
 
         if hasattr(dataset, "latitudes") and hasattr(dataset, "longitudes"):
@@ -366,8 +368,8 @@ def train_model(cfg: dict):
             amsua_obs_err=amsua_obs_err,
             iasi_op=iasi_op,
             iasi_obs_err=iasi_obs_err,
-            hmp_op=hmp_op,
-            hmp_obs_err=hmp_obs_err,
+            hms_op=hms_op,
+            hms_obs_err=hms_obs_err,
             loss_cfg=loss_cfg
         )
 
