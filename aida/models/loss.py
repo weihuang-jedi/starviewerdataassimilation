@@ -15,6 +15,7 @@ import numpy as np
 from models.amsua import DifferentiableAMSUAOperator
 from models.iasi import DifferentiableIASIOperator
 from models.hms import DifferentiableHMSOperator
+from models.atms import DifferentiableATMSOperator
 
 
 def build_icosahedral_differential_operators(
@@ -229,6 +230,7 @@ class AIDASurrogateLoss(nn.Module):
         w_rad_amsua: float = 0.01,
         w_rad_iasi: float = 0.01,
         w_rad_hms: float = 0.01,
+        w_rad_atms: float = 0.01,  # Added ATMS loss weight
         lambda_asym_q: float = 0.50,
         lambda_dyn: float = 0.01,
         w_dyn: float = 0.01,
@@ -266,6 +268,7 @@ class AIDASurrogateLoss(nn.Module):
         self.w_rad_amsua = w_rad_amsua
         self.w_rad_iasi = w_rad_iasi
         self.w_rad_hms = w_rad_hms
+        self.w_rad_atms = w_rad_atms
 
         self.hybrid_dyn = HybridDynamicsLoss(lat_trans_center_deg=15.0)
 
@@ -279,6 +282,7 @@ class AIDASurrogateLoss(nn.Module):
         self.amsua_loss = DifferentiableAMSUAOperator(num_levels=num_levels)
         self.iasi_loss = DifferentiableIASIOperator(num_levels=num_levels)
         self.hms_loss = DifferentiableHMSOperator(num_levels=num_levels)
+        self.atms_loss = DifferentiableATMSOperator(num_levels=num_levels)
 
     def forward(
         self,

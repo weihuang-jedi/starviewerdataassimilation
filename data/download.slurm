@@ -15,4 +15,5 @@ source ../svg.env
 
 #python fetch_nnja_obs.py
 #python fetch_nnja_amsua_iasi_obs.py
-python fetch_nnja_amsua_iasi_hms.py
+#python fetch_nnja_amsua_iasi_hms.py
+python fetch_conv_amsua_iasi_hms_atms.py

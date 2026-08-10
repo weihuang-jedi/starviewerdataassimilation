@@ -31,6 +31,7 @@ from models import (
 from models.amsua import DifferentiableAMSUAOperator
 from models.iasi import DifferentiableIASIOperator
 from models.hms import DifferentiableHMSOperator
+from models.atms import DifferentiableATMSOperator
 
 
 def load_config(config_path: str) -> dict:
@@ -74,6 +75,8 @@ def train_epoch(
     iasi_obs_err,
     hms_op,
     hms_obs_err,
+    atms_op,
+    atms_obs_err,
     loss_cfg
 ):
     """Executes a single training epoch across the dataset."""
@@ -95,6 +98,8 @@ def train_epoch(
             # Unpack HMS batch tensors
             obs_hms_tb = batch_data.get('obs_hms_tb', None)
             obs_hms_mask = batch_data.get('obs_hms_mask', None)
+            obs_atms_tb = batch_data.get('obs_atms_tb', None)
+            obs_atms_mask = batch_data.get('obs_atms_mask', None)
         elif isinstance(batch_data, (tuple, list)):
             x_batch = batch_data[0].to(device)
             y_batch = batch_data[1].to(device)
@@ -104,11 +109,15 @@ def train_epoch(
             obs_iasi_mask = batch_data[5].to(device) if len(batch_data) >= 6 else None
             obs_hms_tb = batch_data[6].to(device) if len(batch_data) >= 7 else None
             obs_hms_mask = batch_data[7].to(device) if len(batch_data) >= 8 else None
+            obs_atms_tb = batch_data[8].to(device) if len(batch_data) >= 9 else None
+            obs_atms_mask = batch_data[9].to(device) if len(batch_data) >= 10 else None
         else:
             x_batch = batch_data.to(device)
             y_batch = x_batch
             obs_amsua_tb, obs_amsua_mask = None, None
             obs_iasi_tb, obs_iasi_mask = None, None
+            obs_hms_tb, obs_hms_mask = None, None
+            obs_atms_tb, obs_atms_mask = None, None
 
         # GNN Forward Pass
         pred = model(x_batch, edge_index)
@@ -120,6 +129,8 @@ def train_epoch(
             edge_index=edge_index,
             graph_mesh_ops=graph_mesh_ops
         )
+
+        total_loss = loss
 
         # Permute log-state predictions for radiance evaluation: [B, V=7, L=32, N] -> [B, N, L=32]
         std_t = getattr(criterion, "std_ln_t", 1.0)
@@ -163,6 +174,9 @@ def train_epoch(
         else:
             loss_rad_amsua = torch.tensor(0.0, device=device)
 
+        total_loss += (w_rad_amsua * loss_rad_amsua)
+        metrics["loss_rad_amsua"] = loss_rad_amsua.item()
+
         # ---------------------------------------------------------------------
         # 3. Differentiable IASI Radiance Innovation Loss
         # ---------------------------------------------------------------------
@@ -191,6 +205,9 @@ def train_epoch(
                 loss_rad_iasi = torch.mean(innov_iasi ** 2) / 30.0
         else:
             loss_rad_iasi = torch.tensor(0.0, device=device)
+
+        total_loss += (w_rad_iasi * loss_rad_iasi)
+        metrics["loss_rad_iasi"] = loss_rad_iasi.item()
 
         # -------------------------------------------------------------------------
         # 4. HMS Satellite Radiance Innovation Loss
@@ -221,13 +238,44 @@ def train_epoch(
         else:
             loss_rad_hms = torch.tensor(0.0, device=device)
 
-        # 5. Total Combined Objective
-        total_loss = loss + (w_rad_amsua * loss_rad_amsua) + (w_rad_iasi * loss_rad_iasi) + (w_rad_hms * loss_rad_hms)
+        total_loss += (w_rad_hms * loss_rad_hms)
+        metrics["loss_rad_hms"] = loss_rad_hms.item()
+
+        # -------------------------------------------------------------------------
+        # 5. Advanced Technology Microwave Sounder
+        # -------------------------------------------------------------------------
+        w_rad_atms = loss_cfg.get("w_rad_atms", 0.01)
+        if obs_atms_tb is not None:
+            p_pa = p_hpa.permute(0, 2, 1) * 100.0
+            t_k_perm = t_k.permute(0, 2, 1)
+            tb_atms_sim = atms_op(t_k_perm, p_pa)  # [B, 22, N]
+
+            tb_atms_obs = obs_atms_tb.to(device)
+            if tb_atms_obs.shape[1] != 22 and tb_atms_obs.shape[2] == 22:
+                tb_atms_obs = tb_atms_obs.permute(0, 2, 1)
+
+            if tb_atms_sim.shape[1] != 22 and tb_atms_sim.shape[2] == 22:
+                tb_atms_sim = tb_atms_sim.permute(0, 2, 1)
+
+            err_atms = atms_obs_err.view(1, 22, 1)
+            innov_atms = (tb_atms_obs - tb_atms_sim) / err_atms
+
+            if obs_atms_mask is not None:
+                mask_atms = obs_atms_mask.to(device)
+                if mask_atms.shape[1] != 22 and mask_atms.shape[2] == 22:
+                    mask_atms = mask_atms.permute(0, 2, 1)
+                loss_rad_atms = torch.sum((innov_atms ** 2) * mask_atms) / (22.0 * torch.sum(mask_atms) + 1e-8)
+            else:
+                loss_rad_atms = torch.mean(innov_atms ** 2) / 22.0
+        else:
+            loss_rad_atms = torch.tensor(0.0, device=device)
+
+        total_loss += (w_rad_atms * loss_rad_atms)
+        metrics["loss_rad_atms"] = loss_rad_atms.item()
+
+        # 6. Total Combined Objective
 
         metrics["loss_total"] = total_loss.item()
-        metrics["loss_rad_amsua"] = loss_rad_amsua.item()
-        metrics["loss_rad_iasi"] = loss_rad_iasi.item()
-        metrics["loss_rad_hms"] = loss_rad_hms.item()
 
         if torch.isnan(total_loss):
             print("[WARNING] NaN loss detected in batch! Skipping step...", flush=True)
@@ -336,6 +384,9 @@ def train_model(cfg: dict):
     hms_op = DifferentiableHMSOperator(num_levels=mesh_cfg.get("num_levels", 32)).to(device)
     hms_obs_err = hms_op.obs_errors.to(device)
 
+    atms_op = DifferentiableATMSOperator(num_levels=mesh_cfg.get("num_levels", 32)).to(device)
+    atms_obs_err = atms_op.obs_errors.to(device)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_cfg["lr"],
@@ -345,6 +396,7 @@ def train_model(cfg: dict):
     print(f"[TRAIN] AMSU-A Radiance Weight: {loss_cfg.get('w_rad', loss_cfg.get('w_rad_amsua', 0.01))}", flush=True)
     print(f"[TRAIN] IASI Radiance Weight: {loss_cfg.get('w_rad_iasi', 0.01)}", flush=True)
     print(f"[TRAIN] HMS Radiance Weight: {loss_cfg.get('w_rad_hms', 0.01)}", flush=True)
+    print(f"[TRAIN] ATMS Radiance Weight: {loss_cfg.get('w_rad_atms', 0.01)}", flush=True)
     print(f"[TRAIN] Dynamics Weight (lambda_dyn): {loss_cfg['lambda_dyn']}", flush=True)
 
     checkpoint_path = paths["checkpoint_path"]

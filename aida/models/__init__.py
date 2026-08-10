@@ -5,6 +5,7 @@ from .loss import AIDASurrogateLoss, M4MeshOperators, build_icosahedral_differen
 from .amsua import AIDALossEngine, DifferentiableAMSUAOperator
 from .iasi import DifferentiableIASIOperator, IASIRadianceLoss
 from .hms import DifferentiableHMSOperator
+from .atms import DifferentiableATMSOperator
 
 __all__ = [
     "LogStateZarrDataset",
@@ -19,4 +20,5 @@ __all__ = [
     "DifferentiableIASIOperator",
     "IASIRadianceLoss",
     "DifferentiableHMSOperator",
+    "DifferentiableATMSOperator",
 ]
