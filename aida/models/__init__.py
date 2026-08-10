@@ -7,6 +7,7 @@ from .iasi import DifferentiableIASIOperator, IASIRadianceLoss
 from .hms import DifferentiableHMSOperator
 from .atms import DifferentiableATMSOperator
 from .cris import DifferentiableCrISOperator
+from .seviri import DifferentiableSEVIRIOperator
 
 __all__ = [
     "LogStateZarrDataset",
@@ -23,4 +24,5 @@ __all__ = [
     "DifferentiableHMSOperator",
     "DifferentiableATMSOperator",
     "DifferentiableCrISOperator",
+    "DifferentiableSEVIRIOperator",
 ]

@@ -34,6 +34,7 @@ from models.iasi import DifferentiableIASIOperator
 from models.hms import DifferentiableHMSOperator
 from models.atms import DifferentiableATMSOperator
 from models.cris import DifferentiableCrISOperator
+from models.seviri import DifferentiableSEVIRIOperator
 
 
 def load_config(config_path: str) -> dict:
@@ -81,6 +82,8 @@ def train_epoch(
     atms_obs_err,
     cris_op,
     cris_obs_err,
+    seviri_op,
+    seviri_obs_err,
     loss_cfg
 ):
     """Executes a single training epoch across the dataset."""
@@ -107,6 +110,8 @@ def train_epoch(
             obs_cris_mask = batch_data.get('obs_cris_mask', None)
             obs_conv_val = batch_data.get('obs_conv_val', None)   # <-- FIX: Define obs_conv_val
             obs_conv_mask = batch_data.get('obs_conv_mask', None) # <-- FIX: Define obs_conv_mask
+            obs_seviri_tb = batch_data.get('obs_seviri_tb', None)
+            obs_seviri_mask = batch_data.get('obs_seviri_mask', None)
         elif isinstance(batch_data, (tuple, list)):
             x_batch = batch_data[0].to(device)
             y_batch = batch_data[1].to(device)
@@ -120,6 +125,8 @@ def train_epoch(
             obs_atms_mask = batch_data[9].to(device) if len(batch_data) >= 10 else None
             obs_cris_tb = batch_data[10].to(device) if len(batch_data) >= 11 else None
             obs_cris_mask = batch_data[11].to(device) if len(batch_data) >= 12 else None
+            obs_seviri_tb = batch_data[12].to(device) if len(batch_data) >= 13 else None
+            obs_seviri_mask = batch_data[13].to(device) if len(batch_data) >= 14 else None
             obs_conv_val, obs_conv_mask = None, None
         else:
             x_batch = batch_data.to(device)
@@ -129,6 +136,7 @@ def train_epoch(
             obs_hms_tb, obs_hms_mask = None, None
             obs_atms_tb, obs_atms_mask = None, None
             obs_cris_tb, obs_cris_mask = None, None
+            obs_seviri_tb, obs_seviri_mask = None, None
             obs_conv_val, obs_conv_mask = None, None
 
         # GNN Forward Pass
@@ -329,7 +337,40 @@ def train_epoch(
         total_loss += (w_rad_cris * loss_rad_cris)
         metrics["loss_rad_cris"] = loss_rad_cris.item()
 
-        # 7. Total Combined Objective
+        # -------------------------------------------------------------------------
+        # 7. SEVIRI
+        # -------------------------------------------------------------------------
+        # Evaluate SEVIRI Radiance Innovation Loss
+        w_rad_seviri = loss_cfg.get("w_rad_seviri", 0.01)
+        if obs_seviri_tb is not None:
+            p_pa = p_hpa.permute(0, 2, 1) * 100.0
+            t_k_perm = t_k.permute(0, 2, 1)
+            tb_seviri_sim = seviri_op(t_k_perm, p_pa)  # [B, 8, N]
+
+            tb_seviri_obs = obs_seviri_tb.to(device)
+            if tb_seviri_obs.shape[1] != 8 and tb_seviri_obs.shape[2] == 8:
+                tb_seviri_obs = tb_seviri_obs.permute(0, 2, 1)
+    
+            if tb_seviri_sim.shape[1] != 8 and tb_seviri_sim.shape[2] == 8:
+                tb_seviri_sim = tb_seviri_sim.permute(0, 2, 1)
+    
+            err_seviri = seviri_obs_err.view(1, 8, 1)
+            innov_seviri = (tb_seviri_obs - tb_seviri_sim) / err_seviri
+
+            if obs_seviri_mask is not None:
+                mask_seviri = obs_seviri_mask.to(device)
+                if mask_seviri.shape[1] != 8 and mask_seviri.shape[2] == 8:
+                    mask_seviri = mask_seviri.permute(0, 2, 1)
+                loss_rad_seviri = torch.sum((innov_seviri ** 2) * mask_seviri) / (8.0 * torch.sum(mask_seviri) + 1e-8)
+            else:
+                loss_rad_seviri = torch.mean(innov_seviri ** 2) / 8.0
+        else:
+            loss_rad_seviri = torch.tensor(0.0, device=device)
+
+        total_loss += (w_rad_seviri * loss_rad_seviri)
+        metrics["loss_rad_seviri"] = loss_rad_seviri.item()
+
+        # 8. Total Combined Objective
 
         metrics["loss_total"] = total_loss.item()
 
@@ -444,6 +485,9 @@ def train_model(cfg: dict):
     cris_op = DifferentiableCrISOperator(num_levels=num_levels).to(device)
     cris_obs_err = cris_op.obs_errors.to(device)
 
+    seviri_op = DifferentiableSEVIRIOperator(num_levels=num_levels).to(device)
+    seviri_obs_err = seviri_op.obs_errors.to(device)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_cfg["lr"],
@@ -455,6 +499,7 @@ def train_model(cfg: dict):
     print(f"[TRAIN] HMS Radiance Weight   : {loss_cfg.get('w_rad_hms', 0.01)}", flush=True)
     print(f"[TRAIN] ATMS Radiance Weight  : {loss_cfg.get('w_rad_atms', 0.01)}", flush=True)
     print(f"[TRAIN] CrIS Radiance Weight  : {loss_cfg.get('w_rad_cris', 0.01)}", flush=True)
+    print(f"[TRAIN] SEVIRI Radiance Weight: {loss_cfg.get('w_rad_seviri', 0.01)}", flush=True)
     print(f"[TRAIN] Dynamics Weight (lambda_dyn): {loss_cfg['lambda_dyn']}", flush=True)
 
     checkpoint_path = paths["checkpoint_path"]
@@ -484,6 +529,8 @@ def train_model(cfg: dict):
             atms_obs_err=atms_obs_err,
             cris_op=cris_op,
             cris_obs_err=cris_obs_err,
+            seviri_op=seviri_op,
+            seviri_obs_err=seviri_obs_err,
             loss_cfg=loss_cfg
         )
 
@@ -496,8 +543,10 @@ def train_model(cfg: dict):
                 f"  TOTAL LOSS    : {epoch_losses.get('loss_total', 0.0):12.5e} | STATE MSE     : {epoch_losses.get('loss_mse', 0.0):12.5e}\n"
                 f"  CONV OBS LOSS : {epoch_losses.get('loss_conv', 0.0):12.5e} | LAPLACIAN P   : {epoch_losses.get('loss_laplacian_p', 0.0):12.5e}\n"
                 f"  AMSU-A RAD    : {epoch_losses.get('loss_rad_amsua', 0.0):12.5e} | IASI RAD      : {epoch_losses.get('loss_rad_iasi', 0.0):12.5e}\n"
-                f"  HMS RAD       : {epoch_losses.get('loss_rad_hms', 0.0):12.5e} | ATMS RAD      : {epoch_losses.get('loss_rad_atms', 0.0):12.5e}\n"
-                f"  CrIS RAD      : {epoch_losses.get('loss_rad_cris', 0.0):12.5e} | DYNAMICS LOSS : {epoch_losses.get('loss_dynamics_total', 0.0):12.5e}\n"
+                f"  HMS RAD       : {epoch_losses.get('loss_rad_hms', 0.0):12.5e} | HMS RAD      : {epoch_losses.get('loss_rad_atms', 0.0):12.5e}\n"
+                f"  ATMS RAD      : {epoch_losses.get('loss_rad_atms', 0.0):12.5e} | ATMS RAD      : {epoch_losses.get('loss_rad_atms', 0.0):12.5e}\n"
+                f"  CrIS RAD      : {epoch_losses.get('loss_rad_cris', 0.0):12.5e} | CrIS LOSS : {epoch_losses.get('loss_rad_cris', 0.0):12.5e}\n"
+                f"  SEVIRI RAD    : {epoch_losses.get('loss_rad_seviri', 0.0):12.5e} | seveir LOSS : {epoch_losses.get('loss_rad_seviri', 0.0):12.5e}\n"
                 f"=" * 110,
                 flush=True
             )

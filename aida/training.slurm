@@ -10,7 +10,8 @@
 #SBATCH --output=log.training_%J.out
 #SBATCH --export=NONE
 
-cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
+cd /scratch3/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
+#cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
 #cd /scratch5/purged/Wei.Huang/src/starviewerdataassimilation/aida
 source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
 

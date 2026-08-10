@@ -98,6 +98,9 @@ class LogStateZarrDataset(Dataset):
         obs_cris_tb = np.full((30, self.num_nodes), 240.0, dtype=np.float32)
         obs_cris_mask = np.zeros((30, self.num_nodes), dtype=np.float32)
 
+        obs_seviri_tb = np.full((8, self.num_nodes), 240.0, dtype=np.float32)
+        obs_seviri_mask = np.zeros((8, self.num_nodes), dtype=np.float32)
+
         if not os.path.exists(self.obs_dir):
             return {
                 'obs_amsua_tb': torch.from_numpy(obs_amsua_tb),
@@ -207,6 +210,23 @@ class LogStateZarrDataset(Dataset):
                             obs_cris_tb[c_idx, n] = v
                             obs_cris_mask[c_idx, n] = 1.0
 
+                # Process SEVIRI Observations
+                mask_seviri = (sensors == "seviri") & (vals > 100.0) & (vals < 350.0)
+                if np.any(mask_seviri):
+                    ch_seviri = channels[mask_seviri]
+                    val_seviri = vals[mask_seviri]
+                    lon_seviri = lons[mask_seviri]
+
+                    node_idx_s = ((lon_seviri + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    node_idx_s = np.clip(node_idx_s, 0, self.num_nodes - 1)
+
+                    # SEVIRI uses channels 4 through 11 -> mapped to 0..7
+                    for c, v, n in zip(ch_seviri, val_seviri, node_idx_s):
+                        c_idx = c - 4
+                        if 0 <= c_idx < 8:
+                            obs_seviri_tb[c_idx, n] = v
+                            obs_seviri_mask[c_idx, n] = 1.0
+
                 ds_obs.close()
             except Exception:
                 pass
@@ -222,6 +242,8 @@ class LogStateZarrDataset(Dataset):
             'obs_atms_mask': torch.from_numpy(obs_atms_mask),
             'obs_cris_tb': torch.from_numpy(obs_cris_tb),
             'obs_cris_mask': torch.from_numpy(obs_cris_mask),
+            'obs_seviri_tb': torch.from_numpy(obs_seviri_tb),
+            'obs_seviri_mask': torch.from_numpy(obs_seviri_mask),
         }
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
@@ -273,4 +295,10 @@ class SyntheticAIDAStateDataset(Dataset):
             'obs_iasi_mask': torch.ones((30, self.num_nodes), dtype=torch.float32),
             'obs_hms_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
             'obs_hms_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
+            'obs_atms_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
+            'obs_atms_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
+            'obs_cris_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
+            'obs_cris_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
+            'obs_seviri_tb': torch.full((8, self.num_nodes), 240.0, dtype=torch.torch.float32),
+            'obs_seviri_mask': torch.ones((8, self.num_nodes), dtype=torch.float32),
         }

@@ -47,3 +47,4 @@ loss_weights:
   w_rad_hms: 0.01      # HMS Sounder Weight
   w_rad_atms: 0.01     # ATMS Microwave Sounder Weight
   w_rad_cris: 0.01     # CrIS Hyperspectral Infrared Sounder Weight
+  w_rad_seviri: 0.01   # SEVIRI Geostationary Sounder
