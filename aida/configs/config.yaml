@@ -1,35 +1,49 @@
-# AIDA GNN Surrogate Model Configuration
+# =============================================================================
+# AIDA GNN Surrogate Configuration File
+# =============================================================================
 
 paths:
-  zarr_path: "/scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/icosahedral_logstate.zarr"
-  edges_path: "/scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/graph/icosahedral_edge_index_m4.pt"
-  obs_dir: "../data/conv_amsua_iasi_hms_2024"  # Points to the new unified dataset folder
+  zarr_path: "../data/icosahedral_logstate.zarr"
+  edges_path: "../data/graph/icosahedral_edge_index_m4.pt"
   checkpoint_path: "checkpoints/aida_gnn_surrogate_logstate.pt"
+  obs_dir: "conv_amsua_iasi_hms_atms_cris_2024"
 
 mesh:
   num_nodes: 2562
   num_levels: 32
-  samples: 80
+  samples: 1464
 
 model:
-  hidden_dim: 64
+  hidden_dim: 128
+  num_layers: 4
 
 training:
   epochs: 35
-  batch_size: 4
-  lr: 0.0003
+  batch_size: 16
+  lr: 0.0005
   weight_decay: 0.0001
-  log_interval: 2
-  save_interval: 5             # Save checkpoint every N epochs (and on final epoch)
+  log_interval: 1
+  save_interval: 5
 
 loss_weights:
-  w_rad_amsua: 0.1            # AMSU-A Radiance Observation Loss
-  w_rad_iasi: 0.1             # AMSU-A Radiance Observation Loss
-  lambda_dyn: 0.01            # Hybrid Dynamics (Geostrophic + Tropical Div)
-  lambda_laplacian_p: 0.18    # 2nd-order Graph Laplacian Pressure Weight
-  weight_grad_state: 0.25     # State Gradient Matching Weight
-  weight_state_eq: 0.12       # Ideal Gas Law Residual Weight
-  weight_q_log: 0.25          # Specific Humidity Log-Scale Loss Weight
-  weight_joint_bias: 0.10     # Joint Temperature/Pressure Bias Penalty
-  lambda_asym_p: 0.35         # Asymmetric Pressure Barrier Penalty
-  tau_min_p: 0.08             # Low-Pressure Threshold Barrier
+  # Base MSE & Physics Constraints
+  w_mse: 1.0
+  w_conv: 0.05
+  lambda_dyn: 0.01
+  lambda_laplacian_p: 0.18
+  weight_grad_state: 0.25
+  lambda_p_acc: 0.15
+  lambda_asym_p: 0.35
+  weight_state_eq: 0.12
+  weight_q_log: 0.25
+  lambda_asym_q: 0.50
+  weight_joint_bias: 0.10
+  tau_min_p: 0.08
+
+  # Differentiable Satellite Radiance Loss Weights
+  w_rad: 0.01          # Legacy fallback for AMSU-A
+  w_rad_amsua: 0.01    # AMSU-A Microwave Sounder Weight
+  w_rad_iasi: 0.01     # IASI Hyperspectral Infrared Weight
+  w_rad_hms: 0.01      # HMS Sounder Weight
+  w_rad_atms: 0.01     # ATMS Microwave Sounder Weight
+  w_rad_cris: 0.01     # CrIS Hyperspectral Infrared Sounder Weight

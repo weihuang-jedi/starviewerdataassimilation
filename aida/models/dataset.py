@@ -95,6 +95,9 @@ class LogStateZarrDataset(Dataset):
         obs_atms_tb = np.full((22, self.num_nodes), 240.0, dtype=np.float32)
         obs_atms_mask = np.zeros((22, self.num_nodes), dtype=np.float32)
 
+        obs_cris_tb = np.full((30, self.num_nodes), 240.0, dtype=np.float32)
+        obs_cris_mask = np.zeros((30, self.num_nodes), dtype=np.float32)
+
         if not os.path.exists(self.obs_dir):
             return {
                 'obs_amsua_tb': torch.from_numpy(obs_amsua_tb),
@@ -188,6 +191,22 @@ class LogStateZarrDataset(Dataset):
                             obs_atms_tb[c - 1, n] = v
                             obs_atms_mask[c - 1, n] = 1.0
 
+                # Process CRIS Observations
+                mask_cris = (sensors == "cris") & (vals > 100.0) & (vals < 350.0)
+                if np.any(mask_cris):
+                    ch_cris = channels[mask_cris]
+                    val_cris = vals[mask_cris]
+                    lon_cris = lons[mask_cris]
+
+                    node_idx_c = ((lon_cris + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    node_idx_c = np.clip(node_idx_c, 0, self.num_nodes - 1)
+
+                    for c, v, n in zip(ch_cris, val_cris, node_idx_c):
+                        c_idx = c - 1 if c <= 30 else 0
+                        if 0 <= c_idx < 30:
+                            obs_cris_tb[c_idx, n] = v
+                            obs_cris_mask[c_idx, n] = 1.0
+
                 ds_obs.close()
             except Exception:
                 pass
@@ -201,6 +220,8 @@ class LogStateZarrDataset(Dataset):
             'obs_hms_mask': torch.from_numpy(obs_hms_mask),
             'obs_atms_tb': torch.from_numpy(obs_atms_tb),
             'obs_atms_mask': torch.from_numpy(obs_atms_mask),
+            'obs_cris_tb': torch.from_numpy(obs_cris_tb),
+            'obs_cris_mask': torch.from_numpy(obs_cris_mask),
         }
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:

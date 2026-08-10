@@ -17,6 +17,7 @@ import yaml
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import torch
+import torch.nn.functional as F   # <-- ADD THIS IMPORT
 from torch.utils.data import DataLoader
 
 from models import (
@@ -32,6 +33,7 @@ from models.amsua import DifferentiableAMSUAOperator
 from models.iasi import DifferentiableIASIOperator
 from models.hms import DifferentiableHMSOperator
 from models.atms import DifferentiableATMSOperator
+from models.cris import DifferentiableCrISOperator
 
 
 def load_config(config_path: str) -> dict:
@@ -77,6 +79,8 @@ def train_epoch(
     hms_obs_err,
     atms_op,
     atms_obs_err,
+    cris_op,
+    cris_obs_err,
     loss_cfg
 ):
     """Executes a single training epoch across the dataset."""
@@ -87,7 +91,7 @@ def train_epoch(
     for batch_data in dataloader:
         optimizer.zero_grad()
 
-        # Handle batch data unpack
+        # Handle batch data unpack safely across dict, list/tuple, or tensor
         if isinstance(batch_data, dict):
             x_batch = batch_data['background'].to(device)
             y_batch = batch_data['target'].to(device)
@@ -95,11 +99,14 @@ def train_epoch(
             obs_amsua_mask = batch_data.get('obs_amsua_mask', None)
             obs_iasi_tb = batch_data.get('obs_iasi_tb', None)
             obs_iasi_mask = batch_data.get('obs_iasi_mask', None)
-            # Unpack HMS batch tensors
             obs_hms_tb = batch_data.get('obs_hms_tb', None)
             obs_hms_mask = batch_data.get('obs_hms_mask', None)
             obs_atms_tb = batch_data.get('obs_atms_tb', None)
             obs_atms_mask = batch_data.get('obs_atms_mask', None)
+            obs_cris_tb = batch_data.get('obs_cris_tb', None)
+            obs_cris_mask = batch_data.get('obs_cris_mask', None)
+            obs_conv_val = batch_data.get('obs_conv_val', None)   # <-- FIX: Define obs_conv_val
+            obs_conv_mask = batch_data.get('obs_conv_mask', None) # <-- FIX: Define obs_conv_mask
         elif isinstance(batch_data, (tuple, list)):
             x_batch = batch_data[0].to(device)
             y_batch = batch_data[1].to(device)
@@ -111,6 +118,9 @@ def train_epoch(
             obs_hms_mask = batch_data[7].to(device) if len(batch_data) >= 8 else None
             obs_atms_tb = batch_data[8].to(device) if len(batch_data) >= 9 else None
             obs_atms_mask = batch_data[9].to(device) if len(batch_data) >= 10 else None
+            obs_cris_tb = batch_data[10].to(device) if len(batch_data) >= 11 else None
+            obs_cris_mask = batch_data[11].to(device) if len(batch_data) >= 12 else None
+            obs_conv_val, obs_conv_mask = None, None
         else:
             x_batch = batch_data.to(device)
             y_batch = x_batch
@@ -118,6 +128,8 @@ def train_epoch(
             obs_iasi_tb, obs_iasi_mask = None, None
             obs_hms_tb, obs_hms_mask = None, None
             obs_atms_tb, obs_atms_mask = None, None
+            obs_cris_tb, obs_cris_mask = None, None
+            obs_conv_val, obs_conv_mask = None, None
 
         # GNN Forward Pass
         pred = model(x_batch, edge_index)
@@ -285,7 +297,39 @@ def train_epoch(
         total_loss += (w_rad_atms * loss_rad_atms)
         metrics["loss_rad_atms"] = loss_rad_atms.item()
 
-        # 6. Total Combined Objective
+        # -------------------------------------------------------------------------
+        # 6. Advanced Technology Microwave Sounder
+        # -------------------------------------------------------------------------
+        w_rad_cris = loss_cfg.get("w_rad_cris", 0.01)
+        if obs_cris_tb is not None:
+            p_pa = p_hpa.permute(0, 2, 1) * 100.0
+            t_k_perm = t_k.permute(0, 2, 1)
+            tb_cris_sim = cris_op(t_k_perm, p_pa)  # [B, 30, N]
+
+            tb_cris_obs = obs_cris_tb.to(device)
+            if tb_cris_obs.shape[1] != 30 and tb_cris_obs.shape[2] == 30:
+                tb_cris_obs = tb_cris_obs.permute(0, 2, 1)
+
+            if tb_cris_sim.shape[1] != 30 and tb_cris_sim.shape[2] == 30:
+                tb_cris_sim = tb_cris_sim.permute(0, 2, 1)
+
+            err_cris = cris_obs_err.view(1, 30, 1)
+            innov_cris = (tb_cris_obs - tb_cris_sim) / err_cris
+
+            if obs_cris_mask is not None:
+                mask_cris = obs_cris_mask.to(device)
+                if mask_cris.shape[1] != 30 and mask_cris.shape[2] == 30:
+                    mask_cris = mask_cris.permute(0, 2, 1)
+                loss_rad_cris = torch.sum((innov_cris ** 2) * mask_cris) / (30.0 * torch.sum(mask_cris) + 1e-8)
+            else:
+                loss_rad_cris = torch.mean(innov_cris ** 2) / 30.0
+        else:
+            loss_rad_cris = torch.tensor(0.0, device=device)
+    
+        total_loss += (w_rad_cris * loss_rad_cris)
+        metrics["loss_rad_cris"] = loss_rad_cris.item()
+
+        # 7. Total Combined Objective
 
         metrics["loss_total"] = total_loss.item()
 
@@ -321,7 +365,7 @@ def train_model(cfg: dict):
     zarr_path = paths["zarr_path"]
     if zarr_path and os.path.exists(zarr_path):
         print(f"[TRAIN] Loading dataset from Zarr: '{zarr_path}'", flush=True)
-        obs_dir = paths["obs_dir"]
+        obs_dir = paths.get("obs_dir", None)
         if obs_dir and os.path.exists(obs_dir):
             print(f"[TRAIN] Loading dataset from Obs: '{obs_dir}'", flush=True)
             dataset = LogStateZarrDataset(zarr_path=zarr_path, obs_dir=obs_dir)
@@ -367,10 +411,9 @@ def train_model(cfg: dict):
     ).to(device)
     print("[TRAIN] Sparse differential operators successfully initialized on GPU.", flush=True)
 
-    # 3. Model & Operators Setup
+    # 3. Model & Loss Setup
     num_levels = mesh_cfg.get("num_levels", 32)
 
-    # 4. Model, Loss, & Operators Setup
     model = IcosahedralGNNSurrogate(
         in_vars=dataset.num_vars if hasattr(dataset, "num_vars") else 7,
         hidden_dim=model_cfg["hidden_dim"],
@@ -382,22 +425,24 @@ def train_model(cfg: dict):
         **loss_cfg
     ).to(device)
 
-    # Radiance Forward Operators
+    # 4. Radiance Forward Operators & Error Buffers
     amsua_op = DifferentiableAMSUAOperator().to(device)
     amsua_obs_err = torch.tensor([
         2.5, 2.2, 1.2, 0.6, 0.3, 0.25, 0.25, 0.25,
         0.25, 0.35, 0.55, 0.8, 1.2, 1.8, 3.5
     ], dtype=torch.float32, device=device)
 
-    iasi_op = DifferentiableIASIOperator(num_levels=mesh_cfg.get("num_levels", 32)).to(device)
+    iasi_op = DifferentiableIASIOperator(num_levels=num_levels).to(device)
     iasi_obs_err = iasi_op.obs_errors.to(device)
 
-    # Instantiate HMS Forward Operator & Observation Error Buffers
-    hms_op = DifferentiableHMSOperator(num_levels=mesh_cfg.get("num_levels", 32)).to(device)
+    hms_op = DifferentiableHMSOperator(num_levels=num_levels).to(device)
     hms_obs_err = hms_op.obs_errors.to(device)
 
-    atms_op = DifferentiableATMSOperator(num_levels=mesh_cfg.get("num_levels", 32)).to(device)
+    atms_op = DifferentiableATMSOperator(num_levels=num_levels).to(device)
     atms_obs_err = atms_op.obs_errors.to(device)
+
+    cris_op = DifferentiableCrISOperator(num_levels=num_levels).to(device)
+    cris_obs_err = cris_op.obs_errors.to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -406,16 +451,17 @@ def train_model(cfg: dict):
     )
 
     print(f"[TRAIN] AMSU-A Radiance Weight: {loss_cfg.get('w_rad', loss_cfg.get('w_rad_amsua', 0.01))}", flush=True)
-    print(f"[TRAIN] IASI Radiance Weight: {loss_cfg.get('w_rad_iasi', 0.01)}", flush=True)
-    print(f"[TRAIN] HMS Radiance Weight: {loss_cfg.get('w_rad_hms', 0.01)}", flush=True)
-    print(f"[TRAIN] ATMS Radiance Weight: {loss_cfg.get('w_rad_atms', 0.01)}", flush=True)
+    print(f"[TRAIN] IASI Radiance Weight  : {loss_cfg.get('w_rad_iasi', 0.01)}", flush=True)
+    print(f"[TRAIN] HMS Radiance Weight   : {loss_cfg.get('w_rad_hms', 0.01)}", flush=True)
+    print(f"[TRAIN] ATMS Radiance Weight  : {loss_cfg.get('w_rad_atms', 0.01)}", flush=True)
+    print(f"[TRAIN] CrIS Radiance Weight  : {loss_cfg.get('w_rad_cris', 0.01)}", flush=True)
     print(f"[TRAIN] Dynamics Weight (lambda_dyn): {loss_cfg['lambda_dyn']}", flush=True)
 
     checkpoint_path = paths["checkpoint_path"]
     save_interval = train_cfg.get("save_interval", 5)
     print(f"[TRAIN] Checkpoints saved every {save_interval} epochs to: '{checkpoint_path}'", flush=True)
 
-    # 4. Main Epoch Loop
+    # 5. Main Epoch Loop
     epochs = train_cfg["epochs"]
     log_interval = train_cfg["log_interval"]
 
@@ -434,10 +480,14 @@ def train_model(cfg: dict):
             iasi_obs_err=iasi_obs_err,
             hms_op=hms_op,
             hms_obs_err=hms_obs_err,
+            atms_op=atms_op,
+            atms_obs_err=atms_obs_err,
+            cris_op=cris_op,
+            cris_obs_err=cris_obs_err,
             loss_cfg=loss_cfg
         )
 
-        # Logging
+        # Scientific Logging
         if epoch % log_interval == 0 or epoch == epochs:
             print(
                 f"\n" + "=" * 110 + "\n"
@@ -446,7 +496,8 @@ def train_model(cfg: dict):
                 f"  TOTAL LOSS    : {epoch_losses.get('loss_total', 0.0):12.5e} | STATE MSE     : {epoch_losses.get('loss_mse', 0.0):12.5e}\n"
                 f"  CONV OBS LOSS : {epoch_losses.get('loss_conv', 0.0):12.5e} | LAPLACIAN P   : {epoch_losses.get('loss_laplacian_p', 0.0):12.5e}\n"
                 f"  AMSU-A RAD    : {epoch_losses.get('loss_rad_amsua', 0.0):12.5e} | IASI RAD      : {epoch_losses.get('loss_rad_iasi', 0.0):12.5e}\n"
-                f"  DYNAMICS LOSS : {epoch_losses.get('loss_dynamics_total', 0.0):12.5e} | JOINT BIAS    : {epoch_losses.get('loss_joint_bias', 0.0):12.5e}\n"
+                f"  HMS RAD       : {epoch_losses.get('loss_rad_hms', 0.0):12.5e} | ATMS RAD      : {epoch_losses.get('loss_rad_atms', 0.0):12.5e}\n"
+                f"  CrIS RAD      : {epoch_losses.get('loss_rad_cris', 0.0):12.5e} | DYNAMICS LOSS : {epoch_losses.get('loss_dynamics_total', 0.0):12.5e}\n"
                 f"=" * 110,
                 flush=True
             )

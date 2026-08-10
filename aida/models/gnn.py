@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from models.amsua import DifferentiableAMSUAOperator
 from models.iasi import DifferentiableIASIOperator
 from models.hms import DifferentiableHMSOperator
+from models.atms import DifferentiableATMSOperator
+from models.cris import DifferentiableCrISOperator
 
 
 class GraphConvBlock(nn.Module):
@@ -82,14 +84,24 @@ class IcosahedralGNNSurrogate(nn.Module):
         self.amsua_operator = DifferentiableAMSUAOperator(num_levels=num_levels)
         self.iasi_operator = DifferentiableIASIOperator(num_levels=num_levels)
         self.hms_operator = DifferentiableHMSOperator(num_levels=num_levels)
+        self.atms_operator = DifferentiableATMSOperator(num_levels=num_levels)
+        self.cris_operator = DifferentiableCrISOperator(num_levels=num_levels)
+
+    def forward_iasi_radiances(self, temp_k: torch.Tensor, press_pa: torch.Tensor) -> torch.Tensor:
+        """Exposes direct forward evaluation of IASI brightness temperatures."""
+        return self.iasi_operator(temp_k, press_pa)
 
     def forward_hms_radiances(self, temp_k: torch.Tensor, press_pa: torch.Tensor) -> torch.Tensor:
         """Exposes direct forward evaluation of HMS brightness temperatures."""
         return self.hms_operator(temp_k, press_pa)
 
-    def forward_iasi_radiances(self, temp_k: torch.Tensor, press_pa: torch.Tensor) -> torch.Tensor:
-        """Exposes direct forward evaluation of IASI brightness temperatures."""
-        return self.iasi_operator(temp_k, press_pa)
+    def forward_atms_radiances(self, temp_k: torch.Tensor, press_pa: torch.Tensor) -> torch.Tensor:
+        """Exposes direct forward evaluation of ATMS."""
+        return self.atms_operator(temp_k, press_pa)
+
+    def forward_cris_radiances(self, temp_k: torch.Tensor, press_pa: torch.Tensor) -> torch.Tensor:
+        """Exposes direct forward evaluation of CrIS."""
+        return self.cris_operator(temp_k, press_pa)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         h = self.encoder(x)
