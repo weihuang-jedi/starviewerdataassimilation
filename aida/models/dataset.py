@@ -273,4 +273,8 @@ class SyntheticAIDAStateDataset(Dataset):
             'obs_iasi_mask': torch.ones((30, self.num_nodes), dtype=torch.float32),
             'obs_hms_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
             'obs_hms_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
+            'obs_atms_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
+            'obs_atms_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
+            'obs_cris_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
+            'obs_cris_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
         }
