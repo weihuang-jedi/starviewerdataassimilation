@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 from models.amsua import DifferentiableAMSUAOperator
 from models.iasi import DifferentiableIASIOperator
+from models.hms import DifferentiableHMSOperator
+
 
 class GraphConvBlock(nn.Module):
     """Graph Convolution Message Passing Block with LayerNorm for numerical stability."""
@@ -79,6 +81,11 @@ class IcosahedralGNNSurrogate(nn.Module):
         # Differentiable Radiance Forward Operators
         self.amsua_operator = DifferentiableAMSUAOperator(num_levels=num_levels)
         self.iasi_operator = DifferentiableIASIOperator(num_levels=num_levels)
+        self.hms_operator = DifferentiableHMSOperator(num_levels=num_levels)
+
+    def forward_hms_radiances(self, temp_k: torch.Tensor, press_pa: torch.Tensor) -> torch.Tensor:
+        """Exposes direct forward evaluation of HMS brightness temperatures."""
+        return self.hms_operator(temp_k, press_pa)
 
     def forward_iasi_radiances(self, temp_k: torch.Tensor, press_pa: torch.Tensor) -> torch.Tensor:
         """Exposes direct forward evaluation of IASI brightness temperatures."""

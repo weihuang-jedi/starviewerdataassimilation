@@ -1,9 +1,9 @@
 # AIDA GNN Surrogate Model Configuration
 
 paths:
-  zarr_path: "../data/icosahedral_logstate.zarr"
-  edges_path: "../data/graph/icosahedral_edge_index_m4.pt"
-  obs_dir: "../data/conv_amsua_iasi_2024"  # Points to the new unified dataset folder
+  zarr_path: "/scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/icosahedral_logstate.zarr"
+  edges_path: "/scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/graph/icosahedral_edge_index_m4.pt"
+  obs_dir: "../data/conv_amsua_iasi_hms_2024"  # Points to the new unified dataset folder
   checkpoint_path: "checkpoints/aida_gnn_surrogate_logstate.pt"
 
 mesh:

@@ -3,7 +3,7 @@
 set -x
 
 # 1. Change to working directory
-cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
+cd /scratch5/purged/Wei.Huang/src/starviewerdataassimilation/aida
 
 # 2. Activate Conda environment
 source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
@@ -18,7 +18,7 @@ if [ ! -f ${gridanalysis} ]; then
    python icosahedral2regular.py \
       -i ${icosahedral_analysis} \
       -o ${gridanalysis} \
-      -g ../data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
+      -g /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
       -r 1.0
 fi
 
@@ -28,7 +28,7 @@ fi
 
 python validate_reconstruction.py \
    -i ${gridanalysis} \
-   -r ../data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
+   -r /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
    -o output/verification_levels.t${analhour}z.csv
 
 python utils/plot_vertical_profiles.py \
