@@ -81,7 +81,7 @@ def train_epoch(
     for batch_data in dataloader:
         optimizer.zero_grad()
 
-        # Handle different dataset batch return shapes
+        # Handle batch data unpack
         if isinstance(batch_data, dict):
             x_batch = batch_data['background'].to(device)
             y_batch = batch_data['target'].to(device)
@@ -89,23 +89,19 @@ def train_epoch(
             obs_amsua_mask = batch_data.get('obs_amsua_mask', None)
             obs_iasi_tb = batch_data.get('obs_iasi_tb', None)
             obs_iasi_mask = batch_data.get('obs_iasi_mask', None)
-        elif isinstance(batch_data, (tuple, list)):
+            obs_conv_val = batch_data.get('obs_conv_val', None)
+            obs_conv_mask = batch_data.get('obs_conv_mask', None)
+        else:
             x_batch = batch_data[0].to(device)
             y_batch = batch_data[1].to(device)
-            obs_amsua_tb = batch_data[2].to(device) if len(batch_data) >= 3 else None
-            obs_amsua_mask = batch_data[3].to(device) if len(batch_data) >= 4 else None
-            obs_iasi_tb = batch_data[4].to(device) if len(batch_data) >= 5 else None
-            obs_iasi_mask = batch_data[5].to(device) if len(batch_data) >= 6 else None
-        else:
-            x_batch = batch_data.to(device)
-            y_batch = x_batch
             obs_amsua_tb, obs_amsua_mask = None, None
             obs_iasi_tb, obs_iasi_mask = None, None
+            obs_conv_val, obs_conv_mask = None, None
 
         # GNN Forward Pass
         pred = model(x_batch, edge_index)
 
-        # 1. Base Multi-Component Physical Loss Calculation
+        # 1. Physical Base Loss
         loss, metrics = criterion(
             pred=pred,
             target=y_batch,
@@ -113,7 +109,7 @@ def train_epoch(
             graph_mesh_ops=graph_mesh_ops
         )
 
-        # Permute log-state predictions for radiance evaluation: [B, V=7, L=32, N] -> [B, N, L=32]
+        # Un-normalize physical fields: [B, V=7, L=32, N] -> [B, N, L=32]
         std_t = getattr(criterion, "std_ln_t", 1.0)
         mu_t = getattr(criterion, "mu_ln_t", 0.0)
         std_p = getattr(criterion, "std_ln_p", 1.0)
@@ -126,24 +122,36 @@ def train_epoch(
         p_hpa = torch.clamp(torch.exp(ln_p_phys) / 100.0, min=0.01, max=1050.0)
 
         # ---------------------------------------------------------------------
-        # 2. Differentiable AMSU-A Radiance Innovation Loss
+        # 2. Conventional Observation Loss (p, t, u, v, q)
+        # ---------------------------------------------------------------------
+        w_conv = loss_cfg.get("w_conv", 0.05)
+        if obs_conv_val is not None:
+            conv_val = obs_conv_val.to(device)
+            if obs_conv_mask is not None:
+                conv_m = obs_conv_mask.to(device)
+                loss_conv = torch.sum(((pred - conv_val) ** 2) * conv_m) / (torch.sum(conv_m) + 1e-8)
+            else:
+                loss_conv = F.mse_loss(pred, conv_val)
+        else:
+            # Fallback conventional innovation proxy vs forecast target
+            loss_conv = F.mse_loss(pred[:, [0, 1, 2, 4, 6], :, :], y_batch[:, [0, 1, 2, 4, 6], :, :])
+
+        # ---------------------------------------------------------------------
+        # 3. AMSU-A Satellite Radiance Loss
         # ---------------------------------------------------------------------
         w_rad_amsua = loss_cfg.get("w_rad", loss_cfg.get("w_rad_amsua", 0.01))
         if obs_amsua_tb is not None:
-            tb_amsua_sim = amsua_op(t_k, p_hpa)  # Output: [B, N=2562, Ch=15] or [B, Ch=15, N=2562]
+            tb_amsua_sim = amsua_op(t_k, p_hpa)
 
-            # Ensure both simulated and observed match shape: [B, Channels=15, Nodes=2562]
             tb_amsua_obs = obs_amsua_tb.to(device)
             if tb_amsua_sim.shape[1] != 15 and tb_amsua_sim.shape[2] == 15:
-                tb_amsua_sim = tb_amsua_sim.permute(0, 2, 1)  # -> [B, 15, 2562]
+                tb_amsua_sim = tb_amsua_sim.permute(0, 2, 1)
 
             if tb_amsua_obs.shape[1] != 15 and tb_amsua_obs.shape[2] == 15:
-                tb_amsua_obs = tb_amsua_obs.permute(0, 2, 1)  # -> [B, 15, 2562]
+                tb_amsua_obs = tb_amsua_obs.permute(0, 2, 1)
 
-            # Reshape amsua_obs_err [15] -> [1, 15, 1] for correct broadcasting across nodes
             err_amsua = amsua_obs_err.view(1, 15, 1)
-
-            innov_amsua = (tb_amsua_obs - tb_amsua_sim) / err_amsua  # [B, 15, 2562]
+            innov_amsua = (tb_amsua_obs - tb_amsua_sim) / err_amsua
 
             if obs_amsua_mask is not None:
                 mask_amsua = obs_amsua_mask.to(device)
@@ -156,13 +164,13 @@ def train_epoch(
             loss_rad_amsua = torch.tensor(0.0, device=device)
 
         # ---------------------------------------------------------------------
-        # 3. Differentiable IASI Radiance Innovation Loss
+        # 4. IASI Satellite Radiance Loss
         # ---------------------------------------------------------------------
         w_rad_iasi = loss_cfg.get("w_rad_iasi", 0.01)
         if obs_iasi_tb is not None:
             p_pa = p_hpa.permute(0, 2, 1) * 100.0
             t_k_perm = t_k.permute(0, 2, 1)
-            tb_iasi_sim = iasi_op(t_k_perm, p_pa)  # [B, 30, N=2562]
+            tb_iasi_sim = iasi_op(t_k_perm, p_pa)
 
             tb_iasi_obs = obs_iasi_tb.to(device)
             if tb_iasi_obs.shape[1] != 30 and tb_iasi_obs.shape[2] == 30:
@@ -184,10 +192,11 @@ def train_epoch(
         else:
             loss_rad_iasi = torch.tensor(0.0, device=device)
 
-        # 4. Total Combined Objective
-        total_loss = loss + (w_rad_amsua * loss_rad_amsua) + (w_rad_iasi * loss_rad_iasi)
+        # Total Objective Sum
+        total_loss = loss + (w_conv * loss_conv) + (w_rad_amsua * loss_rad_amsua) + (w_rad_iasi * loss_rad_iasi)
 
         metrics["loss_total"] = total_loss.item()
+        metrics["loss_conv"] = loss_conv.item()
         metrics["loss_rad_amsua"] = loss_rad_amsua.item()
         metrics["loss_rad_iasi"] = loss_rad_iasi.item()
 
@@ -326,13 +335,14 @@ def train_model(cfg: dict):
         # Logging
         if epoch % log_interval == 0 or epoch == epochs:
             print(
-                f"Epoch {epoch:03d}/{epochs:03d} | "
-                f"Total: {epoch_losses.get('loss_total', 0.0):.4f} | "
-                f"MSE: {epoch_losses.get('loss_mse', 0.0):.4f} | "
-                f"AMSUA_Rad: {epoch_losses.get('loss_rad_amsua', 0.0):.4f} | "
-                f"IASI_Rad: {epoch_losses.get('loss_rad_iasi', 0.0):.4f} | "
-                f"Laplacian_P: {epoch_losses.get('loss_laplacian_p', 0.0):.5f} | "
-                f"Dyn_Total: {epoch_losses.get('loss_dynamics_total', 0.0):.5f}",
+                f"\n" + "=" * 110 + "\n"
+                f" EPOCH {epoch:03d}/{epochs:03d} TRAINING LOSS BREAKDOWN\n"
+                f" " + "-" * 108 + "\n"
+                f"  TOTAL LOSS    : {epoch_losses.get('loss_total', 0.0):12.5e} | STATE MSE     : {epoch_losses.get('loss_mse', 0.0):12.5e}\n"
+                f"  CONV OBS LOSS : {epoch_losses.get('loss_conv', 0.0):12.5e} | LAPLACIAN P   : {epoch_losses.get('loss_laplacian_p', 0.0):12.5e}\n"
+                f"  AMSU-A RAD    : {epoch_losses.get('loss_rad_amsua', 0.0):12.5e} | IASI RAD      : {epoch_losses.get('loss_rad_iasi', 0.0):12.5e}\n"
+                f"  DYNAMICS LOSS : {epoch_losses.get('loss_dynamics_total', 0.0):12.5e} | JOINT BIAS    : {epoch_losses.get('loss_joint_bias', 0.0):12.5e}\n"
+                f"=" * 110,
                 flush=True
             )
 
