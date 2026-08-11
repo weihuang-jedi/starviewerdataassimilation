@@ -12,7 +12,8 @@
 
 # 1. Set working directory
 # cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
-cd /scratch5/purged/Wei.Huang/src/starviewerdataassimilation/aida
+# cd /scratch5/purged/Wei.Huang/src/starviewerdataassimilation/aida
+cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
 
 # 2. Activate Conda environment
 source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env

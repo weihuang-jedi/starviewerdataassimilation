@@ -93,14 +93,24 @@ def run_cycling_inference(
     # 1. Load Checkpoint and Statistics
     print(f"[AIDA INIT] Loading GNN checkpoint: {gnn_ckpt}")
     checkpoint = torch.load(gnn_ckpt, map_location=device)
-    ckpt_args = checkpoint.get('args', checkpoint.get('config', {}))
+    ckpt_cfg = checkpoint.get("config", {})
 
-    hidden_dim = ckpt_args.get('hidden_dim', 64) if isinstance(ckpt_args, dict) else getattr(ckpt_args, 'hidden_dim', 64)
+    # Extract model dimensions from checkpoint config (or fall back to checkpoint tensor shapes)
+    hidden_dim = ckpt_cfg.get("model", {}).get("hidden_dim", 128)
+    num_layers = ckpt_cfg.get("model", {}).get("num_layers", 4)
+    num_levels = ckpt_cfg.get("mesh", {}).get("num_levels", 32)
+
+    print(f"[AIDA INIT] Instantiating GNN Surrogate (hidden_dim={hidden_dim}, layers={num_layers})...")
+
+    # 2. Instantiate model with matching hidden_dim
     model = IcosahedralGNNSurrogate(
-        in_vars=len(LOG_STATE_VARS),
-        hidden_dim=hidden_dim
+        in_vars=7,
+        hidden_dim=hidden_dim,  # <--- Changed from default 64 to hidden_dim (128)
+        num_levels=num_levels,
+        num_layers=num_layers
     ).to(device)
 
+    # 3. Load state dict safely
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
