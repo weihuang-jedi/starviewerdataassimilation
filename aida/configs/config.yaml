@@ -19,7 +19,8 @@ model:
 
 training:
   epochs: 35
-  batch_size: 16
+  batch_size: 4       # <-- Lowered from 16 to 4 to prevent CUDA OOM
+  accum_steps: 4      # <-- Gradient accumulation steps (Effective batch size = 16)
   lr: 0.0005
   weight_decay: 0.0001
   log_interval: 1
