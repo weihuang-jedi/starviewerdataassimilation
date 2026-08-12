@@ -18,6 +18,7 @@ from models.hms import DifferentiableHMSOperator
 from models.atms import DifferentiableATMSOperator
 from models.cris import DifferentiableCrISOperator
 from models.seviri import DifferentiableSEVIRIOperator
+from models.gsrasr import DifferentiableGSRASROperator
 
 
 def build_icosahedral_differential_operators(
@@ -235,6 +236,7 @@ class AIDASurrogateLoss(nn.Module):
         w_rad_atms: float = 0.01,  # Added ATMS loss weight
         w_rad_cris: float = 0.01,  # Added CrIS loss weight
         w_rad_seviri: float = 0.01,  # Added SEVIRI loss weight
+        w_rad_gsrasr: float = 0.01,  # Added GSRASR loss weight
         lambda_asym_q: float = 0.50,
         lambda_dyn: float = 0.01,
         w_dyn: float = 0.01,
@@ -275,6 +277,7 @@ class AIDASurrogateLoss(nn.Module):
         self.w_rad_atms = w_rad_atms
         self.w_rad_cris = w_rad_cris
         self.w_rad_seviri = w_rad_seviri
+        self.w_rad_gsrasr = w_rad_gsrasr
 
         self.hybrid_dyn = HybridDynamicsLoss(lat_trans_center_deg=15.0)
 
@@ -291,6 +294,7 @@ class AIDASurrogateLoss(nn.Module):
         self.atms_loss = DifferentiableATMSOperator(num_levels=num_levels)
         self.cris_loss = DifferentiableCrISOperator(num_levels=num_levels)
         self.seviri_loss = DifferentiableSEVIRIOperator(num_levels=num_levels)
+        self.gsrasr_loss = DifferentiableGSRASROperator(num_levels=num_levels)
 
     def forward(
         self,

@@ -49,3 +49,4 @@ loss_weights:
   w_rad_atms: 0.01     # ATMS Microwave Sounder Weight
   w_rad_cris: 0.01     # CrIS Hyperspectral Infrared Sounder Weight
   w_rad_seviri: 0.01   # SEVIRI Geostationary Sounder
+  w_rad_gsrasr: 0.01   # GOES All-Sky Radiance (ABI)
