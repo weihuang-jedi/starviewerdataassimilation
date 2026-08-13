@@ -20,4 +20,6 @@ source ../svg.env
 #python fetch_conv_amsua_iasi_hms_atms.py
 #python fetch_conv_amsua_iasi_hms_atms_cris.py
 #python fetch_conv_amsua_iasi_hms_atms_cris_seviri.py
-python fetch_conv_amsua_iasi_hms_atms_cris_seviri_gsrasr.py
+#python fetch_conv_amsua_iasi_hms_atms_cris_seviri_gsrasr.py
+python fetch_conv_amsua_iasi_hms_atms_cris_seviri_gsrasr_gsrcsr.py
+

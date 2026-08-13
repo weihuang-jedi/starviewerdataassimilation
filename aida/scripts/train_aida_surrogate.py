@@ -34,6 +34,7 @@ from models.atms import DifferentiableATMSOperator
 from models.cris import DifferentiableCrISOperator
 from models.seviri import DifferentiableSEVIRIOperator
 from models.gsrasr import DifferentiableGSRASROperator
+from models.gsrcsr import DifferentiableGSRCSROperator
 
 
 def load_config(config_path: str) -> dict:
@@ -75,6 +76,7 @@ def train_epoch(
     cris_op, cris_obs_err,
     seviri_op, seviri_obs_err,
     gsrasr_op, gsrasr_obs_err,
+    gsrcsr_op, gsrcsr_obs_err,
     loss_cfg,
     accum_steps: int = 4
 ):
@@ -102,6 +104,8 @@ def train_epoch(
             obs_seviri_mask = batch_data.get('obs_seviri_mask', None)
             obs_gsrasr_tb = batch_data.get('obs_gsrasr_tb', None)
             obs_gsrasr_mask = batch_data.get('obs_gsrasr_mask', None)
+            obs_gsrcsr_tb = batch_data.get('obs_gsrcsr_tb', None)
+            obs_gsrcsr_mask = batch_data.get('obs_gsrcsr_mask', None)
             obs_conv_val = batch_data.get('obs_conv_val', None)
             obs_conv_mask = batch_data.get('obs_conv_mask', None)
         else:
@@ -114,6 +118,7 @@ def train_epoch(
             obs_cris_tb, obs_cris_mask = None, None
             obs_seviri_tb, obs_seviri_mask = None, None
             obs_gsrasr_tb, obs_gsrasr_mask = None, None
+            obs_gsrcsr_tb, obs_gsrcsr_mask = None, None
             obs_conv_val, obs_conv_mask = None, None
 
         # GNN Forward Pass
@@ -333,6 +338,36 @@ def train_epoch(
         total_loss += (w_rad_gsrasr * loss_rad_gsrasr)
         metrics["loss_rad_gsrasr"] = loss_rad_gsrasr.item()
 
+        # 9. Evaluate GSRCSR Radiance Innovation Loss
+        w_rad_gsrcsr = loss_cfg.get("w_rad_gsrcsr", 0.01)
+        if obs_gsrcsr_tb is not None:
+            p_pa = p_hpa.permute(0, 2, 1) * 100.0
+            t_k_perm = t_k.permute(0, 2, 1)
+            tb_gsrcsr_sim = gsrcsr_op(t_k_perm, p_pa)  # [B, 7, N]
+
+            tb_gsrcsr_obs = obs_gsrcsr_tb.to(device)
+            if tb_gsrcsr_obs.shape[1] != 7 and tb_gsrcsr_obs.shape[2] == 7:
+                tb_gsrcsr_obs = tb_gsrcsr_obs.permute(0, 2, 1)
+
+            if tb_gsrcsr_sim.shape[1] != 7 and tb_gsrcsr_sim.shape[2] == 7:
+                tb_gsrcsr_sim = tb_gsrcsr_sim.permute(0, 2, 1)
+
+            err_gsrcsr = gsrcsr_obs_err.view(1, 7, 1)
+            innov_gsrcsr = (tb_gsrcsr_obs - tb_gsrcsr_sim) / err_gsrcsr
+
+            if obs_gsrcsr_mask is not None:
+                mask_gsrcsr = obs_gsrcsr_mask.to(device)
+                if mask_gsrcsr.shape[1] != 7 and mask_gsrcsr.shape[2] == 7:
+                    mask_gsrcsr = mask_gsrcsr.permute(0, 2, 1)
+                loss_rad_gsrcsr = torch.sum((innov_gsrcsr ** 2) * mask_gsrcsr) / (7.0 * torch.sum(mask_gsrcsr) + 1e-8)
+            else:
+                loss_rad_gsrcsr = torch.mean(innov_gsrcsr ** 2) / 7.0
+        else:
+            loss_rad_gsrcsr = torch.tensor(0.0, device=device)
+
+        total_loss += (w_rad_gsrcsr * loss_rad_gsrcsr)
+        metrics["loss_rad_gsrcsr"] = loss_rad_gsrcsr.item()
+
         # ------------------------------------------------------------------------------------------------------------
         metrics["loss_total"] = total_loss.item()
 
@@ -445,6 +480,9 @@ def train_model(cfg: dict):
     gsrasr_op = DifferentiableGSRASROperator(num_levels=num_levels).to(device)
     gsrasr_obs_err = gsrasr_op.obs_errors.to(device)
 
+    gsrcsr_op = DifferentiableGSRCSR0perator(num_levels=num_levels).to(device)
+    gsrcsr_obs_err = gsrcsr_op.obs_errors.to(device)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_cfg["lr"],
@@ -458,6 +496,7 @@ def train_model(cfg: dict):
     print(f"[TRAIN] CrIS Radiance Weight  : {loss_cfg.get('w_rad_cris', 0.01)}", flush=True)
     print(f"[TRAIN] SEVIRI Radiance Weight: {loss_cfg.get('w_rad_seviri', 0.01)}", flush=True)
     print(f"[TRAIN] GSRASR Radiance Weight: {loss_cfg.get('w_rad_gsrasr', 0.01)}", flush=True)
+    print(f"[TRAIN] GSRCSR Radiance Weight: {loss_cfg.get('w_rad_gsrcsr', 0.01)}", flush=True)
 
     checkpoint_path = paths["checkpoint_path"]
     save_interval = train_cfg.get("save_interval", 5)
@@ -481,6 +520,7 @@ def train_model(cfg: dict):
             cris_op=cris_op, cris_obs_err=cris_obs_err,
             seviri_op=seviri_op, seviri_obs_err=seviri_obs_err,
             gsrasr_op=gsrasr_op, gsrasr_obs_err=gsrasr_obs_err,
+            gsrcsr_op=gsrcsr_op, gsrcsr_obs_err=gsrcsr_obs_err,
             loss_cfg=loss_cfg,
             accum_steps=accum_steps
         )
@@ -495,7 +535,7 @@ def train_model(cfg: dict):
                 f"  AMSU-A RAD    : {epoch_losses.get('loss_rad_amsua', 0.0):12.5e} | IASI RAD      : {epoch_losses.get('loss_rad_iasi', 0.0):12.5e}\n"
                 f"  HMS RAD       : {epoch_losses.get('loss_rad_hms', 0.0):12.5e} | ATMS RAD      : {epoch_losses.get('loss_rad_atms', 0.0):12.5e}\n"
                 f"  CrIS RAD      : {epoch_losses.get('loss_rad_cris', 0.0):12.5e} | SEVIRI RAD    : {epoch_losses.get('loss_rad_seviri', 0.0):12.5e}\n"
-                f"  GSRASR RAD    : {epoch_losses.get('loss_rad_gsrasr', 0.0):12.5e}\n"
+                f"  GSRASR RAD    : {epoch_losses.get('loss_rad_gsrasr', 0.0):12.5e} |  GSRCSR RAD    : {epoch_losses.get('loss_rad_gsrcsr', 0.0):12.5e}\n"
                 f"  DYNAMICS LOSS : {epoch_losses.get('loss_dynamics_total', 0.0):12.5e} | JOINT BIAS    : {epoch_losses.get('loss_joint_bias', 0.0):12.5e}\n"
                 f"=" * 110,
                 flush=True

@@ -6,7 +6,7 @@ paths:
   zarr_path: "../data/icosahedral_logstate.zarr"
   edges_path: "../data/graph/icosahedral_edge_index_m4.pt"
   checkpoint_path: "checkpoints/aida_gnn_surrogate_logstate.pt"
-  obs_dir: "conv_amsua_iasi_hms_atms_cris_seviri_gsrasr_2024"
+  obs_dir: "conv_amsua_iasi_hms_atms_cris_seviri_gsrasr_gsrcsr_2024"
 
 mesh:
   num_nodes: 2562
@@ -50,3 +50,4 @@ loss_weights:
   w_rad_cris: 0.01     # CrIS Hyperspectral Infrared Sounder Weight
   w_rad_seviri: 0.01   # SEVIRI Geostationary Sounder
   w_rad_gsrasr: 0.01   # GOES All-Sky Radiance (ABI)
+  w_rad_gsrcsr: 0.01   # GOES Clear-Sky Radiance (ABI CSR)

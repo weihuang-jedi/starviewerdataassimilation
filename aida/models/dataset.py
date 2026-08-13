@@ -104,6 +104,9 @@ class LogStateZarrDataset(Dataset):
         obs_gsrasr_tb = np.full((10, self.num_nodes), 240.0, dtype=np.float32)
         obs_gsrasr_mask = np.zeros((10, self.num_nodes), dtype=np.float32)
 
+        obs_gsrcsr_tb = np.full((7, self.num_nodes), 240.0, dtype=np.float32)
+        obs_gsrcsr_mask = np.zeros((7, self.num_nodes), dtype=np.float32)
+
         if not os.path.exists(self.obs_dir):
             return {
                 'obs_amsua_tb': torch.from_numpy(obs_amsua_tb),
@@ -247,6 +250,24 @@ class LogStateZarrDataset(Dataset):
                             obs_gsrasr_tb[c_idx, n] = v
                             obs_gsrasr_mask[c_idx, n] = 1.0
 
+                # Process GSRCSR Observations
+                mask_gsrcsr = (sensors == "gsrcsr") & (vals > 100.0) & (vals < 350.0)
+                if np.any(mask_gsrcsr):
+                    ch_gsrcsr = channels[mask_gsrcsr]
+                    val_gsrcsr = vals[mask_gsrcsr]
+                    lon_gsrcsr = lons[mask_gsrcsr]
+
+                    node_idx_gc = ((lon_gsrcsr + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    node_idx_gc = np.clip(node_idx_gc, 0, self.num_nodes - 1)
+
+                    # Channel mapping for GSRCSR [8, 9, 10, 12, 13, 14, 15] -> 0..6
+                    channel_map = {8: 0, 9: 1, 10: 2, 12: 3, 13: 4, 14: 5, 15: 6}
+                    for c, v, n in zip(ch_gsrcsr, val_gsrcsr, node_idx_gc):
+                        if c in channel_map:
+                            c_idx = channel_map[c]
+                            obs_gsrcsr_tb[c_idx, n] = v
+                            obs_gsrcsr_mask[c_idx, n] = 1.0
+
                 ds_obs.close()
             except Exception:
                 pass
@@ -266,6 +287,8 @@ class LogStateZarrDataset(Dataset):
             'obs_seviri_mask': torch.from_numpy(obs_seviri_mask),
             'obs_gsrasr_tb': torch.from_numpy(obs_gsrasr_tb),
             'obs_gsrasr_mask': torch.from_numpy(obs_gsrasr_mask),
+            'obs_gsrcsr_tb': torch.from_numpy(obs_gsrcsr_tb),
+            'obs_gsrcsr_mask': torch.from_numpy(obs_gsrcsr_mask),
         }
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
@@ -325,4 +348,6 @@ class SyntheticAIDAStateDataset(Dataset):
             'obs_seviri_mask': torch.ones((8, self.num_nodes), dtype=torch.float32),
             'obs_gsrasr_tb': torch.full((10, self.num_nodes), 240.0, dtype=torch.float32),
             'obs_gsrasr_mask': torch.ones((10, self.num_nodes), dtype=torch.float32),
+            'obs_gsrcsr_tb': torch.full((7, self.num_nodes), 240.0, dtype=torch.float32),
+            'obs_gsrcsr_mask': torch.ones((7, self.num_nodes), dtype=torch.float32),
         }
