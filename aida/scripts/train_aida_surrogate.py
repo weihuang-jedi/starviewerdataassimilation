@@ -480,7 +480,7 @@ def train_model(cfg: dict):
     gsrasr_op = DifferentiableGSRASROperator(num_levels=num_levels).to(device)
     gsrasr_obs_err = gsrasr_op.obs_errors.to(device)
 
-    gsrcsr_op = DifferentiableGSRCSR0perator(num_levels=num_levels).to(device)
+    gsrcsr_op = DifferentiableGSRCSROperator(num_levels=num_levels).to(device)
     gsrcsr_obs_err = gsrcsr_op.obs_errors.to(device)
 
     optimizer = torch.optim.AdamW(

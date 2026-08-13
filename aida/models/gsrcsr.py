@@ -44,7 +44,7 @@ GSRCSR_CHAN_ERRORS = np.array([
 ], dtype=np.float32)
 
 
-class DifferentiableGSRCSR0perator(nn.Module):
+class DifferentiableGSRCSROperator(nn.Module):
     """
     Differentiable Forward Radiance Operator H_gsrcsr(x) in PyTorch.
     Maps atmospheric profile states (Temperature T, Pressure p) to simulated GOES CSR
@@ -89,7 +89,7 @@ class GSRCSRRadianceLoss(nn.Module):
     """Computes normalized GOES Clear-Sky Radiance innovation loss J_rad_gsrcsr."""
     def __init__(self, num_levels: int = 32):
         super().__init__()
-        self.operator = DifferentiableGSRCSR0perator(num_levels=num_levels)
+        self.operator = DifferentiableGSRCSROperator(num_levels=num_levels)
 
     def forward(
         self,

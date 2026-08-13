@@ -19,7 +19,7 @@ from models.atms import DifferentiableATMSOperator
 from models.cris import DifferentiableCrISOperator
 from models.seviri import DifferentiableSEVIRIOperator
 from models.gsrasr import DifferentiableGSRASROperator
-from models.gsrcsr import DifferentiableGSRCSR0perator
+from models.gsrcsr import DifferentiableGSRCSROperator
 
 
 def build_icosahedral_differential_operators(
