@@ -8,7 +8,8 @@ from .hms import DifferentiableHMSOperator
 from .atms import DifferentiableATMSOperator
 from .cris import DifferentiableCrISOperator
 from .seviri import DifferentiableSEVIRIOperator
-from .gsrasr import DifferentiableGSRASROperator, GSRASRRadianceLoss
+from .gsrasr import DifferentiableGSRASROperator
+from .gsrcsr import DifferentiableGSRCSROperator
 
 __all__ = [
     "LogStateZarrDataset",
@@ -27,5 +28,6 @@ __all__ = [
     "DifferentiableCrISOperator",
     "DifferentiableSEVIRIOperator",
     "DifferentiableGSRASROperator",
+    "DifferentiableGSRCSROperator",
     "GSRASRRadianceLoss",
 ]
