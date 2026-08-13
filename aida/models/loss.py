@@ -20,6 +20,7 @@ from models.cris import DifferentiableCrISOperator
 from models.seviri import DifferentiableSEVIRIOperator
 from models.gsrasr import DifferentiableGSRASROperator
 from models.gsrcsr import DifferentiableGSRCSROperator
+from models.ahicsr import DifferentiableAHICSROperator
 
 
 def build_icosahedral_differential_operators(
@@ -239,6 +240,7 @@ class AIDASurrogateLoss(nn.Module):
         w_rad_seviri: float = 0.01,  # Added SEVIRI loss weight
         w_rad_gsrasr: float = 0.01,  # Added GSRASR loss weight
         w_rad_gsrcsr: float = 0.01,  # Added GSRCSR loss weight
+        w_rad_ahicsr: float = 0.01,  # Added AHICSR loss weight
         lambda_asym_q: float = 0.50,
         lambda_dyn: float = 0.01,
         w_dyn: float = 0.01,
@@ -281,6 +283,7 @@ class AIDASurrogateLoss(nn.Module):
         self.w_rad_seviri = w_rad_seviri
         self.w_rad_gsrasr = w_rad_gsrasr
         self.w_rad_gsrcsr = w_rad_gsrcsr
+        self.w_rad_ahicsr = w_rad_ahicsr
 
         self.hybrid_dyn = HybridDynamicsLoss(lat_trans_center_deg=15.0)
 
@@ -299,6 +302,7 @@ class AIDASurrogateLoss(nn.Module):
         self.seviri_loss = DifferentiableSEVIRIOperator(num_levels=num_levels)
         self.gsrasr_loss = DifferentiableGSRASROperator(num_levels=num_levels)
         self.gsrcsr_loss = DifferentiableGSRCSROperator(num_levels=num_levels)
+        self.ahicsr_loss = DifferentiableAHICSROperator(num_levels=num_levels)
 
     def forward(
         self,

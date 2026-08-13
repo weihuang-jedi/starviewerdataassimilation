@@ -107,6 +107,9 @@ class LogStateZarrDataset(Dataset):
         obs_gsrcsr_tb = np.full((7, self.num_nodes), 240.0, dtype=np.float32)
         obs_gsrcsr_mask = np.zeros((7, self.num_nodes), dtype=np.float32)
 
+        obs_ahicsr_tb = np.full((9, self.num_nodes), 240.0, dtype=np.float32)
+        obs_ahicsr_mask = np.zeros((9, self.num_nodes), dtype=np.float32)
+
         if not os.path.exists(self.obs_dir):
             return {
                 'obs_amsua_tb': torch.from_numpy(obs_amsua_tb),
@@ -268,6 +271,23 @@ class LogStateZarrDataset(Dataset):
                             obs_gsrcsr_tb[c_idx, n] = v
                             obs_gsrcsr_mask[c_idx, n] = 1.0
 
+                # Process AHICSR Observations
+                mask_ahicsr = (sensors == "ahicsr") & (vals > 100.0) & (vals < 350.0)
+                if np.any(mask_ahicsr):
+                    ch_ahicsr = channels[mask_ahicsr]
+                    val_ahicsr = vals[mask_ahicsr]
+                    lon_ahicsr = lons[mask_ahicsr]
+
+                    node_idx_ac = ((lon_ahicsr + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    node_idx_ac = np.clip(node_idx_ac, 0, self.num_nodes - 1)
+
+                    # AHICSR channels 7 through 15 -> mapped to 0..8
+                    for c, v, n in zip(ch_ahicsr, val_ahicsr, node_idx_ac):
+                        c_idx = c - 7
+                        if 0 <= c_idx < 9:
+                            obs_ahicsr_tb[c_idx, n] = v
+                            obs_ahicsr_mask[c_idx, n] = 1.0
+
                 ds_obs.close()
             except Exception:
                 pass
@@ -289,6 +309,8 @@ class LogStateZarrDataset(Dataset):
             'obs_gsrasr_mask': torch.from_numpy(obs_gsrasr_mask),
             'obs_gsrcsr_tb': torch.from_numpy(obs_gsrcsr_tb),
             'obs_gsrcsr_mask': torch.from_numpy(obs_gsrcsr_mask),
+            'obs_ahicsr_tb': torch.from_numpy(obs_ahicsr_tb),
+            'obs_ahicsr_mask': torch.from_numpy(obs_ahicsr_mask),
         }
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
@@ -350,4 +372,6 @@ class SyntheticAIDAStateDataset(Dataset):
             'obs_gsrasr_mask': torch.ones((10, self.num_nodes), dtype=torch.float32),
             'obs_gsrcsr_tb': torch.full((7, self.num_nodes), 240.0, dtype=torch.float32),
             'obs_gsrcsr_mask': torch.ones((7, self.num_nodes), dtype=torch.float32),
+            'obs_ahicsr_tb': torch.full((9, self.num_nodes), 240.0, dtype=torch.float32),
+            'obs_ahicsr_mask': torch.ones((9, self.num_nodes), dtype=torch.float32),
         }
