@@ -3,18 +3,19 @@
 train_aida_surrogate.py
 -----------------------
 AIDA GNN Surrogate Model Training Script for Icosahedral Atmospheric Grids.
-Integrated with HybridDynamicsLoss (Mid-Lat Geostrophic + Tropical Divergence)
-via M4MeshOperators sparse differential operators.
+Supports differentiable AMSU-A, IASI, HMS, ATMS, CrIS radiance loss
+integration with gradient accumulation for memory optimization.
 """
 
 import argparse
 import os
 import sys
+import yaml
 
-# Ensure parent directory is in Python path for 'models' package imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from models import (
@@ -26,38 +27,309 @@ from models import (
     M4MeshOperators,
     build_icosahedral_differential_operators,
 )
+from models.amsua import DifferentiableAMSUAOperator
+from models.iasi import DifferentiableIASIOperator
+from models.hms import DifferentiableHMSOperator
+from models.atms import DifferentiableATMSOperator
+from models.cris import DifferentiableCrISOperator
 
 
-def train_model(args):
-    print(f"[TRAIN] Beginning training for {args.epochs} epochs...", flush=True)
+def load_config(config_path: str) -> dict:
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"[ERROR] Config file not found at: '{config_path}'")
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def save_checkpoint(filepath: str, model, optimizer, epoch: int, cfg: dict, criterion):
+    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+    stats_dict = {}
+    for attr in ["mu_ln_t", "std_ln_t", "mu_ln_rho", "std_ln_rho", "mu_ln_p", "std_ln_p"]:
+        if hasattr(criterion, attr):
+            stats_dict[attr] = getattr(criterion, attr)
+
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config": cfg,
+        "stats": stats_dict
+    }, filepath)
+    print(f"[TRAIN] Checkpoint successfully saved to '{filepath}'", flush=True)
+
+
+def train_epoch(
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    edge_index,
+    graph_mesh_ops,
+    amsua_op, amsua_obs_err,
+    iasi_op, iasi_obs_err,
+    hms_op, hms_obs_err,
+    atms_op, atms_obs_err,
+    cris_op, cris_obs_err,
+    loss_cfg,
+    accum_steps: int = 4
+):
+    model.train()
+    epoch_losses = {}
+    num_batches = len(dataloader)
+    optimizer.zero_grad()
+
+    for batch_idx, batch_data in enumerate(dataloader):
+
+        if isinstance(batch_data, dict):
+            x_batch = batch_data['background'].to(device)
+            y_batch = batch_data['target'].to(device)
+            obs_amsua_tb = batch_data.get('obs_amsua_tb', None)
+            obs_amsua_mask = batch_data.get('obs_amsua_mask', None)
+            obs_iasi_tb = batch_data.get('obs_iasi_tb', None)
+            obs_iasi_mask = batch_data.get('obs_iasi_mask', None)
+            obs_hms_tb = batch_data.get('obs_hms_tb', None)
+            obs_hms_mask = batch_data.get('obs_hms_mask', None)
+            obs_atms_tb = batch_data.get('obs_atms_tb', None)
+            obs_atms_mask = batch_data.get('obs_atms_mask', None)
+            obs_cris_tb = batch_data.get('obs_cris_tb', None)
+            obs_cris_mask = batch_data.get('obs_cris_mask', None)
+            obs_conv_val = batch_data.get('obs_conv_val', None)
+            obs_conv_mask = batch_data.get('obs_conv_mask', None)
+        else:
+            x_batch = batch_data[0].to(device)
+            y_batch = batch_data[1].to(device)
+            obs_amsua_tb, obs_amsua_mask = None, None
+            obs_iasi_tb, obs_iasi_mask = None, None
+            obs_hms_tb, obs_hms_mask = None, None
+            obs_atms_tb, obs_atms_mask = None, None
+            obs_cris_tb, obs_cris_mask = None, None
+            obs_conv_val, obs_conv_mask = None, None
+
+        # GNN Forward Pass
+        pred = model(x_batch, edge_index)
+
+        # 1. Base Physical Loss
+        loss, metrics = criterion(
+            pred=pred,
+            target=y_batch,
+            edge_index=edge_index,
+            graph_mesh_ops=graph_mesh_ops
+        )
+        total_loss = loss
+
+        # Un-normalize physical profile fields
+        std_t = getattr(criterion, "std_ln_t", 1.0)
+        mu_t = getattr(criterion, "mu_ln_t", 0.0)
+        std_p = getattr(criterion, "std_ln_p", 1.0)
+        mu_p = getattr(criterion, "mu_ln_p", 0.0)
+
+        ln_T_phys = pred[:, 0, :, :].permute(0, 2, 1) * std_t + mu_t
+        ln_p_phys = pred[:, 6, :, :].permute(0, 2, 1) * std_p + mu_p
+
+        t_k = torch.clamp(torch.exp(ln_T_phys), min=180.0, max=330.0)
+        p_hpa = torch.clamp(torch.exp(ln_p_phys) / 100.0, min=0.01, max=1050.0)
+
+        # 2. Conventional Observation Loss
+        w_conv = loss_cfg.get("w_conv", 0.05)
+        if obs_conv_val is not None:
+            conv_val = obs_conv_val.to(device)
+            if obs_conv_mask is not None:
+                conv_m = obs_conv_mask.to(device)
+                loss_conv = torch.sum(((pred - conv_val) ** 2) * conv_m) / (torch.sum(conv_m) + 1e-8)
+            else:
+                loss_conv = F.mse_loss(pred, conv_val)
+        else:
+            loss_conv = F.mse_loss(pred[:, [0, 1, 2, 4, 6], :, :], y_batch[:, [0, 1, 2, 4, 6], :, :])
+
+        total_loss += (w_conv * loss_conv)
+        metrics["loss_conv"] = loss_conv.item()
+
+        # 3. AMSU-A Radiance Loss
+        w_rad_amsua = loss_cfg.get("w_rad", loss_cfg.get("w_rad_amsua", 0.01))
+        if obs_amsua_tb is not None:
+            tb_sim = amsua_op(t_k, p_hpa)
+            tb_obs = obs_amsua_tb.to(device)
+            if tb_sim.shape[1] != 15 and tb_sim.shape[2] == 15:
+                tb_sim = tb_sim.permute(0, 2, 1)
+            if tb_obs.shape[1] != 15 and tb_obs.shape[2] == 15:
+                tb_obs = tb_obs.permute(0, 2, 1)
+            err = amsua_obs_err.view(1, 15, 1)
+            innov = (tb_obs - tb_sim) / err
+            if obs_amsua_mask is not None:
+                m = obs_amsua_mask.to(device)
+                if m.shape[1] != 15 and m.shape[2] == 15:
+                    m = m.permute(0, 2, 1)
+                loss_rad_amsua = torch.sum((innov ** 2) * m) / (15.0 * torch.sum(m) + 1e-8)
+            else:
+                loss_rad_amsua = torch.mean(innov ** 2) / 15.0
+        else:
+            loss_rad_amsua = torch.tensor(0.0, device=device)
+        total_loss += (w_rad_amsua * loss_rad_amsua)
+        metrics["loss_rad_amsua"] = loss_rad_amsua.item()
+
+        # 4. IASI Radiance Loss
+        w_rad_iasi = loss_cfg.get("w_rad_iasi", 0.01)
+        if obs_iasi_tb is not None:
+            p_pa = p_hpa.permute(0, 2, 1) * 100.0
+            t_k_perm = t_k.permute(0, 2, 1)
+            tb_sim = iasi_op(t_k_perm, p_pa)
+            tb_obs = obs_iasi_tb.to(device)
+            if tb_obs.shape[1] != 30 and tb_obs.shape[2] == 30:
+                tb_obs = tb_obs.permute(0, 2, 1)
+            if tb_sim.shape[1] != 30 and tb_sim.shape[2] == 30:
+                tb_sim = tb_sim.permute(0, 2, 1)
+            err = iasi_obs_err.view(1, 30, 1)
+            innov = (tb_obs - tb_sim) / err
+            if obs_iasi_mask is not None:
+                m = obs_iasi_mask.to(device)
+                if m.shape[1] != 30 and m.shape[2] == 30:
+                    m = m.permute(0, 2, 1)
+                loss_rad_iasi = torch.sum((innov ** 2) * m) / (30.0 * torch.sum(m) + 1e-8)
+            else:
+                loss_rad_iasi = torch.mean(innov ** 2) / 30.0
+        else:
+            loss_rad_iasi = torch.tensor(0.0, device=device)
+        total_loss += (w_rad_iasi * loss_rad_iasi)
+        metrics["loss_rad_iasi"] = loss_rad_iasi.item()
+
+        # 5. HMS Radiance Loss
+        w_rad_hms = loss_cfg.get("w_rad_hms", 0.01)
+        if obs_hms_tb is not None:
+            p_pa = p_hpa.permute(0, 2, 1) * 100.0
+            t_k_perm = t_k.permute(0, 2, 1)
+            tb_sim = hms_op(t_k_perm, p_pa)
+            tb_obs = obs_hms_tb.to(device)
+            if tb_obs.shape[1] != 12 and tb_obs.shape[2] == 12:
+                tb_obs = tb_obs.permute(0, 2, 1)
+            if tb_sim.shape[1] != 12 and tb_sim.shape[2] == 12:
+                tb_sim = tb_sim.permute(0, 2, 1)
+            err = hms_obs_err.view(1, 12, 1)
+            innov = (tb_obs - tb_sim) / err
+            if obs_hms_mask is not None:
+                m = obs_hms_mask.to(device)
+                if m.shape[1] != 12 and m.shape[2] == 12:
+                    m = m.permute(0, 2, 1)
+                loss_rad_hms = torch.sum((innov ** 2) * m) / (12.0 * torch.sum(m) + 1e-8)
+            else:
+                loss_rad_hms = torch.mean(innov ** 2) / 12.0
+        else:
+            loss_rad_hms = torch.tensor(0.0, device=device)
+        total_loss += (w_rad_hms * loss_rad_hms)
+        metrics["loss_rad_hms"] = loss_rad_hms.item()
+
+        # 6. ATMS Radiance Loss
+        w_rad_atms = loss_cfg.get("w_rad_atms", 0.01)
+        if obs_atms_tb is not None:
+            p_pa = p_hpa.permute(0, 2, 1) * 100.0
+            t_k_perm = t_k.permute(0, 2, 1)
+            tb_sim = atms_op(t_k_perm, p_pa)
+            tb_obs = obs_atms_tb.to(device)
+            if tb_obs.shape[1] != 22 and tb_obs.shape[2] == 22:
+                tb_obs = tb_obs.permute(0, 2, 1)
+            if tb_sim.shape[1] != 22 and tb_sim.shape[2] == 22:
+                tb_sim = tb_sim.permute(0, 2, 1)
+            err = atms_obs_err.view(1, 22, 1)
+            innov = (tb_obs - tb_sim) / err
+            if obs_atms_mask is not None:
+                m = obs_atms_mask.to(device)
+                if m.shape[1] != 22 and m.shape[2] == 22:
+                    m = m.permute(0, 2, 1)
+                loss_rad_atms = torch.sum((innov ** 2) * m) / (22.0 * torch.sum(m) + 1e-8)
+            else:
+                loss_rad_atms = torch.mean(innov ** 2) / 22.0
+        else:
+            loss_rad_atms = torch.tensor(0.0, device=device)
+        total_loss += (w_rad_atms * loss_rad_atms)
+        metrics["loss_rad_atms"] = loss_rad_atms.item()
+
+        # 7. CrIS Radiance Loss
+        w_rad_cris = loss_cfg.get("w_rad_cris", 0.01)
+        if obs_cris_tb is not None:
+            p_pa = p_hpa.permute(0, 2, 1) * 100.0
+            t_k_perm = t_k.permute(0, 2, 1)
+            tb_sim = cris_op(t_k_perm, p_pa)
+            tb_obs = obs_cris_tb.to(device)
+            if tb_obs.shape[1] != 30 and tb_obs.shape[2] == 30:
+                tb_obs = tb_obs.permute(0, 2, 1)
+            if tb_sim.shape[1] != 30 and tb_sim.shape[2] == 30:
+                tb_sim = tb_sim.permute(0, 2, 1)
+            err = cris_obs_err.view(1, 30, 1)
+            innov = (tb_obs - tb_sim) / err
+            if obs_cris_mask is not None:
+                m = obs_cris_mask.to(device)
+                if m.shape[1] != 30 and m.shape[2] == 30:
+                    m = m.permute(0, 2, 1)
+                loss_rad_cris = torch.sum((innov ** 2) * m) / (30.0 * torch.sum(m) + 1e-8)
+            else:
+                loss_rad_cris = torch.mean(innov ** 2) / 30.0
+        else:
+            loss_rad_cris = torch.tensor(0.0, device=device)
+        total_loss += (w_rad_cris * loss_rad_cris)
+        metrics["loss_rad_cris"] = loss_rad_cris.item()
+
+        metrics["loss_total"] = total_loss.item()
+
+        if torch.isnan(total_loss):
+            print("[WARNING] NaN loss detected in batch! Skipping step...", flush=True)
+            continue
+
+        loss_accum = total_loss / accum_steps
+        loss_accum.backward()
+
+        if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == num_batches:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        if not epoch_losses:
+            epoch_losses = {k: 0.0 for k in metrics.keys()}
+
+        for k, v in metrics.items():
+            epoch_losses[k] += v / num_batches
+
+    return epoch_losses
+
+
+def train_model(cfg: dict):
+    paths = cfg["paths"]
+    mesh_cfg = cfg["mesh"]
+    model_cfg = cfg["model"]
+    train_cfg = cfg["training"]
+    loss_cfg = cfg["loss_weights"]
+
+    print(f"[TRAIN] Beginning training for {train_cfg['epochs']} epochs...", flush=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[TRAIN] Operating on compute device: {device}", flush=True)
 
-    # 1. Dataset Loading
-    if args.zarr and os.path.exists(args.zarr):
-        print(f"[TRAIN] Loading real dataset from Zarr: '{args.zarr}'", flush=True)
-        dataset = LogStateZarrDataset(zarr_path=args.zarr)
-        num_nodes = dataset.num_nodes
-        
-        # Extract lat/lon coordinates from dataset or fallback to mesh generator
-        if hasattr(dataset, "latitudes") and hasattr(dataset, "longitudes"):
-            lat_deg = torch.tensor(dataset.latitudes, dtype=torch.float32)
-            lon_deg = torch.tensor(dataset.longitudes, dtype=torch.float32)
+    zarr_path = paths["zarr_path"]
+    if zarr_path and os.path.exists(zarr_path):
+        print(f"[TRAIN] Loading dataset from Zarr: '{zarr_path}'", flush=True)
+        obs_dir = paths.get("obs_dir", None)
+        if obs_dir and os.path.exists(obs_dir):
+            print(f"[TRAIN] Loading dataset from Obs: '{obs_dir}'", flush=True)
+            dataset = LogStateZarrDataset(zarr_path=zarr_path, obs_dir=obs_dir)
         else:
-            # Generate synthetic coordinates evenly distributed on sphere
-            lat_deg = torch.linspace(-90, 90, num_nodes)
-            lon_deg = torch.linspace(-180, 180, num_nodes)
+            dataset = LogStateZarrDataset(zarr_path=zarr_path)
+        num_nodes = dataset.num_nodes
+        lat_deg = torch.tensor(dataset.latitudes, dtype=torch.float32) if hasattr(dataset, "latitudes") else torch.linspace(-90, 90, num_nodes)
+        lon_deg = torch.tensor(dataset.longitudes, dtype=torch.float32) if hasattr(dataset, "longitudes") else torch.linspace(-180, 180, num_nodes)
     else:
-        print(f"[WARNING] Zarr dataset path '{args.zarr}' not found. Falling back to synthetic dataset.", flush=True)
-        dataset = SyntheticAIDAStateDataset(num_samples=args.samples, num_nodes=args.num_nodes, num_levels=args.levels)
-        num_nodes = args.num_nodes
+        dataset = SyntheticAIDAStateDataset(
+            num_samples=mesh_cfg["samples"],
+            num_nodes=mesh_cfg["num_nodes"],
+            num_levels=mesh_cfg["num_levels"]
+        )
+        num_nodes = mesh_cfg["num_nodes"]
         lat_deg = torch.linspace(-90, 90, num_nodes)
         lon_deg = torch.linspace(-180, 180, num_nodes)
 
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=train_cfg["batch_size"], shuffle=True)
 
-    # 2. Graph Edges & Sparse Differential Operators Initialization
-    edge_index = generate_or_load_edge_index(num_nodes=num_nodes, edge_file=args.edges).to(device)
+    edge_index = generate_or_load_edge_index(
+        num_nodes=num_nodes,
+        edge_file=paths["edges_path"]
+    ).to(device)
 
     print("[TRAIN] Pre-computing M4 mesh sparse differential operators (Grad/Div)...", flush=True)
     Gx_sparse, Gy_sparse = build_icosahedral_differential_operators(
@@ -70,149 +342,100 @@ def train_model(args):
         Gy_sparse=Gy_sparse,
         lat_deg=lat_deg
     ).to(device)
-    print("[TRAIN] Sparse differential operators successfully initialized on GPU.", flush=True)
 
-    # 3. Model & Loss Instantiation
+    num_levels = mesh_cfg.get("num_levels", 32)
+
     model = IcosahedralGNNSurrogate(
         in_vars=dataset.num_vars if hasattr(dataset, "num_vars") else 7,
-        hidden_dim=args.hidden_dim
+        hidden_dim=model_cfg["hidden_dim"],
+        num_levels=num_levels
     ).to(device)
 
-    criterion = AIDASurrogateLoss(
-        lambda_laplacian_p=args.lambda_laplacian_p,
-        weight_grad_state=args.weight_grad_state,
-        lambda_asym_p=args.lambda_asym_p,
-        weight_state_eq=args.weight_state_eq,
-        weight_q_log=args.weight_q_log,
-        weight_joint_bias=args.weight_joint_bias,
-        lambda_dyn=args.lambda_dyn,
-        tau_min_p=args.tau_min_p
-    ).to(device)
+    criterion = AIDASurrogateLoss(num_levels=num_levels, **loss_cfg).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Radiance Operators
+    amsua_op = DifferentiableAMSUAOperator().to(device)
+    amsua_obs_err = torch.tensor([
+        2.5, 2.2, 1.2, 0.6, 0.3, 0.25, 0.25, 0.25,
+        0.25, 0.35, 0.55, 0.8, 1.2, 1.8, 3.5
+    ], dtype=torch.float32, device=device)
 
-    print(f"[TRAIN] Dynamics weight (lambda_dyn): {args.lambda_dyn}", flush=True)
-    print(f"[TRAIN] Pressure Laplacian weight (lambda_laplacian_p): {args.lambda_laplacian_p}", flush=True)
-    os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
+    iasi_op = DifferentiableIASIOperator(num_levels=num_levels).to(device)
+    iasi_obs_err = iasi_op.obs_errors.to(device)
 
-    # 4. Training Loop
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        epoch_losses = {}  # Dynamic metrics accumulator
+    hms_op = DifferentiableHMSOperator(num_levels=num_levels).to(device)
+    hms_obs_err = hms_op.obs_errors.to(device)
 
-        for x_batch, y_batch in dataloader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+    atms_op = DifferentiableATMSOperator(num_levels=num_levels).to(device)
+    atms_obs_err = atms_op.obs_errors.to(device)
 
-            optimizer.zero_grad()
-            pred = model(x_batch, edge_index)
+    cris_op = DifferentiableCrISOperator(num_levels=num_levels).to(device)
+    cris_obs_err = cris_op.obs_errors.to(device)
 
-            # Compute loss with M4MeshOperators sparse matrices
-            loss, metrics = criterion(
-                pred=pred,
-                target=y_batch,
-                edge_index=edge_index,
-                graph_mesh_ops=graph_mesh_ops
-            )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=train_cfg["lr"],
+        weight_decay=train_cfg.get("weight_decay", 1e-4)
+    )
 
-            if torch.isnan(loss):
-                print("[WARNING] NaN loss detected in batch! Skipping step...", flush=True)
-                continue
+    print(f"[TRAIN] AMSU-A Radiance Weight: {loss_cfg.get('w_rad_amsua', 0.01)}", flush=True)
+    print(f"[TRAIN] IASI Radiance Weight  : {loss_cfg.get('w_rad_iasi', 0.01)}", flush=True)
+    print(f"[TRAIN] HMS Radiance Weight   : {loss_cfg.get('w_rad_hms', 0.01)}", flush=True)
+    print(f"[TRAIN] ATMS Radiance Weight  : {loss_cfg.get('w_rad_atms', 0.01)}", flush=True)
+    print(f"[TRAIN] CrIS Radiance Weight  : {loss_cfg.get('w_rad_cris', 0.01)}", flush=True)
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+    checkpoint_path = paths["checkpoint_path"]
+    save_interval = train_cfg.get("save_interval", 5)
+    epochs = train_cfg["epochs"]
+    log_interval = train_cfg["log_interval"]
+    accum_steps = train_cfg.get("accum_steps", 4)
 
-            # Dynamic initialization on first batch
-            if not epoch_losses:
-                epoch_losses = {k: 0.0 for k in metrics.keys()}
+    for epoch in range(1, epochs + 1):
+        epoch_losses = train_epoch(
+            model=model,
+            dataloader=dataloader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            edge_index=edge_index,
+            graph_mesh_ops=graph_mesh_ops,
+            amsua_op=amsua_op, amsua_obs_err=amsua_obs_err,
+            iasi_op=iasi_op, iasi_obs_err=iasi_obs_err,
+            hms_op=hms_op, hms_obs_err=hms_obs_err,
+            atms_op=atms_op, atms_obs_err=atms_obs_err,
+            cris_op=cris_op, cris_obs_err=cris_obs_err,
+            loss_cfg=loss_cfg,
+            accum_steps=accum_steps
+        )
 
-            for k, v in metrics.items():
-                epoch_losses[k] += v / len(dataloader)
-
-        # Logging
-        if epoch % args.log_interval == 0 or epoch == args.epochs:
+        if epoch % log_interval == 0 or epoch == epochs:
             print(
-                f"Epoch {epoch:03d}/{args.epochs:03d} | "
-                f"Total: {epoch_losses['loss_total']:.4f} | "
-                f"MSE: {epoch_losses['loss_mse']:.4f} | "
-                f"Laplacian_P: {epoch_losses['loss_laplacian_p']:.5f} | "
-                f"Dyn_Total: {epoch_losses.get('loss_dynamics_total', 0.0):.5f} | "
-                f"Geo_Loss: {epoch_losses.get('loss_geostrophic', 0.0):.5f} | "
-                f"Trop_Div: {epoch_losses.get('loss_tropical_div', 0.0):.5f} | "
-                f"Q_Log: {epoch_losses.get('loss_q_log', 0.0):.4f}",
+                f"\n" + "=" * 110 + "\n"
+                f" EPOCH {epoch:03d}/{epochs:03d} TRAINING LOSS BREAKDOWN\n"
+                f" " + "-" * 108 + "\n"
+                f"  TOTAL LOSS    : {epoch_losses.get('loss_total', 0.0):12.5e} | STATE MSE     : {epoch_losses.get('loss_mse', 0.0):12.5e}\n"
+                f"  CONV OBS LOSS : {epoch_losses.get('loss_conv', 0.0):12.5e} | LAPLACIAN P   : {epoch_losses.get('loss_laplacian_p', 0.0):12.5e}\n"
+                f"  AMSU-A RAD    : {epoch_losses.get('loss_rad_amsua', 0.0):12.5e} | IASI RAD      : {epoch_losses.get('loss_rad_iasi', 0.0):12.5e}\n"
+                f"  HMS RAD       : {epoch_losses.get('loss_rad_hms', 0.0):12.5e} | ATMS RAD      : {epoch_losses.get('loss_rad_atms', 0.0):12.5e}\n"
+                f"  CrIS RAD      : {epoch_losses.get('loss_rad_cris', 0.0):12.5e}\n"
+                f"  DYNAMICS LOSS : {epoch_losses.get('loss_dynamics_total', 0.0):12.5e} | JOINT BIAS    : {epoch_losses.get('loss_joint_bias', 0.0):12.5e}\n"
+                f"=" * 110,
                 flush=True
             )
 
-    # 5. Checkpoint Saving
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "args": vars(args),
-        "stats": {
-            "mu_ln_t": criterion.mu_ln_t,
-            "std_ln_t": criterion.std_ln_t,
-            "mu_ln_rho": criterion.mu_ln_rho,
-            "std_ln_rho": criterion.std_ln_rho,
-            "mu_ln_p": criterion.mu_ln_p,
-            "std_ln_p": criterion.std_ln_p,
-        }
-    }, args.checkpoint)
-    print(f"[TRAIN] Checkpoint successfully saved to '{args.checkpoint}'", flush=True)
+        if epoch % save_interval == 0 or epoch == epochs:
+            base_name, ext = os.path.splitext(checkpoint_path)
+            epoch_ckpt_path = f"{base_name}_epoch_{epoch:03d}{ext}"
+            save_checkpoint(epoch_ckpt_path, model, optimizer, epoch, cfg, criterion)
+            save_checkpoint(checkpoint_path, model, optimizer, epoch, cfg, criterion)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train AIDA GNN Surrogate Model")
-
-    parser.add_argument("--zarr", type=str, default="../data/icosahedral_2023_logstate.zarr", help="Path to input Zarr dataset")
-    parser.add_argument("--edges", type=str, default="../data/graph/icosahedral_edge_index_m4.pt", help="Path to precomputed edge tensor (.pt)")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/aida_gnn_surrogate_logstate.pt", help="Checkpoint output path")
-
-    parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs")
-    parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-
-    parser.add_argument("--num-nodes", "--num_nodes", dest="num_nodes", type=int, default=2562)
-    parser.add_argument("--levels", type=int, default=8)
-    parser.add_argument("--samples", type=int, default=80)
-    parser.add_argument("--hidden-dim", "--hidden_dim", dest="hidden_dim", type=int, default=64)
-
-    parser.add_argument(
-        "--lambda-laplacian-p", "--lambda_laplacian_p",
-        dest="lambda_laplacian_p", type=float, default=0.18,
-        help="2nd-order graph Laplacian weight for pressure"
-    )
-    parser.add_argument(
-        "--weight-grad-state", "--weight_grad_state",
-        dest="weight_grad_state", type=float, default=0.20,
-        help="State gradient matching weight"
-    )
-    parser.add_argument(
-        "--weight-state-eq", "--weight_state_eq",
-        dest="weight_state_eq", type=float, default=0.10,
-        help="Ideal gas residual weight"
-    )
-    parser.add_argument(
-        "--weight-q-log", "--weight_q_log",
-        dest="weight_q_log", type=float, default=0.15,
-        help="Log-scale loss weight for specific humidity (q)"
-    )
-    parser.add_argument(
-        "--weight-joint-bias", "--weight_joint_bias",
-        dest="weight_joint_bias", type=float, default=0.05,
-        help="Joint p and T mean bias penalty weight"
-    )
-    parser.add_argument(
-        "--lambda-dyn", "--lambda_dyn",
-        dest="lambda_dyn", type=float, default=0.01,
-        help="Hybrid dynamics constraint weight (Geostrophic + Tropical Div)"
-    )
-    parser.add_argument("--lambda-asym-p", "--lambda_asym_p", dest="lambda_asym_p", type=float, default=0.25, help="Asymmetric pressure penalty weight")
-    parser.add_argument("--tau-min-p", "--tau_min_p", dest="tau_min_p", type=float, default=-0.2894, help="Low-pressure barrier threshold")
-
-    parser.add_argument("--log-interval", "--log_interval", dest="log_interval", type=int, default=2, help="Logging epoch frequency")
-
+    parser = argparse.ArgumentParser(description="Train AIDA GNN Surrogate Model via YAML Config")
+    parser.add_argument("-c", "--config", type=str, default="configs/config.yaml", help="Path to YAML config")
     args = parser.parse_args()
-    train_model(args)
+    cfg = load_config(args.config)
+    train_model(cfg)
 
 
 if __name__ == "__main__":

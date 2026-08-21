@@ -1,7 +1,22 @@
+#!/usr/bin/env python3
+"""
+models/loss.py
+--------------
+Multi-Component Physical & Satellite Radiance Loss Engine for AIDA GNN Surrogate Model.
+Includes Geostrophic/Tropical Dynamics, Pressure Laplacian, Asymmetric Barriers,
+Thermodynamic State Equation, and Differentiable Radiance Innovation Losses (AMSU-A + IASI).
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+from models.amsua import DifferentiableAMSUAOperator
+from models.iasi import DifferentiableIASIOperator
+from models.hms import DifferentiableHMSOperator
+from models.atms import DifferentiableATMSOperator
+from models.cris import DifferentiableCrISOperator
 
 
 def build_icosahedral_differential_operators(
@@ -194,8 +209,8 @@ class HybridDynamicsLoss(nn.Module):
 
 class AIDASurrogateLoss(nn.Module):
     """
-    Refined AIDASurrogateLoss module targeting temperature cold bias (-7.02 K)
-    and pressure pattern correlation skill (p ACC).
+    Unified AIDASurrogateLoss module targeting physical constraints,
+    spatial pattern correlations, and satellite radiance innovations.
     """
     def __init__(
         self,
@@ -204,23 +219,32 @@ class AIDASurrogateLoss(nn.Module):
         v_idx: int = 2,
         q_idx: int = 4,
         p_idx: int = 6,
-        sharp_var_indices: list[int] = [0, 1, 2, 4, 6],  # Explicitly excludes w (idx 3)
+        sharp_var_indices: list[int] = [0, 1, 2, 4, 6],
         weight_mse: float = 1.0,
+        w_mse: float = 1.0,
         lambda_laplacian_p: float = 0.18,
         weight_grad_state: float = 0.25,
-        lambda_p_acc: float = 0.15,            # New: Pressure pattern ACC loss weight
+        lambda_p_acc: float = 0.15,
         lambda_asym_p: float = 0.35,
         weight_state_eq: float = 0.12,
         weight_q_log: float = 0.25,
+        w_rad_amsua: float = 0.01,
+        w_rad_iasi: float = 0.01,
+        w_rad_hms: float = 0.01,
+        w_rad_atms: float = 0.01,  # Added ATMS loss weight
+        w_rad_cris: float = 0.01,  # Added CrIS loss weight
         lambda_asym_q: float = 0.50,
         lambda_dyn: float = 0.01,
+        w_dyn: float = 0.01,
         q_floor: float = 1e-7,
         weight_joint_bias: float = 0.10,
         tau_min_p: float = 0.08,
         mu_ln_t: float = 5.5, std_ln_t: float = 0.2,
         mu_ln_rho: float = -0.5, std_ln_rho: float = 0.5,
         mu_ln_p: float = 11.5, std_ln_p: float = 0.3,
-        R_d: float = 287.058
+        R_d: float = 287.058,
+        num_levels: int = 32,
+        **kwargs
     ):
         super().__init__()
         self.t_idx = t_idx
@@ -230,7 +254,7 @@ class AIDASurrogateLoss(nn.Module):
         self.p_idx = p_idx
         self.sharp_var_indices = sharp_var_indices
 
-        self.weight_mse = weight_mse
+        self.weight_mse = w_mse if w_mse != 1.0 else weight_mse
         self.lambda_laplacian_p = lambda_laplacian_p
         self.weight_grad_state = weight_grad_state
         self.lambda_p_acc = lambda_p_acc
@@ -238,10 +262,16 @@ class AIDASurrogateLoss(nn.Module):
         self.weight_state_eq = weight_state_eq
         self.weight_q_log = weight_q_log
         self.lambda_asym_q = lambda_asym_q
-        self.lambda_dyn = lambda_dyn
+        self.lambda_dyn = lambda_dyn if lambda_dyn != 0.01 else w_dyn
         self.q_floor = q_floor
         self.weight_joint_bias = weight_joint_bias
         self.tau_min_p = tau_min_p
+
+        self.w_rad_amsua = w_rad_amsua
+        self.w_rad_iasi = w_rad_iasi
+        self.w_rad_hms = w_rad_hms
+        self.w_rad_atms = w_rad_atms
+        self.w_rad_cris = w_rad_cris
 
         self.hybrid_dyn = HybridDynamicsLoss(lat_trans_center_deg=15.0)
 
@@ -251,6 +281,12 @@ class AIDASurrogateLoss(nn.Module):
         self.register_buffer("ln_R_d", torch.log(torch.tensor(R_d)))
 
         self.mse_fn = nn.MSELoss()
+
+        self.amsua_loss = DifferentiableAMSUAOperator(num_levels=num_levels)
+        self.iasi_loss = DifferentiableIASIOperator(num_levels=num_levels)
+        self.hms_loss = DifferentiableHMSOperator(num_levels=num_levels)
+        self.atms_loss = DifferentiableATMSOperator(num_levels=num_levels)
+        self.cris_loss = DifferentiableCrISOperator(num_levels=num_levels)
 
     def forward(
         self,
@@ -285,7 +321,7 @@ class AIDASurrogateLoss(nn.Module):
         p_target = target[:, self.p_idx, :, :]
         p_pred_anon = p_pred - torch.mean(p_pred, dim=-1, keepdim=True)
         p_true_anon = p_target - torch.mean(p_target, dim=-1, keepdim=True)
-        
+
         cos_sim_p = F.cosine_similarity(p_pred_anon.flatten(1), p_true_anon.flatten(1), dim=-1)
         loss_p_acc = torch.mean(1.0 - cos_sim_p)
 
@@ -320,19 +356,18 @@ class AIDASurrogateLoss(nn.Module):
         q_violation = F.relu(self.q_floor - q_raw_pred)
         loss_asym_q = torch.mean(torch.square(q_violation))
 
-        # 8. Enhanced Joint Mean Bias Penalty (Increased Temperature Weight: 1.0 -> 5.0)
+        # 8. Enhanced Joint Mean Bias Penalty
         bias_p = torch.abs(torch.mean(p_pred) - torch.mean(target[:, self.p_idx, :, :]))
         bias_t = torch.abs(torch.mean(pred[:, self.t_idx, :, :]) - torch.mean(target[:, self.t_idx, :, :]))
         bias_q = torch.abs(torch.mean(pred[:, self.q_idx, :, :]) - torch.mean(target[:, self.q_idx, :, :]))
-        
-        # Weighted joint mean bias penalty (bias_t weight scaled to eliminate -7.02 K drift)
+
         loss_joint_bias = bias_p + 5.0 * bias_t + 50.0 * bias_q
 
         # 9. Hybrid Dynamics Loss Integration
         if graph_mesh_ops is not None:
-            u_2d = pred[:, self.u_idx, :, :].mean(dim=1)  # [B, N]
-            v_2d = pred[:, self.v_idx, :, :].mean(dim=1)  # [B, N]
-            p_2d = pred[:, self.p_idx, :, :].mean(dim=1)  # [B, N]
+            u_2d = pred[:, self.u_idx, :, :].mean(dim=1)
+            v_2d = pred[:, self.v_idx, :, :].mean(dim=1)
+            p_2d = pred[:, self.p_idx, :, :].mean(dim=1)
 
             grad_px, grad_py = graph_mesh_ops.compute_gradient(p_2d)
             div_v = graph_mesh_ops.compute_divergence(u_2d, v_2d)

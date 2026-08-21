@@ -110,6 +110,9 @@ def main():
         vmin = min(np.nanmin(bg_slice), np.nanmin(an_slice))
         vmax = max(np.nanmax(bg_slice), np.nanmax(an_slice))
 
+        print(f"backgrnd: {var} min: {np.nanmin(bg_slice)}, max: {np.nanmax(bg_slice)}")
+        print(f"analysis: {var} min: {np.nanmin(an_slice)}, max: {np.nanmax(an_slice)}")
+
         max_abs_inc = np.nanmax(np.abs(inc_slice))
         if max_abs_inc == 0 or np.isnan(max_abs_inc):
             max_abs_inc = 1.0

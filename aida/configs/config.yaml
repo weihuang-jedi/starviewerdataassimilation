@@ -1,0 +1,50 @@
+# =============================================================================
+# AIDA GNN Surrogate Configuration File
+# =============================================================================
+
+paths:
+  zarr_path: "../data/icosahedral_logstate.zarr"
+  edges_path: "../data/graph/icosahedral_edge_index_m4.pt"
+  checkpoint_path: "checkpoints/aida_gnn_surrogate_logstate.pt"
+  obs_dir: "conv_amsua_iasi_hms_atms_cris_2024"
+
+mesh:
+  num_nodes: 2562
+  num_levels: 32
+  samples: 1464
+
+model:
+  hidden_dim: 128
+  num_layers: 4
+
+training:
+  epochs: 35
+  batch_size: 4       # Lowered from 16 to 4 to prevent CUDA OOM
+  accum_steps: 4      # Gradient accumulation steps (Effective batch size = 16)
+  lr: 0.0005
+  weight_decay: 0.0001
+  log_interval: 1
+  save_interval: 5
+
+loss_weights:
+  # Base MSE & Physics Constraints
+  w_mse: 1.0
+  w_conv: 0.05
+  lambda_dyn: 0.01
+  lambda_laplacian_p: 0.18
+  weight_grad_state: 0.25
+  lambda_p_acc: 0.15
+  lambda_asym_p: 0.35
+  weight_state_eq: 0.12
+  weight_q_log: 0.25
+  lambda_asym_q: 0.50
+  weight_joint_bias: 0.10
+  tau_min_p: 0.08
+
+  # Differentiable Satellite Radiance Loss Weights
+  w_rad: 0.01          # Legacy fallback for AMSU-A
+  w_rad_amsua: 0.01    # AMSU-A Microwave Sounder Weight
+  w_rad_iasi: 0.01     # IASI Hyperspectral Infrared Weight
+  w_rad_hms: 0.01      # HMS Sounder Weight
+  w_rad_atms: 0.01     # ATMS Microwave Sounder Weight
+  w_rad_cris: 0.01     # CrIS Hyperspectral Infrared Sounder Weight
