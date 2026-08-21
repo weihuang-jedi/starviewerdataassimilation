@@ -10,6 +10,7 @@
 
 set -x
 
+#cd /scratch3/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data
 cd /scratch5/purged/Wei.Huang/src/starviewerdataassimilation/data
 source ../svg.env
 
@@ -17,4 +18,9 @@ source ../svg.env
 #python fetch_nnja_amsua_iasi_obs.py
 #python fetch_nnja_amsua_iasi_hms.py
 #python fetch_conv_amsua_iasi_hms_atms.py
-python fetch_conv_amsua_iasi_hms_atms_cris.py
+#python fetch_conv_amsua_iasi_hms_atms_cris.py
+#python fetch_conv_amsua_iasi_hms_atms_cris_seviri.py
+#python fetch_conv_amsua_iasi_hms_atms_cris_seviri_gsrasr.py
+#python fetch_conv_amsua_iasi_hms_atms_cris_seviri_gsrasr_gsrcsr.py
+python fetch_all_nnja_data.py
+

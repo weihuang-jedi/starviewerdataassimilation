@@ -98,6 +98,18 @@ class LogStateZarrDataset(Dataset):
         obs_cris_tb = np.full((30, self.num_nodes), 240.0, dtype=np.float32)
         obs_cris_mask = np.zeros((30, self.num_nodes), dtype=np.float32)
 
+        obs_seviri_tb = np.full((8, self.num_nodes), 240.0, dtype=np.float32)
+        obs_seviri_mask = np.zeros((8, self.num_nodes), dtype=np.float32)
+
+        obs_gsrasr_tb = np.full((10, self.num_nodes), 240.0, dtype=np.float32)
+        obs_gsrasr_mask = np.zeros((10, self.num_nodes), dtype=np.float32)
+
+        obs_gsrcsr_tb = np.full((7, self.num_nodes), 240.0, dtype=np.float32)
+        obs_gsrcsr_mask = np.zeros((7, self.num_nodes), dtype=np.float32)
+
+        obs_ahicsr_tb = np.full((9, self.num_nodes), 240.0, dtype=np.float32)
+        obs_ahicsr_mask = np.zeros((9, self.num_nodes), dtype=np.float32)
+
         if not os.path.exists(self.obs_dir):
             return {
                 'obs_amsua_tb': torch.from_numpy(obs_amsua_tb),
@@ -207,6 +219,75 @@ class LogStateZarrDataset(Dataset):
                             obs_cris_tb[c_idx, n] = v
                             obs_cris_mask[c_idx, n] = 1.0
 
+                # Process SEVIRI Observations
+                mask_seviri = (sensors == "seviri") & (vals > 100.0) & (vals < 350.0)
+                if np.any(mask_seviri):
+                    ch_seviri = channels[mask_seviri]
+                    val_seviri = vals[mask_seviri]
+                    lon_seviri = lons[mask_seviri]
+
+                    node_idx_s = ((lon_seviri + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    node_idx_s = np.clip(node_idx_s, 0, self.num_nodes - 1)
+
+                    # SEVIRI uses channels 4 through 11 -> mapped to 0..7
+                    for c, v, n in zip(ch_seviri, val_seviri, node_idx_s):
+                        c_idx = c - 4
+                        if 0 <= c_idx < 8:
+                            obs_seviri_tb[c_idx, n] = v
+                            obs_seviri_mask[c_idx, n] = 1.0
+
+                # Process GSRASR Observations
+                mask_gsrasr = (sensors == "gsrasr") & (vals > 100.0) & (vals < 350.0)
+                if np.any(mask_gsrasr):
+                    ch_gsrasr = channels[mask_gsrasr]
+                    val_gsrasr = vals[mask_gsrasr]
+                    lon_gsrasr = lons[mask_gsrasr]
+
+                    node_idx_g = ((lon_gsrasr + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    node_idx_g = np.clip(node_idx_g, 0, self.num_nodes - 1)
+
+                    # GSRASR uses channels 7 through 16 -> mapped to 0..9
+                    for c, v, n in zip(ch_gsrasr, val_gsrasr, node_idx_g):
+                        c_idx = c - 7
+                        if 0 <= c_idx < 10:
+                            obs_gsrasr_tb[c_idx, n] = v
+                            obs_gsrasr_mask[c_idx, n] = 1.0
+
+                # Process GSRCSR Observations
+                mask_gsrcsr = (sensors == "gsrcsr") & (vals > 100.0) & (vals < 350.0)
+                if np.any(mask_gsrcsr):
+                    ch_gsrcsr = channels[mask_gsrcsr]
+                    val_gsrcsr = vals[mask_gsrcsr]
+                    lon_gsrcsr = lons[mask_gsrcsr]
+
+                    node_idx_gc = ((lon_gsrcsr + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    node_idx_gc = np.clip(node_idx_gc, 0, self.num_nodes - 1)
+
+                    # Channel mapping for GSRCSR [8, 9, 10, 12, 13, 14, 15] -> 0..6
+                    channel_map = {8: 0, 9: 1, 10: 2, 12: 3, 13: 4, 14: 5, 15: 6}
+                    for c, v, n in zip(ch_gsrcsr, val_gsrcsr, node_idx_gc):
+                        if c in channel_map:
+                            c_idx = channel_map[c]
+                            obs_gsrcsr_tb[c_idx, n] = v
+                            obs_gsrcsr_mask[c_idx, n] = 1.0
+
+                # Process AHICSR Observations
+                mask_ahicsr = (sensors == "ahicsr") & (vals > 100.0) & (vals < 350.0)
+                if np.any(mask_ahicsr):
+                    ch_ahicsr = channels[mask_ahicsr]
+                    val_ahicsr = vals[mask_ahicsr]
+                    lon_ahicsr = lons[mask_ahicsr]
+
+                    node_idx_ac = ((lon_ahicsr + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    node_idx_ac = np.clip(node_idx_ac, 0, self.num_nodes - 1)
+
+                    # AHICSR channels 7 through 15 -> mapped to 0..8
+                    for c, v, n in zip(ch_ahicsr, val_ahicsr, node_idx_ac):
+                        c_idx = c - 7
+                        if 0 <= c_idx < 9:
+                            obs_ahicsr_tb[c_idx, n] = v
+                            obs_ahicsr_mask[c_idx, n] = 1.0
+
                 ds_obs.close()
             except Exception:
                 pass
@@ -222,6 +303,14 @@ class LogStateZarrDataset(Dataset):
             'obs_atms_mask': torch.from_numpy(obs_atms_mask),
             'obs_cris_tb': torch.from_numpy(obs_cris_tb),
             'obs_cris_mask': torch.from_numpy(obs_cris_mask),
+            'obs_seviri_tb': torch.from_numpy(obs_seviri_tb),
+            'obs_seviri_mask': torch.from_numpy(obs_seviri_mask),
+            'obs_gsrasr_tb': torch.from_numpy(obs_gsrasr_tb),
+            'obs_gsrasr_mask': torch.from_numpy(obs_gsrasr_mask),
+            'obs_gsrcsr_tb': torch.from_numpy(obs_gsrcsr_tb),
+            'obs_gsrcsr_mask': torch.from_numpy(obs_gsrcsr_mask),
+            'obs_ahicsr_tb': torch.from_numpy(obs_ahicsr_tb),
+            'obs_ahicsr_mask': torch.from_numpy(obs_ahicsr_mask),
         }
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
@@ -277,4 +366,12 @@ class SyntheticAIDAStateDataset(Dataset):
             'obs_atms_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
             'obs_cris_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
             'obs_cris_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
+            'obs_seviri_tb': torch.full((8, self.num_nodes), 240.0, dtype=torch.torch.float32),
+            'obs_seviri_mask': torch.ones((8, self.num_nodes), dtype=torch.float32),
+            'obs_gsrasr_tb': torch.full((10, self.num_nodes), 240.0, dtype=torch.float32),
+            'obs_gsrasr_mask': torch.ones((10, self.num_nodes), dtype=torch.float32),
+            'obs_gsrcsr_tb': torch.full((7, self.num_nodes), 240.0, dtype=torch.float32),
+            'obs_gsrcsr_mask': torch.ones((7, self.num_nodes), dtype=torch.float32),
+            'obs_ahicsr_tb': torch.full((9, self.num_nodes), 240.0, dtype=torch.float32),
+            'obs_ahicsr_mask': torch.ones((9, self.num_nodes), dtype=torch.float32),
         }
