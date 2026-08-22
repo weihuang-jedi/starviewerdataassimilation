@@ -130,11 +130,15 @@ def train_epoch(
         pred = model(x_batch, edge_index)
 
         # 1. Base Physical Loss
+        # Inside train_epoch() in scripts/train_aida_surrogate.py
         loss, metrics = criterion(
             pred=pred,
             target=y_batch,
             edge_index=edge_index,
-            graph_mesh_ops=graph_mesh_ops
+            graph_mesh_ops=graph_mesh_ops,
+            valid_mask=valid_mask,
+            h_3d=h_3d,           # Pass 3D height profile for exponential boundary layer weighting
+            static_topo=static_topo # Pass static topo for surface drag penalty
         )
         total_loss = loss
 
@@ -481,11 +485,20 @@ def train_model(cfg: dict):
     ).to(device)
 
     num_levels = mesh_cfg.get("num_levels", 32)
+    num_layers=model_cfg.get("num_layers", 4)
+    in_vars = model_cfg.get("in_vars", 14)
+    out_vars = model_cfg.get("out_vars", 7)
+
+    # MUST BE 4: [Elevation, Land-Sea Mask, Roughness_z0, cos_SZA]
+    num_static_feats = model_cfg.get("num_static_feats", 4)
 
     model = IcosahedralGNNSurrogate(
-        in_vars=dataset.num_vars if hasattr(dataset, "num_vars") else 7,
+        in_vars=in_vars,
+        out_vars=out_vars,
+        num_static_feats=num_static_feats,
         hidden_dim=model_cfg["hidden_dim"],
-        num_levels=num_levels
+        num_levels=num_levels,
+        num_layers=num_layers
     ).to(device)
 
     criterion = AIDASurrogateLoss(num_levels=num_levels, **loss_cfg).to(device)

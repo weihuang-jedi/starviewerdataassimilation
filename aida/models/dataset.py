@@ -2,376 +2,273 @@
 """
 models/dataset.py
 -----------------
-Dataset wrappers for multi-variable Zarr stores and unified satellite/conventional
-observations (AMSU-A + IASI) for AIDA AI-DA surrogate training.
+Dataset Loaders for AIDA GNN Surrogate Model Training.
+Extracts 3D dynamic atmospheric log-state fields, 3D terrain-following geometric
+height profiles (h_3d), 2D static topography features (static_topo), dynamic
+Solar Zenith Angle cos(SZA) forcing, and Surface Roughness z0 from Zarr datasets.
 """
 
 import os
 import glob
 import re
 import numpy as np
+import xarray as xr
 import torch
 from torch.utils.data import Dataset
-import xarray as xr
+from datetime import datetime
 
-LOG_STATE_VARS = [
-    'ln_t_icosahedral',
-    'u_icosahedral',
-    'v_icosahedral',
-    'w_icosahedral',
-    'q_icosahedral',
-    'ln_rho_icosahedral',
-    'ln_p_icosahedral'
-]
+
+def compute_solar_zenith_angle(lats_deg: np.ndarray, lons_deg: np.ndarray, timestamp_unix: float) -> np.ndarray:
+    """Computes cosine of Solar Zenith Angle cos(SZA) in [0.0, 1.0] across mesh nodes."""
+    dt = datetime.utcfromtimestamp(timestamp_unix)
+    day_of_year = dt.timetuple().tm_yday
+    hour_utc = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
+
+    rad = np.pi / 180.0
+    declination = 23.45 * np.sin(rad * (360.0 / 365.0) * (day_of_year - 81)) * rad
+    solar_time = hour_utc + (lons_deg / 15.0)
+    hour_angle = (solar_time - 12.0) * 15.0 * rad
+
+    lats_rad = lats_deg * rad
+    cos_sza = np.sin(lats_rad) * np.sin(declination) + np.cos(lats_rad) * np.cos(declination) * np.cos(hour_angle)
+    return np.maximum(0.0, cos_sza).astype(np.float32)
 
 
 class LogStateZarrDataset(Dataset):
     """
-    Multi-Variable Zarr Dataset with Observation Ingestion (AMSU-A + IASI).
-    
-    Reads background state pairs (x_t, x_t+1) and aligns time-corresponding
-    satellite observation files from `obs_dir` (e.g., `conv_amsua_iasi_2024/`).
+    Standard Zarr Dataset Loader for Single-Step AI-DA State Ingestion.
+    Loads [t_0, t_1] background-target pairs along with 3D terrain heights (h_3d),
+    static surface topography features, surface roughness z0, and solar zenith angle cos(SZA).
     """
-    def __init__(self, zarr_path: str, obs_dir: str = "conv_amsua_iasi_2024"):
+    def __init__(self, zarr_path: str, obs_dir: str = None):
         super().__init__()
         self.zarr_path = zarr_path
         self.obs_dir = obs_dir
-        self.var_keys = LOG_STATE_VARS
 
-        try:
-            import zarr
-        except ImportError:
-            raise ImportError("zarr library is required. Run 'pip install zarr'.")
+        if not os.path.exists(zarr_path):
+            raise FileNotFoundError(f"[ERROR] Zarr dataset not found at '{zarr_path}'")
 
-        self.root = zarr.open(zarr_path, mode='r')
+        print(f"[DATASET] Loading Zarr dataset from: '{zarr_path}'", flush=True)
+        self.ds = xr.open_zarr(zarr_path)
 
-        available_keys = list(self.root.array_keys())
-        for k in self.var_keys:
-            if k not in available_keys:
-                raise KeyError(
-                    f"Expected key '{k}' not found in Zarr store at '{zarr_path}'. "
-                    f"Found: {available_keys}"
-                )
+        self.var_names = [
+            'ln_t_icosahedral', 'u_icosahedral', 'v_icosahedral',
+            'w_icosahedral', 'q_icosahedral', 'ln_rho_icosahedral', 'ln_p_icosahedral'
+        ]
+        for i, v in enumerate(self.var_names):
+            if v not in self.ds:
+                short_v = v.replace('_icosahedral', '')
+                if short_v in self.ds:
+                    self.var_names[i] = short_v
 
-        first_arr = self.root[self.var_keys[0]]
-        self.num_time_steps = first_arr.shape[0] - 1  # t -> t+1 pairs
-        self.num_vars = len(self.var_keys)
-        self.num_levels = first_arr.shape[1]  # 32
-        self.num_nodes = first_arr.shape[2]   # 2562
+        self.times = self.ds['time'].values
+        self.num_samples = len(self.times) - 1
+        self.num_levels = self.ds.sizes.get('level', self.ds.sizes.get('height', 32))
+        self.num_nodes = self.ds.sizes.get('node', 40962)
+        self.num_vars = len(self.var_names)
 
-        # Extract timestamps if present in Zarr metadata
-        if 'time' in self.root:
-            self.timestamps = list(self.root['time'][:])
+        if 'latitude' in self.ds and 'longitude' in self.ds:
+            self.latitudes = np.nan_to_num(self.ds['latitude'].values, nan=0.0)
+            self.longitudes = np.nan_to_num(self.ds['longitude'].values, nan=0.0)
         else:
-            self.timestamps = None
+            self.latitudes = np.linspace(-90, 90, self.num_nodes)
+            self.longitudes = np.linspace(-180, 180, self.num_nodes)
 
-        print(f"[DATASET] Loaded Multi-Array Zarr dataset from '{zarr_path}'")
-        print(f"          Variables ({self.num_vars}): {self.var_keys}")
-        print(
-            f"          Dimensions: Time={self.num_time_steps + 1}, "
-            f"Levels={self.num_levels}, Nodes={self.num_nodes}"
-        )
-        print(f"          Observation Directory: '{obs_dir}'")
+        if self.latitudes.ndim > 1:
+            self.latitudes = self.latitudes[0]
+        if self.longitudes.ndim > 1:
+            self.longitudes = self.longitudes[0]
+        self.longitudes = np.where(self.longitudes > 180.0, self.longitudes - 360.0, self.longitudes)
 
-    def __len__(self):
-        return self.num_time_steps
+        # Load Static Surface Features
+        self.h_terrain = self._extract_2d_surface_feature(['h_terrain_icosahedral', 'h_terrain', 'elevation'], default_val=0.0)
+        self.land_sea_mask = self._extract_2d_surface_feature(['land_sea_mask'], default_val=0.0)
 
-    def _load_observations_for_step(self, idx: int) -> dict:
-        """
-        Locates and loads satellite brightness temperatures (AMSU-A + IASI)
-        for the given time index `idx` from NetCDF observation files.
-        """
-        # Allocate placeholder array for 12 HMS channels across nodes
-        obs_hms_tb = np.full((12, self.num_nodes), 240.0, dtype=np.float32)
-        obs_hms_mask = np.zeros((12, self.num_nodes), dtype=np.float32)
+        # Compute Surface Roughness Length z0 (Ocean = 0.0002m, Land = 0.1m)
+        z0_map = np.where(self.land_sea_mask > 0.5, 0.1, 0.0002).astype(np.float32)
+        ln_z0_norm = (np.log(z0_map + 1e-5) / 5.0).astype(np.float32)
 
-        # Default placeholder arrays [15, 2562] and [30, 2562]
-        obs_amsua_tb = np.full((15, self.num_nodes), 240.0, dtype=np.float32)
-        obs_amsua_mask = np.zeros((15, self.num_nodes), dtype=np.float32)
+        # Build 3-channel base static topography [Elevation, LSM, z0]
+        static_topo_raw = np.stack([
+            self.h_terrain / 10000.0,
+            self.land_sea_mask,
+            ln_z0_norm
+        ], axis=0)
+        self.static_topo_base = np.nan_to_num(static_topo_raw, nan=0.0, posinf=1.0, neginf=-2.0).astype(np.float32)
 
-        obs_iasi_tb = np.full((30, self.num_nodes), 240.0, dtype=np.float32)
-        obs_iasi_mask = np.zeros((30, self.num_nodes), dtype=np.float32)
-
-        obs_atms_tb = np.full((22, self.num_nodes), 240.0, dtype=np.float32)
-        obs_atms_mask = np.zeros((22, self.num_nodes), dtype=np.float32)
-
-        obs_cris_tb = np.full((30, self.num_nodes), 240.0, dtype=np.float32)
-        obs_cris_mask = np.zeros((30, self.num_nodes), dtype=np.float32)
-
-        obs_seviri_tb = np.full((8, self.num_nodes), 240.0, dtype=np.float32)
-        obs_seviri_mask = np.zeros((8, self.num_nodes), dtype=np.float32)
-
-        obs_gsrasr_tb = np.full((10, self.num_nodes), 240.0, dtype=np.float32)
-        obs_gsrasr_mask = np.zeros((10, self.num_nodes), dtype=np.float32)
-
-        obs_gsrcsr_tb = np.full((7, self.num_nodes), 240.0, dtype=np.float32)
-        obs_gsrcsr_mask = np.zeros((7, self.num_nodes), dtype=np.float32)
-
-        obs_ahicsr_tb = np.full((9, self.num_nodes), 240.0, dtype=np.float32)
-        obs_ahicsr_mask = np.zeros((9, self.num_nodes), dtype=np.float32)
-
-        if not os.path.exists(self.obs_dir):
-            return {
-                'obs_amsua_tb': torch.from_numpy(obs_amsua_tb),
-                'obs_amsua_mask': torch.from_numpy(obs_amsua_mask),
-                'obs_iasi_tb': torch.from_numpy(obs_iasi_tb),
-                'obs_iasi_mask': torch.from_numpy(obs_iasi_mask),
-            }
-
-        # Match observation NetCDF files in obs_dir
-        obs_files = sorted(glob.glob(os.path.join(self.obs_dir, "obs_unified.*.nc")))
-        if not obs_files or idx >= len(obs_files):
-            # Fallback if specific timestep index exceeds available files
-            obs_file = obs_files[idx % len(obs_files)] if obs_files else None
-        else:
-            obs_file = obs_files[idx]
-
-        if obs_file and os.path.exists(obs_file):
-            try:
-                ds_obs = xr.open_dataset(obs_file)
-
-                # Read observation values, variables, sensors, channels, and coordinates
-                vals = ds_obs['observation_value'].values
-                sensors = ds_obs['sensor'].values
-                channels = ds_obs['channel'].values
-                lats = ds_obs['latitude'].values
-                lons = ds_obs['longitude'].values
-
-                # Process AMSU-A Observations
-                mask_amsua = (sensors == "amsua") & (vals > 100.0) & (vals < 350.0)
-                if np.any(mask_amsua):
-                    ch_amsua = channels[mask_amsua]
-                    val_amsua = vals[mask_amsua]
-                    lat_amsua = lats[mask_amsua]
-                    lon_amsua = lons[mask_amsua]
-
-                    # Map coordinates to node indices [0..2561]
-                    node_idx = ((lon_amsua + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
-                    node_idx = np.clip(node_idx, 0, self.num_nodes - 1)
-
-                    for c, v, n in zip(ch_amsua, val_amsua, node_idx):
-                        if 1 <= c <= 15:
-                            obs_amsua_tb[c - 1, n] = v
-                            obs_amsua_mask[c - 1, n] = 1.0
-
-                # Process IASI Observations
-                mask_iasi = (sensors == "iasi") & (vals > 100.0) & (vals < 350.0)
-                if np.any(mask_iasi):
-                    ch_iasi = channels[mask_iasi]
-                    val_iasi = vals[mask_iasi]
-                    lat_iasi = lats[mask_iasi]
-                    lon_iasi = lons[mask_iasi]
-
-                    node_idx_i = ((lon_iasi + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
-                    node_idx_i = np.clip(node_idx_i, 0, self.num_nodes - 1)
-
-                    # Map IASI channels (1..30)
-                    for c, v, n in zip(ch_iasi, val_iasi, node_idx_i):
-                        c_idx = c - 1 if c <= 30 else 0
-                        if 0 <= c_idx < 30:
-                            obs_iasi_tb[c_idx, n] = v
-                            obs_iasi_mask[c_idx, n] = 1.0
-
-
-                # Process HMS Observations
-                mask_hms = (sensors == "hms") & (vals > 100.0) & (vals < 350.0)
-                if np.any(mask_hms):
-                    ch_hms = channels[mask_hms]
-                    val_hms = vals[mask_hms]
-                    lon_hms = lons[mask_hms]
-
-                    node_idx_h = ((lon_hms + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
-                    node_idx_h = np.clip(node_idx_h, 0, self.num_nodes - 1)
-
-                    for c, v, n in zip(ch_hms, val_hms, node_idx_h):
-                        if 1 <= c <= 12:
-                            obs_hms_tb[c - 1, n] = v
-                            obs_hms_mask[c - 1, n] = 1.0
-
-                # Process ATMS Observations
-                mask_atms = (sensors == "atms") & (vals > 100.0) & (vals < 350.0)
-                if np.any(mask_atms):
-                    ch_atms = channels[mask_atms]
-                    val_atms = vals[mask_atms]
-                    lon_atms = lons[mask_atms]
-
-                    node_idx_a = ((lon_atms + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
-                    node_idx_a = np.clip(node_idx_a, 0, self.num_nodes - 1)
-
-                    for c, v, n in zip(ch_atms, val_atms, node_idx_a):
-                        if 1 <= c <= 22:
-                            obs_atms_tb[c - 1, n] = v
-                            obs_atms_mask[c - 1, n] = 1.0
-
-                # Process CRIS Observations
-                mask_cris = (sensors == "cris") & (vals > 100.0) & (vals < 350.0)
-                if np.any(mask_cris):
-                    ch_cris = channels[mask_cris]
-                    val_cris = vals[mask_cris]
-                    lon_cris = lons[mask_cris]
-
-                    node_idx_c = ((lon_cris + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
-                    node_idx_c = np.clip(node_idx_c, 0, self.num_nodes - 1)
-
-                    for c, v, n in zip(ch_cris, val_cris, node_idx_c):
-                        c_idx = c - 1 if c <= 30 else 0
-                        if 0 <= c_idx < 30:
-                            obs_cris_tb[c_idx, n] = v
-                            obs_cris_mask[c_idx, n] = 1.0
-
-                # Process SEVIRI Observations
-                mask_seviri = (sensors == "seviri") & (vals > 100.0) & (vals < 350.0)
-                if np.any(mask_seviri):
-                    ch_seviri = channels[mask_seviri]
-                    val_seviri = vals[mask_seviri]
-                    lon_seviri = lons[mask_seviri]
-
-                    node_idx_s = ((lon_seviri + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
-                    node_idx_s = np.clip(node_idx_s, 0, self.num_nodes - 1)
-
-                    # SEVIRI uses channels 4 through 11 -> mapped to 0..7
-                    for c, v, n in zip(ch_seviri, val_seviri, node_idx_s):
-                        c_idx = c - 4
-                        if 0 <= c_idx < 8:
-                            obs_seviri_tb[c_idx, n] = v
-                            obs_seviri_mask[c_idx, n] = 1.0
-
-                # Process GSRASR Observations
-                mask_gsrasr = (sensors == "gsrasr") & (vals > 100.0) & (vals < 350.0)
-                if np.any(mask_gsrasr):
-                    ch_gsrasr = channels[mask_gsrasr]
-                    val_gsrasr = vals[mask_gsrasr]
-                    lon_gsrasr = lons[mask_gsrasr]
-
-                    node_idx_g = ((lon_gsrasr + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
-                    node_idx_g = np.clip(node_idx_g, 0, self.num_nodes - 1)
-
-                    # GSRASR uses channels 7 through 16 -> mapped to 0..9
-                    for c, v, n in zip(ch_gsrasr, val_gsrasr, node_idx_g):
-                        c_idx = c - 7
-                        if 0 <= c_idx < 10:
-                            obs_gsrasr_tb[c_idx, n] = v
-                            obs_gsrasr_mask[c_idx, n] = 1.0
-
-                # Process GSRCSR Observations
-                mask_gsrcsr = (sensors == "gsrcsr") & (vals > 100.0) & (vals < 350.0)
-                if np.any(mask_gsrcsr):
-                    ch_gsrcsr = channels[mask_gsrcsr]
-                    val_gsrcsr = vals[mask_gsrcsr]
-                    lon_gsrcsr = lons[mask_gsrcsr]
-
-                    node_idx_gc = ((lon_gsrcsr + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
-                    node_idx_gc = np.clip(node_idx_gc, 0, self.num_nodes - 1)
-
-                    # Channel mapping for GSRCSR [8, 9, 10, 12, 13, 14, 15] -> 0..6
-                    channel_map = {8: 0, 9: 1, 10: 2, 12: 3, 13: 4, 14: 5, 15: 6}
-                    for c, v, n in zip(ch_gsrcsr, val_gsrcsr, node_idx_gc):
-                        if c in channel_map:
-                            c_idx = channel_map[c]
-                            obs_gsrcsr_tb[c_idx, n] = v
-                            obs_gsrcsr_mask[c_idx, n] = 1.0
-
-                # Process AHICSR Observations
-                mask_ahicsr = (sensors == "ahicsr") & (vals > 100.0) & (vals < 350.0)
-                if np.any(mask_ahicsr):
-                    ch_ahicsr = channels[mask_ahicsr]
-                    val_ahicsr = vals[mask_ahicsr]
-                    lon_ahicsr = lons[mask_ahicsr]
-
-                    node_idx_ac = ((lon_ahicsr + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
-                    node_idx_ac = np.clip(node_idx_ac, 0, self.num_nodes - 1)
-
-                    # AHICSR channels 7 through 15 -> mapped to 0..8
-                    for c, v, n in zip(ch_ahicsr, val_ahicsr, node_idx_ac):
-                        c_idx = c - 7
-                        if 0 <= c_idx < 9:
-                            obs_ahicsr_tb[c_idx, n] = v
-                            obs_ahicsr_mask[c_idx, n] = 1.0
-
-                ds_obs.close()
-            except Exception:
-                pass
-
-        return {
-            'obs_amsua_tb': torch.from_numpy(obs_amsua_tb),
-            'obs_amsua_mask': torch.from_numpy(obs_amsua_mask),
-            'obs_iasi_tb': torch.from_numpy(obs_iasi_tb),
-            'obs_iasi_mask': torch.from_numpy(obs_iasi_mask),
-            'obs_hms_tb': torch.from_numpy(obs_hms_tb),
-            'obs_hms_mask': torch.from_numpy(obs_hms_mask),
-            'obs_atms_tb': torch.from_numpy(obs_atms_tb),
-            'obs_atms_mask': torch.from_numpy(obs_atms_mask),
-            'obs_cris_tb': torch.from_numpy(obs_cris_tb),
-            'obs_cris_mask': torch.from_numpy(obs_cris_mask),
-            'obs_seviri_tb': torch.from_numpy(obs_seviri_tb),
-            'obs_seviri_mask': torch.from_numpy(obs_seviri_mask),
-            'obs_gsrasr_tb': torch.from_numpy(obs_gsrasr_tb),
-            'obs_gsrasr_mask': torch.from_numpy(obs_gsrasr_mask),
-            'obs_gsrcsr_tb': torch.from_numpy(obs_gsrcsr_tb),
-            'obs_gsrcsr_mask': torch.from_numpy(obs_gsrcsr_mask),
-            'obs_ahicsr_tb': torch.from_numpy(obs_ahicsr_tb),
-            'obs_ahicsr_mask': torch.from_numpy(obs_ahicsr_mask),
-        }
-
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        x_list = [np.array(self.root[key][idx], dtype=np.float32) for key in self.var_keys]
-        y_list = [np.array(self.root[key][idx + 1], dtype=np.float32) for key in self.var_keys]
-
-        x = np.stack(x_list, axis=0)
-        y = np.stack(y_list, axis=0)
-
-        # Basic NaN safeguard on data read
-        x = np.nan_to_num(x, nan=0.0)
-        y = np.nan_to_num(y, nan=0.0)
-
-        item_dict = {
-            'background': torch.from_numpy(x),
-            'target': torch.from_numpy(y)
-        }
-
-        # Ingest time-corresponding satellite observation fields
-        obs_dict = self._load_observations_for_step(idx)
-        item_dict.update(obs_dict)
-
-        return item_dict
-
-
-class SyntheticAIDAStateDataset(Dataset):
-    """Fallback dataset simulating log-state atmospheric variables on mesh with dummy observations."""
-    def __init__(self, num_samples: int = 80, num_nodes: int = 2562, num_levels: int = 8):
-        super().__init__()
-        self.num_samples = num_samples
-        self.num_nodes = num_nodes
-        self.num_levels = num_levels
-        self.num_vars = len(LOG_STATE_VARS)
-
-        np.random.seed(42)
-        self.data_x = np.random.randn(num_samples, 7, num_levels, num_nodes).astype(np.float32)
-        self.data_y = self.data_x * 0.98 + 0.02 * np.random.randn(num_samples, 7, num_levels, num_nodes).astype(np.float32)
+    def _extract_2d_surface_feature(self, candidate_names: list, default_val: float = 0.0) -> np.ndarray:
+        for name in candidate_names:
+            if name in self.ds:
+                arr = self.ds[name].values
+                if arr.ndim > 1:
+                    arr = arr[0]
+                return np.nan_to_num(arr, nan=default_val, posinf=default_val, neginf=default_val).astype(np.float32)
+        return np.full((self.num_nodes,), default_val, dtype=np.float32)
 
     def __len__(self):
         return self.num_samples
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+    def _load_observations_for_time(self, time_val, h_3d_profile: np.ndarray, p_3d_profile: np.ndarray):
+        obs_dict = {
+            'obs_amsua_tb': np.full((15, self.num_nodes), 240.0, dtype=np.float32),
+            'obs_amsua_mask': np.zeros((15, self.num_nodes), dtype=np.float32),
+            'obs_iasi_tb': np.full((30, self.num_nodes), 240.0, dtype=np.float32),
+            'obs_iasi_mask': np.zeros((30, self.num_nodes), dtype=np.float32),
+            'obs_hms_tb': np.full((12, self.num_nodes), 240.0, dtype=np.float32),
+            'obs_hms_mask': np.zeros((12, self.num_nodes), dtype=np.float32),
+            'obs_atms_tb': np.full((22, self.num_nodes), 240.0, dtype=np.float32),
+            'obs_atms_mask': np.zeros((22, self.num_nodes), dtype=np.float32),
+            'obs_cris_tb': np.full((30, self.num_nodes), 240.0, dtype=np.float32),
+            'obs_cris_mask': np.zeros((30, self.num_nodes), dtype=np.float32),
+            'obs_seviri_tb': np.full((8, self.num_nodes), 240.0, dtype=np.float32),
+            'obs_seviri_mask': np.zeros((8, self.num_nodes), dtype=np.float32),
+            'obs_gsrasr_tb': np.full((10, self.num_nodes), 240.0, dtype=np.float32),
+            'obs_gsrasr_mask': np.zeros((10, self.num_nodes), dtype=np.float32),
+            'obs_gsrcsr_tb': np.full((7, self.num_nodes), 240.0, dtype=np.float32),
+            'obs_gsrcsr_mask': np.zeros((7, self.num_nodes), dtype=np.float32),
+            'obs_ahicsr_tb': np.full((9, self.num_nodes), 240.0, dtype=np.float32),
+            'obs_ahicsr_mask': np.zeros((9, self.num_nodes), dtype=np.float32),
+            'obs_conv_val': np.zeros((self.num_vars, self.num_levels, self.num_nodes), dtype=np.float32),
+            'obs_conv_mask': np.zeros((self.num_vars, self.num_levels, self.num_nodes), dtype=np.float32),
+        }
+
+        if self.obs_dir and os.path.exists(self.obs_dir):
+            dt_str = str(time_val)[:13].replace('-', '').replace('T', '.t') + 'z'
+            conv_pattern = os.path.join(self.obs_dir, f"obs_conv.*{dt_str}*.nc")
+            conv_files = glob.glob(conv_pattern)
+
+            if conv_files:
+                try:
+                    ds_conv = xr.open_dataset(conv_files[0])
+                    c_lons = ds_conv['longitude'].values
+                    c_pressures = ds_conv['pressure'].values
+                    c_var_types = ds_conv['variable_type'].values
+                    c_obs_vals = np.nan_to_num(ds_conv['observation_value'].values, nan=0.0)
+
+                    c_node_idx = ((c_lons + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    c_node_idx = np.clip(c_node_idx, 0, self.num_nodes - 1)
+
+                    if np.nanmean(c_pressures) < 2000.0:
+                        c_pressures = c_pressures * 100.0
+
+                    for p_obs, v_type, val, n_idx in zip(c_pressures, c_var_types, c_obs_vals, c_node_idx):
+                        if 0 <= v_type < self.num_vars and val != 0.0:
+                            node_p_profile = p_3d_profile[:, n_idx]
+                            if p_obs <= node_p_profile[0] and p_obs >= node_p_profile[-1]:
+                                log_p_node = np.log(np.clip(node_p_profile, 1.0, None))
+                                log_p_obs = np.log(np.clip(p_obs, 1.0, None))
+
+                                k_idx = int(np.interp(-log_p_obs, -log_p_node, np.arange(self.num_levels)))
+                                k_idx = np.clip(k_idx, 0, self.num_levels - 1)
+
+                                obs_dict['obs_conv_val'][v_type, k_idx, n_idx] = val
+                                obs_dict['obs_conv_mask'][v_type, k_idx, n_idx] = 1.0
+
+                    ds_conv.close()
+                except Exception:
+                    pass
+
+        clean_obs = {}
+        for k, v in obs_dict.items():
+            clean_v = np.nan_to_num(v, nan=0.0).astype(np.float32)
+            clean_obs[k] = torch.from_numpy(clean_v)
+
+        return clean_obs
+
+
+class LogState4DForecastDataset(LogStateZarrDataset):
+    """
+    4D Observation-Guided Forecast Dataset Loader.
+    Loads [x(t-1), x(t)] 2-step trajectory inputs, predicts x(t+1) target state,
+    and extracts 3D terrain-following heights (h_3d), dynamic cos(SZA), z0, and observations.
+    """
+    def __init__(self, zarr_path: str, obs_dir: str = None):
+        super().__init__(zarr_path=zarr_path, obs_dir=obs_dir)
+        self.valid_indices = list(range(1, len(self.times) - 1))
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def __getitem__(self, idx):
+        t_idx = self.valid_indices[idx]
+        idx_minus6, idx_zero, idx_plus6 = t_idx - 1, t_idx, t_idx + 1
+
+        x_minus6 = np.stack([self.ds[v].isel(time=idx_minus6).values for v in self.var_names], axis=0)
+        x_zero   = np.stack([self.ds[v].isel(time=idx_zero).values for v in self.var_names], axis=0)
+        target   = np.stack([self.ds[v].isel(time=idx_plus6).values for v in self.var_names], axis=0)
+
+        x_trajectory = np.concatenate([x_minus6, x_zero], axis=0)
+
+        x_trajectory = np.nan_to_num(x_trajectory, nan=0.0, posinf=5.0, neginf=-5.0).astype(np.float32)
+        target       = np.nan_to_num(target,       nan=0.0, posinf=5.0, neginf=-5.0).astype(np.float32)
+
+        valid_mask_np = ~np.isnan(self.ds[self.var_names[0]].isel(time=idx_plus6).values)
+        valid_mask_np = np.nan_to_num(valid_mask_np, nan=False).astype(bool)
+
+        # -----------------------------------------------------------------
+        # M6 Terrain-Following Geometric Heights Compute: h = Hmax - eta*(Hmax - Hterrain)
+        # -----------------------------------------------------------------
+        if 'h_icosahedral' in self.ds:
+            h_3d = self.ds['h_icosahedral'].isel(time=idx_zero).values
+        elif 'eta' in self.ds:
+            eta_vals = self.ds['eta'].values  # [32]
+            Hmax = 20000.0
+            h_3d = Hmax - eta_vals[:, np.newaxis] * (Hmax - self.h_terrain[np.newaxis, :])
+        else:
+            baseline_h = np.linspace(2, 20000, self.num_levels, dtype=np.float32)
+            h_3d = np.repeat(baseline_h[:, np.newaxis], self.num_nodes, axis=1)
+
+        h_3d = np.nan_to_num(h_3d, nan=0.0, posinf=20000.0, neginf=0.0).astype(np.float32)
+
+        # Extract 3D pressure profile p_3d (Pa)
+        ln_p_3d = self.ds[self.var_names[6]].isel(time=idx_zero).values
+        p_3d_pa = np.exp(np.nan_to_num(ln_p_3d, nan=10.0))
+
+        # Dynamic Solar Zenith Angle Compute
+        time_val = self.times[idx_zero]
+        timestamp_unix = float(np.datetime64(time_val, 's').astype(int))
+        cos_sza = compute_solar_zenith_angle(self.latitudes, self.longitudes, timestamp_unix)
+
+        # Concatenate 3-channel base static topo + 1-channel cos(SZA) -> 4 channels
+        static_topo = np.concatenate([self.static_topo_base, cos_sza[np.newaxis, :]], axis=0)
+
+        item = {
+            'input_trajectory': torch.from_numpy(x_trajectory),   # [In_Vars=14, Levels=32, Nodes]
+            'target_state': torch.from_numpy(target),             # [Out_Vars=7, Levels=32, Nodes]
+            'valid_mask': torch.from_numpy(valid_mask_np),        # [Levels=32, Nodes]
+            'h_3d': torch.from_numpy(h_3d),                       # [Levels=32, Nodes]
+            'static_topo': torch.from_numpy(static_topo),         # [Static_Feats=4, Nodes]
+        }
+
+        item.update(self._load_observations_for_time(self.times[idx_plus6], h_3d_profile=h_3d, p_3d_profile=p_3d_pa))
+        return item
+
+
+class SyntheticAIDAStateDataset(Dataset):
+    """Synthetic Dataset Generator for Dry Testing."""
+    def __init__(self, num_samples: int = 100, num_nodes: int = 40962, num_levels: int = 32):
+        super().__init__()
+        self.num_samples = num_samples
+        self.num_nodes = num_nodes
+        self.num_levels = num_levels
+
+        self.data_x = np.random.randn(num_samples, 7, num_levels, num_nodes).astype(np.float32)
+        self.data_y = self.data_x + 0.05 * np.random.randn(num_samples, 7, num_levels, num_nodes).astype(np.float32)
+
+        baseline_h = np.linspace(2, 20000, num_levels, dtype=np.float32)
+        self.h_3d = np.repeat(baseline_h[:, np.newaxis], num_nodes, axis=1)
+        self.static_topo = np.random.randn(4, num_nodes).astype(np.float32)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
         return {
             'background': torch.from_numpy(self.data_x[idx]),
+            'input_trajectory': torch.from_numpy(np.concatenate([self.data_x[idx], self.data_x[idx]], axis=0)),
             'target': torch.from_numpy(self.data_y[idx]),
-            'obs_amsua_tb': torch.full((15, self.num_nodes), 240.0, dtype=torch.float32),
-            'obs_amsua_mask': torch.ones((15, self.num_nodes), dtype=torch.float32),
-            'obs_iasi_tb': torch.full((30, self.num_nodes), 240.0, dtype=torch.float32),
-            'obs_iasi_mask': torch.ones((30, self.num_nodes), dtype=torch.float32),
-            'obs_hms_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
-            'obs_hms_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
-            'obs_atms_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
-            'obs_atms_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
-            'obs_cris_tb': torch.full((12, self.num_nodes), 240.0, dtype=torch.float32),
-            'obs_cris_mask': torch.ones((12, self.num_nodes), dtype=torch.float32),
-            'obs_seviri_tb': torch.full((8, self.num_nodes), 240.0, dtype=torch.torch.float32),
-            'obs_seviri_mask': torch.ones((8, self.num_nodes), dtype=torch.float32),
-            'obs_gsrasr_tb': torch.full((10, self.num_nodes), 240.0, dtype=torch.float32),
-            'obs_gsrasr_mask': torch.ones((10, self.num_nodes), dtype=torch.float32),
-            'obs_gsrcsr_tb': torch.full((7, self.num_nodes), 240.0, dtype=torch.float32),
-            'obs_gsrcsr_mask': torch.ones((7, self.num_nodes), dtype=torch.float32),
-            'obs_ahicsr_tb': torch.full((9, self.num_nodes), 240.0, dtype=torch.float32),
-            'obs_ahicsr_mask': torch.ones((9, self.num_nodes), dtype=torch.float32),
+            'target_state': torch.from_numpy(self.data_y[idx]),
+            'valid_mask': torch.ones((self.num_levels, self.num_nodes), dtype=torch.bool),
+            'h_3d': torch.from_numpy(self.h_3d),
+            'static_topo': torch.from_numpy(self.static_topo),
         }
