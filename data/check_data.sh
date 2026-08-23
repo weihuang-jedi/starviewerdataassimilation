@@ -4,10 +4,10 @@
 
 s3dir=s3://noaa-gfs-bdp-pds
 totalyears=1
-startyear=2026
+startyear=2024
 res=0p25
 #res=1p00
-forecasthour=f000
+forecasthour=f006
 
 regular_dir=terrain-regular-grid
 icosahedral_dir=icosahedral-grid

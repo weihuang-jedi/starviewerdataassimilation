@@ -16,6 +16,7 @@ import yaml
 import numpy as np
 import xarray as xr
 import torch
+import inspect
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -234,14 +235,34 @@ def run_autoregressive_forecast(
     num_levels = cfg.get("mesh", {}).get("num_levels", 32)
     num_layers = model_cfg.get("num_layers", 4)
 
-    model = IcosahedralGNNSurrogate(
-        in_vars=in_vars,
-        out_vars=out_vars,
-        num_static_feats=num_static_feats,
-        hidden_dim=hidden_dim,
-        num_levels=num_levels,
-        num_layers=num_layers
-    ).to(device)
+    init_sig = inspect.signature(IcosahedralGNNSurrogate.__init__).parameters
+
+    kwargs = {}
+    if "in_vars" in init_sig:
+        kwargs["in_vars"] = in_vars
+    elif "in_channels" in init_sig:
+        kwargs["in_channels"] = in_vars
+
+    if "out_vars" in init_sig:
+        kwargs["out_vars"] = out_vars
+    elif "out_channels" in init_sig:
+        kwargs["out_channels"] = out_vars
+
+    if "num_static_feats" in init_sig:
+        kwargs["num_static_feats"] = num_static_feats
+    elif "num_static_features" in init_sig:
+        kwargs["num_static_features"] = num_static_feats
+    elif "static_dim" in init_sig:
+        kwargs["static_dim"] = num_static_feats
+
+    if "hidden_dim" in init_sig:
+        kwargs["hidden_dim"] = hidden_dim
+    if "num_levels" in init_sig:
+        kwargs["num_levels"] = num_levels
+    if "num_layers" in init_sig:
+        kwargs["num_layers"] = num_layers
+
+    model = IcosahedralGNNSurrogate(**kwargs).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()

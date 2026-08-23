@@ -21,7 +21,7 @@ model:
   num_layers: 4
 
 training:
-  epochs: 35
+  epochs: 5
   batch_size: 4       # Lowered from 16 to 4 to prevent CUDA OOM
   accum_steps: 4      # Gradient accumulation steps (Effective batch size = 16)
   lr: 0.0005
@@ -50,14 +50,14 @@ loss_weights:
   tau_min_p: 0.08
 
   # Differentiable Satellite Radiance Loss Weights
-  w_rad: 0.01          # Legacy fallback for AMSU-A
-  w_rad_amsua: 0.01    # AMSU-A Microwave Sounder Weight
-  w_rad_iasi: 0.01     # IASI Hyperspectral Infrared Weight
-  w_rad_hms: 0.01      # HMS Sounder Weight
-  w_rad_atms: 0.01     # ATMS Microwave Sounder Weight
-  w_rad_cris: 0.01     # CrIS Hyperspectral Infrared Sounder Weight
-  w_rad_seviri: 0.01   # SEVIRI Geostationary Sounder
-  w_rad_gsrasr: 0.01   # GOES All-Sky Radiance (ABI)
-  w_rad_gsrcsr: 0.01   # GOES Clear-Sky Radiance (ABI CSR)
-  w_rad_ahicsr: 0.01   # Himawari AHI Clear-Sky Radiance (AHI CSR)
+  w_rad: 0.00          # Legacy fallback for AMSU-A
+  w_rad_amsua: 0.00    # AMSU-A Microwave Sounder Weight
+  w_rad_iasi: 0.00     # IASI Hyperspectral Infrared Weight
+  w_rad_hms: 0.00      # HMS Sounder Weight
+  w_rad_atms: 0.00     # ATMS Microwave Sounder Weight
+  w_rad_cris: 0.00     # CrIS Hyperspectral Infrared Sounder Weight
+  w_rad_seviri: 0.00   # SEVIRI Geostationary Sounder
+  w_rad_gsrasr: 0.00   # GOES All-Sky Radiance (ABI)
+  w_rad_gsrcsr: 0.00   # GOES Clear-Sky Radiance (ABI CSR)
+  w_rad_ahicsr: 0.00   # Himawari AHI Clear-Sky Radiance (AHI CSR)
 

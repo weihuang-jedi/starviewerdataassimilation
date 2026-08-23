@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from models import (
-    LogStateZarrDataset,
+    LogState4DForecastDataset,
     SyntheticAIDAStateDataset,
     generate_or_load_edge_index,
     IcosahedralGNNSurrogate,
@@ -90,8 +90,29 @@ def train_epoch(
     for batch_idx, batch_data in enumerate(dataloader):
 
         if isinstance(batch_data, dict):
-            x_batch = batch_data['background'].to(device)
-            y_batch = batch_data['target'].to(device)
+            # Read input_trajectory (14 ch) or fall back to background
+            if 'input_trajectory' in batch_data:
+                x_batch = batch_data['input_trajectory'].to(device)
+            else:
+                x_batch = batch_data['background'].to(device)
+
+            if 'target_state' in batch_data:
+                y_batch = batch_data['target_state'].to(device)
+            else:
+                y_batch = batch_data['target'].to(device)
+
+            valid_mask = batch_data.get('valid_mask', None)
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(device)
+
+            static_topo = batch_data.get('static_topo', None)
+            if static_topo is not None:
+                static_topo = static_topo.to(device)
+
+            h_3d = batch_data.get('h_3d', None)
+            if h_3d is not None:
+                h_3d = h_3d.to(device)
+
             obs_amsua_tb = batch_data.get('obs_amsua_tb', None)
             obs_amsua_mask = batch_data.get('obs_amsua_mask', None)
             obs_iasi_tb = batch_data.get('obs_iasi_tb', None)
@@ -115,6 +136,7 @@ def train_epoch(
         else:
             x_batch = batch_data[0].to(device)
             y_batch = batch_data[1].to(device)
+            valid_mask, static_topo, h_3d = None, None, None
             obs_amsua_tb, obs_amsua_mask = None, None
             obs_iasi_tb, obs_iasi_mask = None, None
             obs_hms_tb, obs_hms_mask = None, None
@@ -126,19 +148,28 @@ def train_epoch(
             obs_ahicsr_tb, obs_ahicsr_mask = None, None
             obs_conv_val, obs_conv_mask = None, None
 
+        # -----------------------------------------------------------------
+        # CONCATENATE 14 DYNAMIC TRAJECTORY + 4 STATIC TOPO CHANNELS -> 18 CH
+        # -----------------------------------------------------------------
+        if static_topo is not None and x_batch.shape[1] == 14:
+            num_levels = x_batch.shape[2]
+            static_topo_expanded = static_topo.unsqueeze(2).expand(-1, -1, num_levels, -1)
+            x_input = torch.cat([x_batch, static_topo_expanded], dim=1)
+        else:
+            x_input = x_batch
+
         # GNN Forward Pass
-        pred = model(x_batch, edge_index)
+        pred = model(x_input, edge_index)
 
         # 1. Base Physical Loss
-        # Inside train_epoch() in scripts/train_aida_surrogate.py
         loss, metrics = criterion(
             pred=pred,
             target=y_batch,
             edge_index=edge_index,
             graph_mesh_ops=graph_mesh_ops,
             valid_mask=valid_mask,
-            h_3d=h_3d,           # Pass 3D height profile for exponential boundary layer weighting
-            static_topo=static_topo # Pass static topo for surface drag penalty
+            h_3d=h_3d,
+            static_topo=static_topo
         )
         total_loss = loss
 
@@ -317,17 +348,16 @@ def train_epoch(
         total_loss += (w_rad_seviri * loss_rad_seviri)
         metrics["loss_rad_seviri"] = loss_rad_seviri.item()
 
-        # 8. Evaluate GSRASR Radiance Innovation Loss
+        # 9. GSRASR Radiance Loss
         w_rad_gsrasr = loss_cfg.get("w_rad_gsrasr", 0.01)
         if obs_gsrasr_tb is not None:
             p_pa = p_hpa.permute(0, 2, 1) * 100.0
             t_k_perm = t_k.permute(0, 2, 1)
-            tb_gsrasr_sim = gsrasr_op(t_k_perm, p_pa)  # [B, 10, N]
+            tb_gsrasr_sim = gsrasr_op(t_k_perm, p_pa)
 
             tb_gsrasr_obs = obs_gsrasr_tb.to(device)
             if tb_gsrasr_obs.shape[1] != 10 and tb_gsrasr_obs.shape[2] == 10:
                 tb_gsrasr_obs = tb_gsrasr_obs.permute(0, 2, 1)
-
             if tb_gsrasr_sim.shape[1] != 10 and tb_gsrasr_sim.shape[2] == 10:
                 tb_gsrasr_sim = tb_gsrasr_sim.permute(0, 2, 1)
 
@@ -343,21 +373,20 @@ def train_epoch(
                 loss_rad_gsrasr = torch.mean(innov_gsrasr ** 2) / 10.0
         else:
             loss_rad_gsrasr = torch.tensor(0.0, device=device)
-    
+
         total_loss += (w_rad_gsrasr * loss_rad_gsrasr)
         metrics["loss_rad_gsrasr"] = loss_rad_gsrasr.item()
 
-        # 9. Evaluate GSRCSR Radiance Innovation Loss
+        # 10. GSRCSR Radiance Loss
         w_rad_gsrcsr = loss_cfg.get("w_rad_gsrcsr", 0.01)
         if obs_gsrcsr_tb is not None:
             p_pa = p_hpa.permute(0, 2, 1) * 100.0
             t_k_perm = t_k.permute(0, 2, 1)
-            tb_gsrcsr_sim = gsrcsr_op(t_k_perm, p_pa)  # [B, 7, N]
+            tb_gsrcsr_sim = gsrcsr_op(t_k_perm, p_pa)
 
             tb_gsrcsr_obs = obs_gsrcsr_tb.to(device)
             if tb_gsrcsr_obs.shape[1] != 7 and tb_gsrcsr_obs.shape[2] == 7:
                 tb_gsrcsr_obs = tb_gsrcsr_obs.permute(0, 2, 1)
-
             if tb_gsrcsr_sim.shape[1] != 7 and tb_gsrcsr_sim.shape[2] == 7:
                 tb_gsrcsr_sim = tb_gsrcsr_sim.permute(0, 2, 1)
 
@@ -377,17 +406,16 @@ def train_epoch(
         total_loss += (w_rad_gsrcsr * loss_rad_gsrcsr)
         metrics["loss_rad_gsrcsr"] = loss_rad_gsrcsr.item()
 
-        # 10. Evaluate AHICSR Radiance Innovation Loss
+        # 11. AHICSR Radiance Loss
         w_rad_ahicsr = loss_cfg.get("w_rad_ahicsr", 0.01)
         if obs_ahicsr_tb is not None:
             p_pa = p_hpa.permute(0, 2, 1) * 100.0
             t_k_perm = t_k.permute(0, 2, 1)
-            tb_ahicsr_sim = ahicsr_op(t_k_perm, p_pa)  # [B, 9, N]
+            tb_ahicsr_sim = ahicsr_op(t_k_perm, p_pa)
 
             tb_ahicsr_obs = obs_ahicsr_tb.to(device)
             if tb_ahicsr_obs.shape[1] != 9 and tb_ahicsr_obs.shape[2] == 9:
                 tb_ahicsr_obs = tb_ahicsr_obs.permute(0, 2, 1)
-
             if tb_ahicsr_sim.shape[1] != 9 and tb_ahicsr_sim.shape[2] == 9:
                 tb_ahicsr_sim = tb_ahicsr_sim.permute(0, 2, 1)
 
@@ -407,14 +435,12 @@ def train_epoch(
         total_loss += (w_rad_ahicsr * loss_rad_ahicsr)
         metrics["loss_rad_ahicsr"] = loss_rad_ahicsr.item()
 
-        # ------------------------------------------------------------------------------------------------------------
         metrics["loss_total"] = total_loss.item()
 
         if torch.isnan(total_loss):
             print("[WARNING] NaN loss detected in batch! Skipping step...", flush=True)
             continue
 
-        # Scale loss for gradient accumulation to conserve memory
         loss_accum = total_loss / accum_steps
         loss_accum.backward()
 
@@ -449,9 +475,9 @@ def train_model(cfg: dict):
         obs_dir = paths.get("obs_dir", None)
         if obs_dir and os.path.exists(obs_dir):
             print(f"[TRAIN] Loading dataset from Obs: '{obs_dir}'", flush=True)
-            dataset = LogStateZarrDataset(zarr_path=zarr_path, obs_dir=obs_dir)
+            dataset = LogState4DForecastDataset(zarr_path=zarr_path, obs_dir=obs_dir)
         else:
-            dataset = LogStateZarrDataset(zarr_path=zarr_path)
+            dataset = LogState4DForecastDataset(zarr_path=zarr_path)
         num_nodes = dataset.num_nodes
         lat_deg = torch.tensor(dataset.latitudes, dtype=torch.float32) if hasattr(dataset, "latitudes") else torch.linspace(-90, 90, num_nodes)
         lon_deg = torch.tensor(dataset.longitudes, dtype=torch.float32) if hasattr(dataset, "longitudes") else torch.linspace(-180, 180, num_nodes)
@@ -485,17 +511,16 @@ def train_model(cfg: dict):
     ).to(device)
 
     num_levels = mesh_cfg.get("num_levels", 32)
-    num_layers=model_cfg.get("num_layers", 4)
+    num_layers = model_cfg.get("num_layers", 4)
     in_vars = model_cfg.get("in_vars", 14)
-    out_vars = model_cfg.get("out_vars", 7)
-
-    # MUST BE 4: [Elevation, Land-Sea Mask, Roughness_z0, cos_SZA]
     num_static_feats = model_cfg.get("num_static_feats", 4)
 
+    # 14 dynamic channels + 4 static channels = 18 total channels
+    total_in_vars = in_vars + num_static_feats
+
+    # Instantiation matching IcosahedralGNNSurrogate signature
     model = IcosahedralGNNSurrogate(
-        in_vars=in_vars,
-        out_vars=out_vars,
-        num_static_feats=num_static_feats,
+        in_vars=total_in_vars,
         hidden_dim=model_cfg["hidden_dim"],
         num_levels=num_levels,
         num_layers=num_layers

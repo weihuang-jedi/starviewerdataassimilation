@@ -1,4 +1,4 @@
-from .dataset import LogStateZarrDataset, SyntheticAIDAStateDataset
+from .dataset import LogStateZarrDataset, SyntheticAIDAStateDataset, LogState4DForecastDataset
 from .graph import generate_or_load_edge_index
 from .gnn import IcosahedralGNNSurrogate
 from .loss import AIDASurrogateLoss, M4MeshOperators, build_icosahedral_differential_operators
@@ -15,6 +15,7 @@ from .ahicsr import DifferentiableAHICSROperator
 __all__ = [
     "LogStateZarrDataset",
     "SyntheticAIDAStateDataset",
+    "LogState4DForecastDataset",
     "generate_or_load_edge_index",
     "IcosahedralGNNSurrogate",
     "AIDASurrogateLoss",
