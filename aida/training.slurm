@@ -24,6 +24,8 @@ fi
 
 set -x
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # 1. Train surrogate
 time python -u scripts/train_aida_surrogate.py --config configs/config.yaml
 

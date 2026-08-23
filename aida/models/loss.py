@@ -34,8 +34,14 @@ class M4MeshOperators(nn.Module):
             L = 1
             flat_field = scalar_field.t()
 
-        df_dx_flat = torch.sparse.mm(self.Gx_sparse, flat_field).t()
-        df_dy_flat = torch.sparse.mm(self.Gy_sparse, flat_field).t()
+        # -----------------------------------------------------------------
+        # FORCE FLOAT32 FOR BOTH FORWARD AND BACKWARD AUTOGRAD GRAPH
+        # Do NOT cast back to orig_dtype (bfloat16/float16)!
+        # -----------------------------------------------------------------
+        flat_field_f32 = flat_field.float()
+
+        df_dx_flat = torch.sparse.mm(self.Gx_sparse, flat_field_f32).t()
+        df_dy_flat = torch.sparse.mm(self.Gy_sparse, flat_field_f32).t()
 
         if L > 1:
             df_dx = df_dx_flat.reshape(B, L, N)
@@ -247,18 +253,23 @@ class AIDASurrogateLoss(nn.Module):
         if self.lambda_dyn > 0.0 and graph_mesh_ops is not None and hasattr(graph_mesh_ops, "Gx_sparse"):
             u_pred = pred_clean[:, 1, :, :]
             v_pred = pred_clean[:, 2, :, :]
-            dp_dx, dp_dy = graph_mesh_ops(p_pred)
 
-            f_coriolis = 2.0 * 7.2921e-5 * torch.sin(graph_mesh_ops.lat_deg * np.pi / 180.0).view(1, 1, -1).to(pred.device)
-            f_coriolis = torch.where(torch.abs(f_coriolis) < 2e-5, torch.sign(f_coriolis) * 2e-5 + 2e-5, f_coriolis)
+            # Wrap in autocast(enabled=False) to ensure float32 autograd graph
+            with torch.cuda.amp.autocast(enabled=False):
+                p_pred_f32 = pred_clean[:, 6, :, :].float()
+                dp_dx, dp_dy = graph_mesh_ops(p_pred_f32)
 
-            ln_rho_unnorm = pred_clean[:, 5, :, :] * self.std_ln_rho + self.mu_ln_rho
-            rho_pred = torch.clamp(torch.exp(torch.clamp(ln_rho_unnorm, min=-10.0, max=1.0)), min=1e-4, max=2.0)
+                f_coriolis = 2.0 * 7.2921e-5 * torch.sin(graph_mesh_ops.lat_deg * np.pi / 180.0).view(1, 1, -1).to(pred.device)
+                f_coriolis = torch.where(torch.abs(f_coriolis) < 2e-5, torch.sign(f_coriolis) * 2e-5 + 2e-5, f_coriolis)
 
-            u_geo = torch.clamp(-1.0 / (rho_pred * f_coriolis) * dp_dy, min=-100.0, max=100.0)
-            v_geo = torch.clamp(1.0 / (rho_pred * f_coriolis) * dp_dx, min=-100.0, max=100.0)
+                ln_rho_unnorm = pred_clean[:, 5, :, :].float() * self.std_ln_rho + self.mu_ln_rho
+                rho_pred = torch.clamp(torch.exp(torch.clamp(ln_rho_unnorm, min=-10.0, max=1.0)), min=1e-4, max=2.0)
 
-            loss_dyn = F.mse_loss(u_pred, u_geo) + F.mse_loss(v_pred, v_geo)
+                u_geo = torch.clamp(-1.0 / (rho_pred * f_coriolis) * dp_dy, min=-100.0, max=100.0)
+                v_geo = torch.clamp(1.0 / (rho_pred * f_coriolis) * dp_dx, min=-100.0, max=100.0)
+
+                loss_dyn = F.mse_loss(u_pred.float(), u_geo) + F.mse_loss(v_pred.float(), v_geo)
+
             loss_dyn = torch.nan_to_num(loss_dyn, nan=0.0)
             metrics["loss_dynamics_total"] = loss_dyn.item()
             total_loss += (self.lambda_dyn * loss_dyn)

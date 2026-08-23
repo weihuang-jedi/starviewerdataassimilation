@@ -22,8 +22,9 @@ model:
 
 training:
   epochs: 5
-  batch_size: 4       # Lowered from 16 to 4 to prevent CUDA OOM
-  accum_steps: 4      # Gradient accumulation steps (Effective batch size = 16)
+  batch_size: 1
+  accum_steps: 8            # Accumulate gradients across 8 steps to reduce VRAM spike
+  use_amp: true             # Enable Automatic Mixed Precision (AMP)
   lr: 0.0005
   weight_decay: 0.0001
   log_interval: 1
