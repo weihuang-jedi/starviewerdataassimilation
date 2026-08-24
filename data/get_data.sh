@@ -15,7 +15,7 @@ set -x
 cd /scratch5/purged/Wei.Huang/src/starviewerdataassimilation/data
 
 totalyears=1
-startyear=2024
+startyear=2025
 #export res=1p00
 export res=0p25
 export fcst=f006
@@ -92,9 +92,9 @@ generate_tasks() {
          dayinmonth[1]=28
       fi
 
-      # local month=1
+      local month=1
       # local month=5
-      local month=9
+      # local month=9
       while [ $month -le 12 ]
       do
          printf -v MM "%02d" $month

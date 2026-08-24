@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-scripts/run_aida_forecast.py
-----------------------------
+scripts/run_aida_cycling.py
+---------------------------
 Autoregressive Forecast Rollout Engine using the trained 4D Terrain-Following AIDA Checkpoint.
 Infers X_+6h, X_+12h, X_+18h... from initial analysis state pair (X_-6h, X_0)
 while conditioning on static topography (static_topo), 3D terrain heights (h_3d),
@@ -235,13 +235,16 @@ def run_autoregressive_forecast(
     num_levels = cfg.get("mesh", {}).get("num_levels", 32)
     num_layers = model_cfg.get("num_layers", 4)
 
+    # 14 dynamic + 4 static = 18 total input channels
+    total_in_vars = in_vars + num_static_feats
+
     init_sig = inspect.signature(IcosahedralGNNSurrogate.__init__).parameters
 
     kwargs = {}
     if "in_vars" in init_sig:
-        kwargs["in_vars"] = in_vars
+        kwargs["in_vars"] = total_in_vars
     elif "in_channels" in init_sig:
-        kwargs["in_channels"] = in_vars
+        kwargs["in_channels"] = total_in_vars
 
     if "out_vars" in init_sig:
         kwargs["out_vars"] = out_vars
@@ -320,7 +323,7 @@ def run_autoregressive_forecast(
 
             # Build 4-channel static feature tensor: [Elevation, LSM, Roughness_z0, cos_SZA]
             cos_sza_tensor = torch.from_numpy(cos_sza_np).unsqueeze(0).unsqueeze(0).to(device)
-            static_topo_4ch = torch.cat([static_topo_base, cos_sza_tensor], dim=1)
+            static_topo_4ch = torch.cat([static_topo_base, cos_sza_tensor], dim=1)  # [1, 4, Nodes]
 
             x_m6_curr = state_prev[:, 0:7, :, :] if state_prev.shape[1] >= 14 else state_prev
             x_0_curr  = state_curr[:, 7:14, :, :] if state_curr.shape[1] >= 14 else state_curr
@@ -334,7 +337,13 @@ def run_autoregressive_forecast(
             else:
                 input_traj = torch.cat([state_prev[:, :7, :, :], state_curr[:, :7, :, :]], dim=1)
 
-            out_model = model(input_traj, edge_index, static_topo=static_topo_4ch)
+            # -----------------------------------------------------------------
+            # COMBINE 14 DYNAMIC + 4 STATIC CHANNELS -> 18 INPUT CHANNELS
+            # -----------------------------------------------------------------
+            static_topo_expanded = static_topo_4ch.unsqueeze(2).expand(-1, -1, num_levels, -1)  # [1, 4, 32, Nodes]
+            x_input = torch.cat([input_traj, static_topo_expanded], dim=1)                       # [1, 18, 32, Nodes]
+
+            out_model = model(x_input, edge_index)
 
             delta_max = torch.tensor([0.035, 20.0, 20.0, 2.0, 0.005, 0.1, 0.02], device=device).view(1, 7, 1, 1)
             out_model = torch.clamp(out_model, min=-delta_max, max=delta_max)

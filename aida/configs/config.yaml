@@ -17,13 +17,13 @@ model:
   in_vars: 14                  # 2 timesteps x 7 variables
   out_vars: 7
   num_static_feats: 4          # MUST BE 4: Elevation + LSM + Roughness_z0 + cos_SZA
-  hidden_dim: 128
+  hidden_dim: 256
   num_layers: 4
 
 training:
   epochs: 5
   batch_size: 1
-  accum_steps: 8            # Accumulate gradients across 8 steps to reduce VRAM spike
+  accum_steps: 16
   use_amp: true             # Enable Automatic Mixed Precision (AMP)
   lr: 0.0005
   weight_decay: 0.0001

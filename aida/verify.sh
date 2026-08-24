@@ -2,35 +2,36 @@
 
 set -x
 
+aidahome=/scratch5/purged/Wei.Huang/src/starviewerdataassimilation
+datadir=/scratch5/purged/Wei.Huang/src/starviewerdataassimilation/data
 # 1. Change to working directory
-#cd /scratch3/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
-cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
-# cd /scratch5/purged/Wei.Huang/src/starviewerdataassimilation/aida
+cd ${aidahome}/aida
 
 # 2. Activate Conda environment
-source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
+source ${aidahome}/svg.env
 
 yyyymmdd=20250106
-analhour=06
+analhour=00
+res=0p25
 
-icosahedral_analysis=output/global_icosahedral_m4.${yyyymmdd}.t${analhour}z.1p00.anal.nc
-gridanalysis=output/reconstructed_aida_analysis_${yyyymmdd}.t${analhour}z.1p00.nc
+icosahedral_analysis=output/aida.${yyyymmdd}.t${analhour}z.${res}.f006.nc
+gridanalysis=output/reconstructed_aida_analysis_${yyyymmdd}.t${analhour}z.${res}.nc
 
 if [ ! -f ${gridanalysis} ]; then
-   python icosahedral2regular.py \
+   python utils/icosahedral2regular.py \
       -i ${icosahedral_analysis} \
       -o ${gridanalysis} \
-      -g /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
-      -r 1.0
+      -g ${datadir}/terrain-regular-grid/gfs.${yyyymmdd}.t${analhour}z.${res}.f006.nc \
+      -r 0.25
 fi
 
 #python plot_3dvar_matrix.py \
 #   --input ${gridanalysis} \
 #   --output aida_increment_matrix_${yyyymmdd}T${analhour}.png
 
-python validate_reconstruction.py \
+python utils/validate_reconstruction.py \
    -i ${gridanalysis} \
-   -r /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/regular_truth/gfs.${yyyymmdd}.t${analhour}z.1p00.f000.nc \
+   -r ${datadir}/terrain-regular-grid/gfs.${yyyymmdd}.t${analhour}z.${res}.f006.nc \
    -o output/verification_levels.t${analhour}z.csv
 
 python utils/plot_vertical_profiles.py \

@@ -541,6 +541,25 @@ def train_model(cfg: dict):
         num_layers=num_layers
     ).to(device)
 
+    # Compute total trainable parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    
+    print(f"[MODEL] Total Parameters    : {total_params:,}", flush=True)
+    print(f"[MODEL] Trainable Parameters: {trainable_params:,}", flush=True)
+
+    print("\n" + "=" * 60)
+    print(f"{'Layer / Module Name':<35} | {'Param Count':>18}")
+    print("=" * 60)
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"{name:<35} | {param.numel():>18,}")
+
+    print("-" * 60)
+    print(f"{'Total Trainable Parameters':<35} | {sum(p.numel() for p in model.parameters() if p.requires_grad):>18,}")
+    print("=" * 60 + "\n", flush=True)
+
     criterion = AIDASurrogateLoss(num_levels=num_levels, **loss_cfg).to(device)
     # scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))

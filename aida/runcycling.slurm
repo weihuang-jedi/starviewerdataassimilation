@@ -10,16 +10,15 @@
 #SBATCH --output=log.cycling_%J.out
 #SBATCH --export=NONE
 
+aidahome=/scratch5/purged/Wei.Huang/src/starviewerdataassimilation
 # 1. Set working directory
-cd /scratch3/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
-# cd /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/aida
-# cd /scratch5/purged/Wei.Huang/src/starviewerdataassimilation/aida
+cd ${aidahome}/aida
 
 # 2. Activate Conda environment
-source /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/svg.env
+source ${aidahome}/svg.env
 
 # 3. Define cycling parameters
-START_YMD="20250106"
+START_YMD="20260106"
 START_HOUR="00"
 FCST_HOUR=6
 
@@ -57,19 +56,29 @@ GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate.pt"
 
 get_analysis_time ${START_YMD} ${START_HOUR} ${FCST_HOUR}
 
-background=/scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/icosahedral_grid/global_icosahedral_m4.${START_YMD}.t${START_HOUR}z.1p00.f006.nc
+background=../data/icosahedral-grid/icosahedral_logstate_m6.${START_YMD}.t${START_HOUR}z.0p25.f006.nc
 icosahedral_anal=output/global_icosahedral_m4.${ANALYS_YMD}.t${ANALYS_HOUR}z.1p00.anal.nc
 grid_anal=output/reconstructed_aida_analysis_${ANALYS_YMD}.t${ANALYS_HOUR}z.1p00.nc
 
 rm -f ${icosahedral_anal}
 rm -f ${grid_anal}
+rm -f output/*
 
 set -x
 
 PYTHONPATH=. python scripts/run_aida_cycling.py \
-    --background ${background} \
-    --output_file ${icosahedral_anal} \
-    --gnn_ckpt ${GNN_CKPT} \
-    --graph_path_m4 /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/graph/icosahedral_edge_index_m4.pt
+    --checkpoint ${GNN_CKPT} \
+    --minus6 ../data/icosahedral-grid/icosahedral_logstate_m6.20260105.t12z.0p25.f006.nc \
+    --zero ../data/icosahedral-grid/icosahedral_logstate_m6.20260105.t18z.0p25.f006.nc \
+    --steps 4 \
+    --edges=../graph/graph-grid/icosahedral_edge_index_m6.pt \
+    --output_pattern output/aida.20250106.t00z.0p25.f{lead:03d}.nc
 
-#   --graph_path_m3 ../data/graph/icosahedral_edge_index_m3.pt \
+exit 0
+
+    parser.add_argument("-k", "--checkpoint", default="checkpoints/aida_gnn_surrogate_logstate.pt", help="Path to checkpoint")
+    parser.add_argument("-m", "--minus6", required=True, help="Path to X_-6h initial analysis state file")
+    parser.add_argument("-z", "--zero", required=True, help="Path to X_0 current initial analysis state file")
+    parser.add_argument("-e", "--edges", default="data/graph/icosahedral_edge_index_m6.pt", help="Path to graph edge index")
+    parser.add_argument("-s", "--steps", type=int, default=4, help="Number of 6h forecast steps (default: 4 = 24h)")
+    parser.add_argument("-o", "--output_pattern", default="output/aida.{date_tag}.f{lead:03d}.nc", help="Output path pattern")

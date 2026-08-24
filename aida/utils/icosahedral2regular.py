@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+utils/icosahedral2regular.py
+----------------------------
+Regrids unstructured 3D M6 icosahedral atmospheric fields (level=32, node=40962)
+to regular 2D/3D latitude-longitude grids (e.g. 1.0° or 0.25° resolution).
+Transforms logarithmic state variables (ln_t, ln_p, ln_rho) into physical units.
+"""
+
 import os
 import argparse
 import numpy as np
@@ -17,16 +25,14 @@ def transform_log_variable(var_name: str, da: xr.DataArray):
     val = da.values.copy()
 
     if var_name in ['ln_t_icosahedral', 'ln_t', 't_icosahedral']:
-        # Check if log-temperature was already exponentiated or stored as ln_T
         if np.nanmean(val) > 100.0:
             phys_data = val  # Already physical Kelvin
         else:
-            # If normalized values, restore typical mean around ~5.5 (245 K)
             if np.nanmean(val) < 2.0:
                 val = val * 0.2 + 5.5
             phys_data = np.exp(val)
 
-        phys_data = np.clip(phys_data, 150.0, 350.0)  # Valid tropospheric bounds
+        phys_data = np.clip(phys_data, 150.0, 350.0)
         attrs = {
             'long_name': 'Absolute Temperature',
             'units': 'K',
@@ -78,35 +84,11 @@ def regrid_dataset(input_file: str, output_file: str, grid_file: str = None, res
     print(f"[AIDA REGRID] Opening dataset: {input_file}")
     ds = xr.open_dataset(input_file)
 
-    num_nodes = ds.dims['node'] if 'node' in ds.dims else None
+    num_nodes = ds.sizes.get('node', None)
 
-    if grid_file:
-        if not os.path.exists(grid_file):
-            raise FileNotFoundError(f"Specified grid file not found: {grid_file}")
-        print(f"[AIDA REGRID] Inspecting grid coordinates from: {grid_file}")
-        ds_grid = xr.open_dataset(grid_file)
-
-        lons_raw, lats_raw = None, None
-        for lon_key in ['longitude', 'lon', 'clon']:
-            if lon_key in ds_grid:
-                lons_raw = ds_grid[lon_key].values
-                break
-        for lat_key in ['latitude', 'lat', 'clat']:
-            if lat_key in ds_grid:
-                lats_raw = ds_grid[lat_key].values
-                break
-
-        if num_nodes and lons_raw.size != num_nodes:
-            print(f"[AIDA WARNING] External grid file points ({lons_raw.size}) do not match "
-                  f"source dataset node count ({num_nodes}). Falling back to input dataset coordinates.")
-            src_lons = np.squeeze(ds['longitude'].values)
-            src_lats = np.squeeze(ds['latitude'].values)
-        else:
-            src_lons = np.squeeze(lons_raw)
-            src_lats = np.squeeze(lats_raw)
-    else:
-        src_lons = np.squeeze(ds['longitude'].values)
-        src_lats = np.squeeze(ds['latitude'].values)
+    # Load Source Longitudes and Latitudes from Dataset
+    src_lons = np.squeeze(ds['longitude'].values)
+    src_lats = np.squeeze(ds['latitude'].values)
 
     if np.nanmax(src_lons) <= 2 * np.pi and np.nanmax(src_lats) <= np.pi:
         print("[AIDA REGRID] Converting coordinate units from radians to degrees...")
@@ -122,11 +104,12 @@ def regrid_dataset(input_file: str, output_file: str, grid_file: str = None, res
 
     print(f"[AIDA REGRID] Loaded {len(points)} valid source coordinate points.")
 
+    # Target Regular Lat-Lon Grid Setup
     grid_lons = np.arange(0.0, 360.0, resolution, dtype=np.float64)
-    grid_lats = np.arange(90.0, -90.0 - resolution, -resolution, dtype=np.float64)
+    grid_lats = np.arange(90.0, -90.0 - resolution / 2.0, -resolution, dtype=np.float64)
     lon_mesh, lat_mesh = np.meshgrid(grid_lons, grid_lats)
 
-    print(f"[AIDA REGRID] Grid boundaries: Lats ({grid_lats[0]} -> {grid_lats[-1]}), Lons ({grid_lons[0]} -> {grid_lons[-1]})")
+    print(f"[AIDA REGRID] Target Grid: Lats ({grid_lats[0]} -> {grid_lats[-1]}, size={len(grid_lats)}), Lons ({grid_lons[0]} -> {grid_lons[-1]}, size={len(grid_lons)})")
 
     print("[AIDA REGRID] Building spatial triangulation interpolators...")
     dummy_values = np.zeros(len(points), dtype=np.float64)
@@ -145,13 +128,14 @@ def regrid_dataset(input_file: str, output_file: str, grid_file: str = None, res
         print(f"Processing: {raw_var_name} -> Converting to Physical Field: [{out_var_name}]")
 
         has_time = 'time' in da.dims
-        has_height = 'height' in da.dims
+        has_level = ('level' in da.dims) or ('height' in da.dims)
 
-        time_len = ds['time'].size if 'time' in ds else 1
-        height_len = len(ds['height']) if has_height else 1
+        time_len = ds.sizes.get('time', 1) if has_time else 1
+        level_len = ds.sizes.get('level', ds.sizes.get('height', 1)) if has_level else 1
 
         def interpolate_layer(layer_raw):
-            layer_flat = np.squeeze(layer_raw).flatten()[valid_coord_mask].astype(np.float64)
+            # Mask valid horizontal nodes
+            layer_flat = np.squeeze(layer_raw)[valid_coord_mask].astype(np.float64)
 
             linear_interp.values = layer_flat.reshape(-1, 1)
             grid_data = linear_interp(lon_mesh, lat_mesh)
@@ -169,27 +153,30 @@ def regrid_dataset(input_file: str, output_file: str, grid_file: str = None, res
 
             return grid_data.astype(np.float32)
 
-        if has_time and has_height:
+        # 1. Handle 4D: (time, level, lat, lon)
+        if has_time and has_level and phys_array_data.ndim >= 3:
             time_stack = []
             for t_idx in range(time_len):
-                height_stack = []
-                for h_idx in range(height_len):
-                    layer_data = phys_array_data[t_idx, h_idx] if phys_array_data.ndim >= 3 else phys_array_data[h_idx]
-                    height_stack.append(interpolate_layer(layer_data))
-                time_stack.append(np.stack(height_stack, axis=0))
+                level_stack = []
+                for l_idx in range(level_len):
+                    layer_data = phys_array_data[t_idx, l_idx] if phys_array_data.ndim == 3 else phys_array_data[l_idx]
+                    level_stack.append(interpolate_layer(layer_data))
+                time_stack.append(np.stack(level_stack, axis=0))
 
             regrid_array = np.stack(time_stack, axis=0)
-            dims = ('time', 'height', 'lat', 'lon')
+            dims = ('time', 'level', 'lat', 'lon')
 
-        elif has_height:
-            height_stack = []
-            for h_idx in range(height_len):
-                layer_data = phys_array_data[h_idx]
-                height_stack.append(interpolate_layer(layer_data))
+        # 2. Handle 3D: (level, lat, lon)
+        elif has_level and phys_array_data.ndim == 2:
+            level_stack = []
+            for l_idx in range(level_len):
+                layer_data = phys_array_data[l_idx]
+                level_stack.append(interpolate_layer(layer_data))
 
-            regrid_array = np.stack(height_stack, axis=0)
-            dims = ('height', 'lat', 'lon')
+            regrid_array = np.stack(level_stack, axis=0)
+            dims = ('level', 'lat', 'lon')
 
+        # 3. Handle 2D Surface Features: (lat, lon)
         else:
             regrid_array = interpolate_layer(phys_array_data)
             dims = ('lat', 'lon')
@@ -209,8 +196,15 @@ def regrid_dataset(input_file: str, output_file: str, grid_file: str = None, res
         })
     }
 
-    if 'height' in ds.coords:
-        coords['height'] = ('height', ds['height'].values, ds['height'].attrs)
+    if 'level' in ds.coords:
+        coords['level'] = ('level', ds['level'].values, ds['level'].attrs)
+    elif 'height' in ds.coords:
+        coords['level'] = ('level', ds['height'].values, ds['height'].attrs)
+
+    if 'target_level' in ds:
+        coords['target_level'] = ('level', ds['target_level'].values, ds['target_level'].attrs)
+    if 'eta' in ds:
+        coords['eta'] = ('level', ds['eta'].values, ds['eta'].attrs)
 
     if 'time' in ds.coords:
         t_val = ds['time'].values

@@ -24,13 +24,15 @@ fi
 
 set -x
 
+gnn_ckpt=checkpoints/aida_gnn_surrogate_logstate.pt
+
 # 1. Train surrogate
 time \
-python -u scripts/evaluate_aida_rollout.py \
+python -u scripts/run_aida_cycling.py \
   --zarr ../data/icosahedral_2023_logstate.zarr \
-  --edges ../data/graph/icosahedral_edge_index_m4.pt \
-  --checkpoint checkpoints/aida_gnn_surrogate_logstate_12.pt \
-  --rollout-steps 28 \
+  --edges ../graph/graph-grid/icosahedral_edge_index_m6.pt \
+  --checkpoint ${gnn_ckpt} \
+  --rollout-steps 24 \
   --num-samples 5 \
   --output-plot output/aida_ar_rollout_7day.png
 
