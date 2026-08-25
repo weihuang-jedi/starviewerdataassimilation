@@ -4,7 +4,7 @@
 
 s3dir=s3://noaa-gfs-bdp-pds
 totalyears=1
-startyear=2024
+startyear=2025
 res=0p25
 #res=1p00
 forecasthour=f006

@@ -4,12 +4,12 @@
 
 paths:
   zarr_path: "../data/icosahedral_logstate.zarr"
-  edges_path: "../data/graph/icosahedral_edge_index_m4.pt"
+  edges_path: "../graph/graph-grid/icosahedral_edge_index_m6.pt"
   checkpoint_path: "checkpoints/aida_gnn_surrogate_logstate.pt"
   obs_dir: "../data/all_NNJA_data_2024"
 
 mesh:
-  num_nodes: 2562
+  num_nodes: 40962
   num_levels: 32
   samples: 1464
 
@@ -17,14 +17,14 @@ model:
   in_vars: 14                  # 2 timesteps x 7 variables
   out_vars: 7
   num_static_feats: 4          # MUST BE 4: Elevation + LSM + Roughness_z0 + cos_SZA
-  hidden_dim: 256
+  hidden_dim: 256              # Scaled for 19M-25M parameter capacity
   num_layers: 4
 
 training:
   epochs: 5
   batch_size: 1
   accum_steps: 16
-  use_amp: true             # Enable Automatic Mixed Precision (AMP)
+  use_amp: true                # Enable Automatic Mixed Precision (AMP)
   lr: 0.0005
   weight_decay: 0.0001
   log_interval: 1
@@ -38,15 +38,14 @@ loss_weights:
   lambda_dyn: 0.01
   lambda_laplacian_p: 0.18
   weight_grad_state: 0.25
-  lambda_asym_q: 0.5           # Active non-negative physical humidity barrier
-  lambda_thermal: 0.1          # Active global thermal equilibrium penalty
-  lambda_pbl_drag: 0.05        # NEW: Active surface wind friction drag penalty
-  lambda_lapse_rate: 0.02      # NEW: Active boundary layer thermal lapse rate penalty
+  lambda_asym_q: 0.5            # Active non-negative physical humidity barrier
+  lambda_thermal: 0.1           # Active global thermal equilibrium penalty
+  lambda_pbl_drag: 0.05         # Active surface wind friction drag penalty
+  lambda_lapse_rate: 0.02       # Active boundary layer thermal lapse rate penalty
   lambda_p_acc: 0.15
   lambda_asym_p: 0.35
   weight_state_eq: 0.12
   weight_q_log: 0.25
-  lambda_asym_q: 0.50
   weight_joint_bias: 0.10
   tau_min_p: 0.08
 
@@ -61,4 +60,3 @@ loss_weights:
   w_rad_gsrasr: 0.00   # GOES All-Sky Radiance (ABI)
   w_rad_gsrcsr: 0.00   # GOES Clear-Sky Radiance (ABI CSR)
   w_rad_ahicsr: 0.00   # Himawari AHI Clear-Sky Radiance (AHI CSR)
-

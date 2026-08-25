@@ -88,8 +88,11 @@ def train_epoch(
     num_batches = len(dataloader)
     optimizer.zero_grad()
 
-    # Determine mixed precision precision type
-    amp_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+    # Determine mixed precision precision type (bfloat16 preferred for Ampere/Hopper)
+    if device.type == "cuda":
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        amp_dtype = torch.float32
 
     for batch_idx, batch_data in enumerate(dataloader):
 
@@ -154,15 +157,6 @@ def train_epoch(
         # -----------------------------------------------------------------
         # AUTOMATIC MIXED PRECISION FORWARD PASS (Cuts VRAM consumption in half)
         # -----------------------------------------------------------------
-        # Use float16 or float32 to prevent dtype mismatches during index_add_
-        # Inside train_epoch() in scripts/train_aida_surrogate.py
-
-        # Prefer bfloat16 for CUDA sparse matrix operations
-        if device.type == "cuda":
-            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-        else:
-            amp_dtype = torch.float32
-
         with torch.amp.autocast('cuda', enabled=(device.type == "cuda"), dtype=amp_dtype):
             if static_topo is not None and x_batch.shape[1] == 14:
                 num_levels = x_batch.shape[2]
@@ -450,6 +444,7 @@ def train_epoch(
 
         if torch.isnan(total_loss):
             print("[WARNING] NaN loss detected in batch! Skipping step...", flush=True)
+            optimizer.zero_grad()
             continue
 
         # Scale loss for gradient accumulation & AMP backward
@@ -544,7 +539,7 @@ def train_model(cfg: dict):
     # Compute total trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
-    
+
     print(f"[MODEL] Total Parameters    : {total_params:,}", flush=True)
     print(f"[MODEL] Trainable Parameters: {trainable_params:,}", flush=True)
 
@@ -561,7 +556,6 @@ def train_model(cfg: dict):
     print("=" * 60 + "\n", flush=True)
 
     criterion = AIDASurrogateLoss(num_levels=num_levels, **loss_cfg).to(device)
-    # scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
 
     # Radiance Operators
