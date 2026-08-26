@@ -7,10 +7,10 @@ import torch.utils.checkpoint as checkpoint
 class EdgeNodeGNNBlock(nn.Module):
     """
     GraphCast-style Edge-Node Interaction Block.
-    Processes both node features and edge attributes with 3-layer MLPs.
-    Uses memory-efficient sub-chunking for large 3D edge tensors.
+    Processes node features and edge attributes with 3-layer MLPs.
+    Uses sub-chunking (chunk_size=100000) to keep peak VRAM under control.
     """
-    def __init__(self, channels: int, edge_dim: int = 16, chunk_size: int = 1000000):
+    def __init__(self, channels: int, edge_dim: int = 16, chunk_size: int = 100000):
         super().__init__()
         self.chunk_size = chunk_size
 
@@ -40,7 +40,7 @@ class EdgeNodeGNNBlock(nn.Module):
         self.edge_norm = nn.LayerNorm(edge_dim)
 
     def _forward_edge_mlp_chunked(self, edge_in: torch.Tensor) -> torch.Tensor:
-        """Processes edge_in through edge_mlp in smaller sub-chunks to cap peak VRAM usage."""
+        """Processes edge_in through edge_mlp in small 100k sub-chunks to avoid VRAM spikes."""
         num_edges = edge_in.shape[0]
         if num_edges <= self.chunk_size:
             return self.edge_mlp(edge_in)
@@ -68,7 +68,7 @@ class EdgeNodeGNNBlock(nn.Module):
 
         edge_in = torch.cat([x_perm[src_expanded], x_perm[dst_expanded], edge_attr_expanded], dim=-1)
 
-        # Sub-chunked MLP pass prevents VRAM spikes
+        # Sub-chunked pass
         updated_edge_attr = edge_attr_expanded + self._forward_edge_mlp_chunked(edge_in)
         updated_edge_attr = self.edge_norm(updated_edge_attr)
 
@@ -92,8 +92,7 @@ class EdgeNodeGNNBlock(nn.Module):
 class ScalableAIDAProcessor(nn.Module):
     """
     Scalable High-Capacity GNN Atmospheric Surrogate Model.
-    Configurable to match GraphCast parameter scales (10M - 40M parameters).
-    Uses dynamic edge embedding initialization and gradient checkpointing.
+    Uses dynamic edge embedding initialization, chunked MLPs, and gradient checkpointing.
     """
     def __init__(
         self,
@@ -123,7 +122,7 @@ class ScalableAIDAProcessor(nn.Module):
 
         # Deep Processor Backbone
         self.gnn_layers = nn.ModuleList([
-            EdgeNodeGNNBlock(channels=hidden_dim, edge_dim=edge_dim) for _ in range(num_layers)
+            EdgeNodeGNNBlock(channels=hidden_dim, edge_dim=edge_dim, chunk_size=100000) for _ in range(num_layers)
         ])
 
         # Post-decoder MLP (projects hidden_dim -> out_vars)

@@ -5,12 +5,15 @@ train_aida_surrogate.py
 AIDA GNN Surrogate Model Training Script for Icosahedral Atmospheric Grids.
 Supports differentiable AMSU-A, IASI, HMS, ATMS, CrIS, and SEVIRI radiance loss
 integration with gradient accumulation and Automatic Mixed Precision (AMP) for memory optimization.
+Enhanced with real-time intra-epoch stdout progress flushing and periodic batch checkpointing.
 """
 
 import argparse
 import os
 import sys
+import time
 import yaml
+from datetime import datetime
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -38,6 +41,12 @@ from models.gsrcsr import DifferentiableGSRCSROperator
 from models.ahicsr import DifferentiableAHICSROperator
 
 
+def log_msg(msg: str):
+    """Timestamped log helper with immediate stdout flushing."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now_str}] {msg}", flush=True)
+
+
 def load_config(config_path: str) -> dict:
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"[ERROR] Config file not found at: '{config_path}'")
@@ -45,7 +54,7 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def save_checkpoint(filepath: str, model, optimizer, epoch: int, cfg: dict, criterion):
+def save_checkpoint(filepath: str, model, optimizer, epoch: int, cfg: dict, criterion, batch_idx: int = 0):
     os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
     stats_dict = {}
     for attr in ["mu_ln_t", "std_ln_t", "mu_ln_rho", "std_ln_rho", "mu_ln_p", "std_ln_p"]:
@@ -54,15 +63,18 @@ def save_checkpoint(filepath: str, model, optimizer, epoch: int, cfg: dict, crit
 
     torch.save({
         "epoch": epoch,
+        "batch_idx": batch_idx,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "config": cfg,
         "stats": stats_dict
     }, filepath)
-    print(f"[TRAIN] Checkpoint successfully saved to '{filepath}'", flush=True)
+    log_msg(f"[TRAIN] Checkpoint successfully saved to '{filepath}' (Epoch {epoch}, Batch {batch_idx})")
 
 
 def train_epoch(
+    epoch: int,
+    total_epochs: int,
     model,
     dataloader,
     optimizer,
@@ -81,7 +93,11 @@ def train_epoch(
     gsrcsr_op, gsrcsr_obs_err,
     ahicsr_op, ahicsr_obs_err,
     loss_cfg,
-    accum_steps: int = 8
+    cfg: dict,
+    checkpoint_path: str,
+    accum_steps: int = 8,
+    log_batch_freq: int = 10,
+    save_batch_freq: int = 100
 ):
     model.train()
     epoch_losses = {}
@@ -94,30 +110,37 @@ def train_epoch(
     else:
         amp_dtype = torch.float32
 
-    for batch_idx, batch_data in enumerate(dataloader):
+    log_msg(f"=== Starting Epoch {epoch:03d}/{total_epochs:03d} | Total Batches: {num_batches} | Accum Steps: {accum_steps} ===")
+    
+    epoch_start_time = time.time()
+    batch_window_start = time.time()
+    running_loss = 0.0
+
+    for batch_idx, batch_data in enumerate(dataloader, start=1):
+        batch_step_start = time.time()
 
         if isinstance(batch_data, dict):
             if 'input_trajectory' in batch_data:
-                x_batch = batch_data['input_trajectory'].to(device)
+                x_batch = batch_data['input_trajectory'].to(device, non_blocking=True)
             else:
-                x_batch = batch_data['background'].to(device)
+                x_batch = batch_data['background'].to(device, non_blocking=True)
 
             if 'target_state' in batch_data:
-                y_batch = batch_data['target_state'].to(device)
+                y_batch = batch_data['target_state'].to(device, non_blocking=True)
             else:
-                y_batch = batch_data['target'].to(device)
+                y_batch = batch_data['target'].to(device, non_blocking=True)
 
             valid_mask = batch_data.get('valid_mask', None)
             if valid_mask is not None:
-                valid_mask = valid_mask.to(device)
+                valid_mask = valid_mask.to(device, non_blocking=True)
 
             static_topo = batch_data.get('static_topo', None)
             if static_topo is not None:
-                static_topo = static_topo.to(device)
+                static_topo = static_topo.to(device, non_blocking=True)
 
             h_3d = batch_data.get('h_3d', None)
             if h_3d is not None:
-                h_3d = h_3d.to(device)
+                h_3d = h_3d.to(device, non_blocking=True)
 
             obs_amsua_tb = batch_data.get('obs_amsua_tb', None)
             obs_amsua_mask = batch_data.get('obs_amsua_mask', None)
@@ -140,8 +163,8 @@ def train_epoch(
             obs_conv_val = batch_data.get('obs_conv_val', None)
             obs_conv_mask = batch_data.get('obs_conv_mask', None)
         else:
-            x_batch = batch_data[0].to(device)
-            y_batch = batch_data[1].to(device)
+            x_batch = batch_data[0].to(device, non_blocking=True)
+            y_batch = batch_data[1].to(device, non_blocking=True)
             valid_mask, static_topo, h_3d = None, None, None
             obs_amsua_tb, obs_amsua_mask = None, None
             obs_iasi_tb, obs_iasi_mask = None, None
@@ -154,9 +177,7 @@ def train_epoch(
             obs_ahicsr_tb, obs_ahicsr_mask = None, None
             obs_conv_val, obs_conv_mask = None, None
 
-        # -----------------------------------------------------------------
-        # AUTOMATIC MIXED PRECISION FORWARD PASS (Cuts VRAM consumption in half)
-        # -----------------------------------------------------------------
+        # AUTOMATIC MIXED PRECISION FORWARD PASS
         with torch.amp.autocast('cuda', enabled=(device.type == "cuda"), dtype=amp_dtype):
             if static_topo is not None and x_batch.shape[1] == 14:
                 num_levels = x_batch.shape[2]
@@ -193,9 +214,9 @@ def train_epoch(
             # 2. Conventional Observation Loss
             w_conv = loss_cfg.get("w_conv", 0.05)
             if obs_conv_val is not None:
-                conv_val = obs_conv_val.to(device)
+                conv_val = obs_conv_val.to(device, non_blocking=True)
                 if obs_conv_mask is not None:
-                    conv_m = obs_conv_mask.to(device)
+                    conv_m = obs_conv_mask.to(device, non_blocking=True)
                     loss_conv = torch.sum(((pred - conv_val) ** 2) * conv_m) / (torch.sum(conv_m) + 1e-8)
                 else:
                     loss_conv = F.mse_loss(pred, conv_val)
@@ -209,7 +230,7 @@ def train_epoch(
             w_rad_amsua = loss_cfg.get("w_rad", loss_cfg.get("w_rad_amsua", 0.01))
             if obs_amsua_tb is not None and w_rad_amsua > 0.0:
                 tb_sim = amsua_op(t_k, p_hpa)
-                tb_obs = obs_amsua_tb.to(device)
+                tb_obs = obs_amsua_tb.to(device, non_blocking=True)
                 if tb_sim.shape[1] != 15 and tb_sim.shape[2] == 15:
                     tb_sim = tb_sim.permute(0, 2, 1)
                 if tb_obs.shape[1] != 15 and tb_obs.shape[2] == 15:
@@ -217,7 +238,7 @@ def train_epoch(
                 err = amsua_obs_err.view(1, 15, 1)
                 innov = (tb_obs - tb_sim) / err
                 if obs_amsua_mask is not None:
-                    m = obs_amsua_mask.to(device)
+                    m = obs_amsua_mask.to(device, non_blocking=True)
                     if m.shape[1] != 15 and m.shape[2] == 15:
                         m = m.permute(0, 2, 1)
                     loss_rad_amsua = torch.sum((innov ** 2) * m) / (15.0 * torch.sum(m) + 1e-8)
@@ -234,7 +255,7 @@ def train_epoch(
                 p_pa = p_hpa.permute(0, 2, 1) * 100.0
                 t_k_perm = t_k.permute(0, 2, 1)
                 tb_sim = iasi_op(t_k_perm, p_pa)
-                tb_obs = obs_iasi_tb.to(device)
+                tb_obs = obs_iasi_tb.to(device, non_blocking=True)
                 if tb_obs.shape[1] != 30 and tb_obs.shape[2] == 30:
                     tb_obs = tb_obs.permute(0, 2, 1)
                 if tb_sim.shape[1] != 30 and tb_sim.shape[2] == 30:
@@ -242,7 +263,7 @@ def train_epoch(
                 err = iasi_obs_err.view(1, 30, 1)
                 innov = (tb_obs - tb_sim) / err
                 if obs_iasi_mask is not None:
-                    m = obs_iasi_mask.to(device)
+                    m = obs_iasi_mask.to(device, non_blocking=True)
                     if m.shape[1] != 30 and m.shape[2] == 30:
                         m = m.permute(0, 2, 1)
                     loss_rad_iasi = torch.sum((innov ** 2) * m) / (30.0 * torch.sum(m) + 1e-8)
@@ -259,7 +280,7 @@ def train_epoch(
                 p_pa = p_hpa.permute(0, 2, 1) * 100.0
                 t_k_perm = t_k.permute(0, 2, 1)
                 tb_sim = hms_op(t_k_perm, p_pa)
-                tb_obs = obs_hms_tb.to(device)
+                tb_obs = obs_hms_tb.to(device, non_blocking=True)
                 if tb_obs.shape[1] != 12 and tb_obs.shape[2] == 12:
                     tb_obs = tb_obs.permute(0, 2, 1)
                 if tb_sim.shape[1] != 12 and tb_sim.shape[2] == 12:
@@ -267,7 +288,7 @@ def train_epoch(
                 err = hms_obs_err.view(1, 12, 1)
                 innov = (tb_obs - tb_sim) / err
                 if obs_hms_mask is not None:
-                    m = obs_hms_mask.to(device)
+                    m = obs_hms_mask.to(device, non_blocking=True)
                     if m.shape[1] != 12 and m.shape[2] == 12:
                         m = m.permute(0, 2, 1)
                     loss_rad_hms = torch.sum((innov ** 2) * m) / (12.0 * torch.sum(m) + 1e-8)
@@ -284,7 +305,7 @@ def train_epoch(
                 p_pa = p_hpa.permute(0, 2, 1) * 100.0
                 t_k_perm = t_k.permute(0, 2, 1)
                 tb_sim = atms_op(t_k_perm, p_pa)
-                tb_obs = obs_atms_tb.to(device)
+                tb_obs = obs_atms_tb.to(device, non_blocking=True)
                 if tb_obs.shape[1] != 22 and tb_obs.shape[2] == 22:
                     tb_obs = tb_obs.permute(0, 2, 1)
                 if tb_sim.shape[1] != 22 and tb_sim.shape[2] == 22:
@@ -292,7 +313,7 @@ def train_epoch(
                 err = atms_obs_err.view(1, 22, 1)
                 innov = (tb_obs - tb_sim) / err
                 if obs_atms_mask is not None:
-                    m = obs_atms_mask.to(device)
+                    m = obs_atms_mask.to(device, non_blocking=True)
                     if m.shape[1] != 22 and m.shape[2] == 22:
                         m = m.permute(0, 2, 1)
                     loss_rad_atms = torch.sum((innov ** 2) * m) / (22.0 * torch.sum(m) + 1e-8)
@@ -309,7 +330,7 @@ def train_epoch(
                 p_pa = p_hpa.permute(0, 2, 1) * 100.0
                 t_k_perm = t_k.permute(0, 2, 1)
                 tb_sim = cris_op(t_k_perm, p_pa)
-                tb_obs = obs_cris_tb.to(device)
+                tb_obs = obs_cris_tb.to(device, non_blocking=True)
                 if tb_obs.shape[1] != 30 and tb_obs.shape[2] == 30:
                     tb_obs = tb_obs.permute(0, 2, 1)
                 if tb_sim.shape[1] != 30 and tb_sim.shape[2] == 30:
@@ -317,7 +338,7 @@ def train_epoch(
                 err = cris_obs_err.view(1, 30, 1)
                 innov = (tb_obs - tb_sim) / err
                 if obs_cris_mask is not None:
-                    m = obs_cris_mask.to(device)
+                    m = obs_cris_mask.to(device, non_blocking=True)
                     if m.shape[1] != 30 and m.shape[2] == 30:
                         m = m.permute(0, 2, 1)
                     loss_rad_cris = torch.sum((innov ** 2) * m) / (30.0 * torch.sum(m) + 1e-8)
@@ -334,7 +355,7 @@ def train_epoch(
                 p_pa = p_hpa.permute(0, 2, 1) * 100.0
                 t_k_perm = t_k.permute(0, 2, 1)
                 tb_sim = seviri_op(t_k_perm, p_pa)
-                tb_obs = obs_seviri_tb.to(device)
+                tb_obs = obs_seviri_tb.to(device, non_blocking=True)
                 if tb_obs.shape[1] != 8 and tb_obs.shape[2] == 8:
                     tb_obs = tb_obs.permute(0, 2, 1)
                 if tb_sim.shape[1] != 8 and tb_sim.shape[2] == 8:
@@ -342,7 +363,7 @@ def train_epoch(
                 err = seviri_obs_err.view(1, 8, 1)
                 innov = (tb_obs - tb_sim) / err
                 if obs_seviri_mask is not None:
-                    m = obs_seviri_mask.to(device)
+                    m = obs_seviri_mask.to(device, non_blocking=True)
                     if m.shape[1] != 8 and m.shape[2] == 8:
                         m = m.permute(0, 2, 1)
                     loss_rad_seviri = torch.sum((innov ** 2) * m) / (8.0 * torch.sum(m) + 1e-8)
@@ -360,7 +381,7 @@ def train_epoch(
                 t_k_perm = t_k.permute(0, 2, 1)
                 tb_gsrasr_sim = gsrasr_op(t_k_perm, p_pa)
 
-                tb_gsrasr_obs = obs_gsrasr_tb.to(device)
+                tb_gsrasr_obs = obs_gsrasr_tb.to(device, non_blocking=True)
                 if tb_gsrasr_obs.shape[1] != 10 and tb_gsrasr_obs.shape[2] == 10:
                     tb_gsrasr_obs = tb_gsrasr_obs.permute(0, 2, 1)
                 if tb_gsrasr_sim.shape[1] != 10 and tb_gsrasr_sim.shape[2] == 10:
@@ -370,7 +391,7 @@ def train_epoch(
                 innov_gsrasr = (tb_gsrasr_obs - tb_gsrasr_sim) / err_gsrasr
 
                 if obs_gsrasr_mask is not None:
-                    mask_gsrasr = obs_gsrasr_mask.to(device)
+                    mask_gsrasr = obs_gsrasr_mask.to(device, non_blocking=True)
                     if mask_gsrasr.shape[1] != 10 and mask_gsrasr.shape[2] == 10:
                         mask_gsrasr = mask_gsrasr.permute(0, 2, 1)
                     loss_rad_gsrasr = torch.sum((innov_gsrasr ** 2) * mask_gsrasr) / (10.0 * torch.sum(mask_gsrasr) + 1e-8)
@@ -389,7 +410,7 @@ def train_epoch(
                 t_k_perm = t_k.permute(0, 2, 1)
                 tb_gsrcsr_sim = gsrcsr_op(t_k_perm, p_pa)
 
-                tb_gsrcsr_obs = obs_gsrcsr_tb.to(device)
+                tb_gsrcsr_obs = obs_gsrcsr_tb.to(device, non_blocking=True)
                 if tb_gsrcsr_obs.shape[1] != 7 and tb_gsrcsr_obs.shape[2] == 7:
                     tb_gsrcsr_obs = tb_gsrcsr_obs.permute(0, 2, 1)
                 if tb_gsrcsr_sim.shape[1] != 7 and tb_gsrcsr_sim.shape[2] == 7:
@@ -399,7 +420,7 @@ def train_epoch(
                 innov_gsrcsr = (tb_gsrcsr_obs - tb_gsrcsr_sim) / err_gsrcsr
 
                 if obs_gsrcsr_mask is not None:
-                    mask_gsrcsr = obs_gsrcsr_mask.to(device)
+                    mask_gsrcsr = obs_gsrcsr_mask.to(device, non_blocking=True)
                     if mask_gsrcsr.shape[1] != 7 and mask_gsrcsr.shape[2] == 7:
                         mask_gsrcsr = mask_gsrcsr.permute(0, 2, 1)
                     loss_rad_gsrcsr = torch.sum((innov_gsrcsr ** 2) * mask_gsrcsr) / (7.0 * torch.sum(mask_gsrcsr) + 1e-8)
@@ -418,7 +439,7 @@ def train_epoch(
                 t_k_perm = t_k.permute(0, 2, 1)
                 tb_ahicsr_sim = ahicsr_op(t_k_perm, p_pa)
 
-                tb_ahicsr_obs = obs_ahicsr_tb.to(device)
+                tb_ahicsr_obs = obs_ahicsr_tb.to(device, non_blocking=True)
                 if tb_ahicsr_obs.shape[1] != 9 and tb_ahicsr_obs.shape[2] == 9:
                     tb_ahicsr_obs = tb_ahicsr_obs.permute(0, 2, 1)
                 if tb_ahicsr_sim.shape[1] != 9 and tb_ahicsr_sim.shape[2] == 9:
@@ -428,7 +449,7 @@ def train_epoch(
                 innov_ahicsr = (tb_ahicsr_obs - tb_ahicsr_sim) / err_ahicsr
 
                 if obs_ahicsr_mask is not None:
-                    mask_ahicsr = obs_ahicsr_mask.to(device)
+                    mask_ahicsr = obs_ahicsr_mask.to(device, non_blocking=True)
                     if mask_ahicsr.shape[1] != 9 and mask_ahicsr.shape[2] == 9:
                         mask_ahicsr = mask_ahicsr.permute(0, 2, 1)
                     loss_rad_ahicsr = torch.sum((innov_ahicsr ** 2) * mask_ahicsr) / (9.0 * torch.sum(mask_ahicsr) + 1e-8)
@@ -443,7 +464,7 @@ def train_epoch(
             metrics["loss_total"] = total_loss.item()
 
         if torch.isnan(total_loss):
-            print("[WARNING] NaN loss detected in batch! Skipping step...", flush=True)
+            log_msg(f"[WARNING] Batch {batch_idx}/{num_batches} yielded NaN loss! Skipping step...")
             optimizer.zero_grad()
             continue
 
@@ -451,12 +472,14 @@ def train_epoch(
         loss_accum = total_loss / accum_steps
         scaler.scale(loss_accum).backward()
 
-        if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == num_batches:
+        if batch_idx % accum_steps == 0 or batch_idx == num_batches:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+
+        running_loss += total_loss.item()
 
         if not epoch_losses:
             epoch_losses = {k: 0.0 for k in metrics.keys()}
@@ -464,6 +487,35 @@ def train_epoch(
         for k, v in metrics.items():
             epoch_losses[k] += v / num_batches
 
+        batch_time = time.time() - batch_step_start
+
+        # REAL-TIME INTRA-EPOCH STDOUT LOGGING
+        if batch_idx % log_batch_freq == 0 or batch_idx == num_batches:
+            elapsed_window = time.time() - batch_window_start
+            sec_per_batch = elapsed_window / log_batch_freq if batch_idx % log_batch_freq == 0 else elapsed_window
+            pct = (batch_idx / num_batches) * 100.0
+            avg_batch_loss = running_loss / batch_idx
+            
+            remaining_batches = num_batches - batch_idx
+            eta_seconds = remaining_batches * sec_per_batch
+            eta_hrs = eta_seconds / 3600.0
+
+            log_msg(
+                f"[Epoch {epoch:03d}/{total_epochs:03d}] Batch {batch_idx:04d}/{num_batches:04d} ({pct:5.1f}%) | "
+                f"Loss: {total_loss.item():.5e} (Avg: {avg_batch_loss:.5e}) | "
+                f"Step Time: {batch_time:.2f}s | Speed: {sec_per_batch:.2f}s/batch | "
+                f"Epoch ETA: {eta_hrs:.2f}h"
+            )
+            batch_window_start = time.time()
+
+        # SUB-EPOCH PERIODIC CHECKPOINTING
+        if batch_idx % save_batch_freq == 0:
+            base_dir = os.path.dirname(checkpoint_path) or "checkpoints"
+            latest_batch_ckpt = os.path.join(base_dir, "aida_gnn_surrogate_latest_batch.pt")
+            save_checkpoint(latest_batch_ckpt, model, optimizer, epoch, cfg, criterion, batch_idx=batch_idx)
+
+    epoch_elapsed = (time.time() - epoch_start_time) / 3600.0
+    log_msg(f"=== Epoch {epoch:03d} Completed in {epoch_elapsed:.2f} hours ===")
     return epoch_losses
 
 
@@ -474,16 +526,16 @@ def train_model(cfg: dict):
     train_cfg = cfg["training"]
     loss_cfg = cfg["loss_weights"]
 
-    print(f"[TRAIN] Beginning training for {train_cfg['epochs']} epochs...", flush=True)
+    log_msg(f"[TRAIN] Initializing AIDA GNN Surrogate Training Pipeline")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[TRAIN] Operating on compute device: {device}", flush=True)
+    log_msg(f"[TRAIN] Target Compute Device: {device}")
 
     zarr_path = paths["zarr_path"]
     if zarr_path and os.path.exists(zarr_path):
-        print(f"[TRAIN] Loading dataset from Zarr: '{zarr_path}'", flush=True)
+        log_msg(f"[TRAIN] Loading Zarr Dataset: '{zarr_path}'...")
         obs_dir = paths.get("obs_dir", None)
         if obs_dir and os.path.exists(obs_dir):
-            print(f"[TRAIN] Loading dataset from Obs: '{obs_dir}'", flush=True)
+            log_msg(f"[TRAIN] Loading Observation Directory: '{obs_dir}'...")
             dataset = LogState4DForecastDataset(zarr_path=zarr_path, obs_dir=obs_dir)
         else:
             dataset = LogState4DForecastDataset(zarr_path=zarr_path)
@@ -491,6 +543,7 @@ def train_model(cfg: dict):
         lat_deg = torch.tensor(dataset.latitudes, dtype=torch.float32) if hasattr(dataset, "latitudes") else torch.linspace(-90, 90, num_nodes)
         lon_deg = torch.tensor(dataset.longitudes, dtype=torch.float32) if hasattr(dataset, "longitudes") else torch.linspace(-180, 180, num_nodes)
     else:
+        log_msg("[TRAIN] Zarr path not found. Generating Synthetic Dataset...")
         dataset = SyntheticAIDAStateDataset(
             num_samples=mesh_cfg["samples"],
             num_nodes=mesh_cfg["num_nodes"],
@@ -500,14 +553,16 @@ def train_model(cfg: dict):
         lat_deg = torch.linspace(-90, 90, num_nodes)
         lon_deg = torch.linspace(-180, 180, num_nodes)
 
-    dataloader = DataLoader(dataset, batch_size=train_cfg["batch_size"], shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=train_cfg["batch_size"], shuffle=True, pin_memory=True, num_workers=2)
+    log_msg(f"[TRAIN] DataLoader initialized. Total Samples: {len(dataset)} | Total Batches: {len(dataloader)}")
 
+    log_msg("[GRAPH] Loading precomputed edge topology...")
     edge_index = generate_or_load_edge_index(
         num_nodes=num_nodes,
         edge_file=paths["edges_path"]
     ).to(device)
 
-    print("[TRAIN] Pre-computing M4 mesh sparse differential operators (Grad/Div)...", flush=True)
+    log_msg("[GRAPH] Pre-computing M4 sparse differential operators...")
     Gx_sparse, Gy_sparse = build_icosahedral_differential_operators(
         lat_deg=lat_deg,
         lon_deg=lon_deg,
@@ -525,34 +580,33 @@ def train_model(cfg: dict):
     out_vars = model_cfg.get("out_vars", 7)
     num_static_feats = model_cfg.get("num_static_feats", 4)
 
-    # 14 dynamic channels + 4 static channels = 18 total channels
     total_in_vars = in_vars + num_static_feats
 
+    log_msg("[MODEL] Constructing Icosahedral GNN Surrogate Model...")
     model = IcosahedralGNNSurrogate(
         in_vars=total_in_vars,
-        out_vars=out_vars,      # 7
+        out_vars=out_vars,
         hidden_dim=model_cfg["hidden_dim"],
         num_levels=num_levels,
         num_layers=num_layers
     ).to(device)
 
-    # Compute total trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
 
-    print(f"[MODEL] Total Parameters    : {total_params:,}", flush=True)
-    print(f"[MODEL] Trainable Parameters: {trainable_params:,}", flush=True)
+    log_msg(f"[MODEL] Total Parameters    : {total_params:,}")
+    log_msg(f"[MODEL] Trainable Parameters: {trainable_params:,}")
 
-    print("\n" + "=" * 60)
-    print(f"{'Layer / Module Name':<35} | {'Param Count':>18}")
-    print("=" * 60)
+    print("\n" + "=" * 60, flush=True)
+    print(f"{'Layer / Module Name':<35} | {'Param Count':>18}", flush=True)
+    print("=" * 60, flush=True)
 
     for name, param in model.named_parameters():
         if param.requires_grad:
-            print(f"{name:<35} | {param.numel():>18,}")
+            print(f"{name:<35} | {param.numel():>18,}", flush=True)
 
-    print("-" * 60)
-    print(f"{'Total Trainable Parameters':<35} | {sum(p.numel() for p in model.parameters() if p.requires_grad):>18,}")
+    print("-" * 60, flush=True)
+    print(f"{'Total Trainable Parameters':<35} | {sum(p.numel() for p in model.parameters() if p.requires_grad):>18,}", flush=True)
     print("=" * 60 + "\n", flush=True)
 
     criterion = AIDASurrogateLoss(num_levels=num_levels, **loss_cfg).to(device)
@@ -560,10 +614,7 @@ def train_model(cfg: dict):
 
     # Radiance Operators
     amsua_op = DifferentiableAMSUAOperator().to(device)
-    amsua_obs_err = torch.tensor([
-        2.5, 2.2, 1.2, 0.6, 0.3, 0.25, 0.25, 0.25,
-        0.25, 0.35, 0.55, 0.8, 1.2, 1.8, 3.5
-    ], dtype=torch.float32, device=device)
+    amsua_obs_err = torch.tensor([2.5, 2.2, 1.2, 0.6, 0.3, 0.25, 0.25, 0.25, 0.25, 0.35, 0.55, 0.8, 1.2, 1.8, 3.5], dtype=torch.float32, device=device)
 
     iasi_op = DifferentiableIASIOperator(num_levels=num_levels).to(device)
     iasi_obs_err = iasi_op.obs_errors.to(device)
@@ -595,24 +646,30 @@ def train_model(cfg: dict):
         weight_decay=train_cfg.get("weight_decay", 1e-4)
     )
 
-    print(f"[TRAIN] AMSU-A Radiance Weight: {loss_cfg.get('w_rad_amsua', 0.01)}", flush=True)
-    print(f"[TRAIN] IASI Radiance Weight  : {loss_cfg.get('w_rad_iasi', 0.01)}", flush=True)
-    print(f"[TRAIN] HMS Radiance Weight   : {loss_cfg.get('w_rad_hms', 0.01)}", flush=True)
-    print(f"[TRAIN] ATMS Radiance Weight  : {loss_cfg.get('w_rad_atms', 0.01)}", flush=True)
-    print(f"[TRAIN] CrIS Radiance Weight  : {loss_cfg.get('w_rad_cris', 0.01)}", flush=True)
-    print(f"[TRAIN] SEVIRI Radiance Weight: {loss_cfg.get('w_rad_seviri', 0.01)}", flush=True)
-    print(f"[TRAIN] GSRASR Radiance Weight: {loss_cfg.get('w_rad_gsrasr', 0.01)}", flush=True)
-    print(f"[TRAIN] GSRCSR Radiance Weight: {loss_cfg.get('w_rad_gsrcsr', 0.01)}", flush=True)
-    print(f"[TRAIN] AHICSR Radiance Weight: {loss_cfg.get('w_rad_ahicsr', 0.01)}", flush=True)
+    log_msg(f"[TRAIN] AMSU-A Radiance Weight: {loss_cfg.get('w_rad_amsua', 0.01)}")
+    log_msg(f"[TRAIN] IASI Radiance Weight  : {loss_cfg.get('w_rad_iasi', 0.01)}")
+    log_msg(f"[TRAIN] HMS Radiance Weight   : {loss_cfg.get('w_rad_hms', 0.01)}")
+    log_msg(f"[TRAIN] ATMS Radiance Weight  : {loss_cfg.get('w_rad_atms', 0.01)}")
+    log_msg(f"[TRAIN] CrIS Radiance Weight  : {loss_cfg.get('w_rad_cris', 0.01)}")
+    log_msg(f"[TRAIN] SEVIRI Radiance Weight: {loss_cfg.get('w_rad_seviri', 0.01)}")
+    log_msg(f"[TRAIN] GSRASR Radiance Weight: {loss_cfg.get('w_rad_gsrasr', 0.01)}")
+    log_msg(f"[TRAIN] GSRCSR Radiance Weight: {loss_cfg.get('w_rad_gsrcsr', 0.01)}")
+    log_msg(f"[TRAIN] AHICSR Radiance Weight: {loss_cfg.get('w_rad_ahicsr', 0.01)}")
 
     checkpoint_path = paths["checkpoint_path"]
-    save_interval = train_cfg.get("save_interval", 5)
+    save_interval = train_cfg.get("save_interval", 1)
     epochs = train_cfg["epochs"]
-    log_interval = train_cfg["log_interval"]
-    accum_steps = train_cfg.get("accum_steps", 8)
+    log_interval = train_cfg.get("log_interval", 1)
+    accum_steps = train_cfg.get("accum_steps", 16)
+    log_batch_freq = train_cfg.get("log_batch_freq", 10)
+    save_batch_freq = train_cfg.get("save_batch_freq", 100)
+
+    log_msg(f"[TRAIN] Starting Training Loop: {epochs} Epochs | Batch Accumulation: {accum_steps}")
 
     for epoch in range(1, epochs + 1):
         epoch_losses = train_epoch(
+            epoch=epoch,
+            total_epochs=epochs,
             model=model,
             dataloader=dataloader,
             optimizer=optimizer,
@@ -631,7 +688,11 @@ def train_model(cfg: dict):
             gsrcsr_op=gsrcsr_op, gsrcsr_obs_err=gsrcsr_obs_err,
             ahicsr_op=ahicsr_op, ahicsr_obs_err=ahicsr_obs_err,
             loss_cfg=loss_cfg,
-            accum_steps=accum_steps
+            cfg=cfg,
+            checkpoint_path=checkpoint_path,
+            accum_steps=accum_steps,
+            log_batch_freq=log_batch_freq,
+            save_batch_freq=save_batch_freq
         )
 
         if epoch % log_interval == 0 or epoch == epochs:
@@ -654,8 +715,8 @@ def train_model(cfg: dict):
         if epoch % save_interval == 0 or epoch == epochs:
             base_name, ext = os.path.splitext(checkpoint_path)
             epoch_ckpt_path = f"{base_name}_epoch_{epoch:03d}{ext}"
-            save_checkpoint(epoch_ckpt_path, model, optimizer, epoch, cfg, criterion)
-            save_checkpoint(checkpoint_path, model, optimizer, epoch, cfg, criterion)
+            save_checkpoint(epoch_ckpt_path, model, optimizer, epoch, cfg, criterion, batch_idx=0)
+            save_checkpoint(checkpoint_path, model, optimizer, epoch, cfg, criterion, batch_idx=0)
 
 
 def main():
