@@ -2,7 +2,9 @@
 """
 train_aida_surrogate.py
 -----------------------
-AIDA GNN Surrogate Model Training Script for Icosahedral Atmospheric Grids.
+AIDA GNN AI-Data Assimilation Training Script for Icosahedral Atmospheric Grids.
+Combines Background B_0h, Observations O_0h + Masks M_0h, and 4 Static Features
+to train the GNN model to produce Analysis A_0h at time 0h.
 Supports differentiable AMSU-A, IASI, HMS, ATMS, CrIS, and SEVIRI radiance loss
 integration with gradient accumulation and Automatic Mixed Precision (AMP) for memory optimization.
 Enhanced with real-time intra-epoch stdout progress flushing and periodic batch checkpointing.
@@ -120,15 +122,8 @@ def train_epoch(
         batch_step_start = time.time()
 
         if isinstance(batch_data, dict):
-            if 'input_trajectory' in batch_data:
-                x_batch = batch_data['input_trajectory'].to(device, non_blocking=True)
-            else:
-                x_batch = batch_data['background'].to(device, non_blocking=True)
-
-            if 'target_state' in batch_data:
-                y_batch = batch_data['target_state'].to(device, non_blocking=True)
-            else:
-                y_batch = batch_data['target'].to(device, non_blocking=True)
+            b_zero = batch_data['background_0h'].to(device, non_blocking=True)
+            target_a0 = batch_data['target_analysis_0h'].to(device, non_blocking=True)
 
             valid_mask = batch_data.get('valid_mask', None)
             if valid_mask is not None:
@@ -163,8 +158,8 @@ def train_epoch(
             obs_conv_val = batch_data.get('obs_conv_val', None)
             obs_conv_mask = batch_data.get('obs_conv_mask', None)
         else:
-            x_batch = batch_data[0].to(device, non_blocking=True)
-            y_batch = batch_data[1].to(device, non_blocking=True)
+            b_zero = batch_data[0].to(device, non_blocking=True)
+            target_a0 = batch_data[1].to(device, non_blocking=True)
             valid_mask, static_topo, h_3d = None, None, None
             obs_amsua_tb, obs_amsua_mask = None, None
             obs_iasi_tb, obs_iasi_mask = None, None
@@ -177,20 +172,28 @@ def train_epoch(
             obs_ahicsr_tb, obs_ahicsr_mask = None, None
             obs_conv_val, obs_conv_mask = None, None
 
+        num_levels = b_zero.shape[2]
+
+        # Construct AI-DA Input: [B_0h (7), Obs_Val_0h (7), Obs_Mask_0h (7), Static_Topo (4)] = 25 Channels
+        if obs_conv_val is not None and obs_conv_mask is not None:
+            conv_v = obs_conv_val.to(device, non_blocking=True)
+            conv_m = obs_conv_mask.to(device, non_blocking=True)
+        else:
+            conv_v = torch.zeros_like(b_zero)
+            conv_m = torch.zeros_like(b_zero)
+
+        static_topo_exp = static_topo.unsqueeze(2).expand(-1, -1, num_levels, -1) if static_topo is not None else torch.zeros((b_zero.shape[0], 4, num_levels, b_zero.shape[3]), device=device)
+
+        # 25-Channel AI-DA Input Tensor
+        x_input = torch.cat([b_zero, conv_v, conv_m, static_topo_exp], dim=1)
+
         # AUTOMATIC MIXED PRECISION FORWARD PASS
         with torch.amp.autocast('cuda', enabled=(device.type == "cuda"), dtype=amp_dtype):
-            if static_topo is not None and x_batch.shape[1] == 14:
-                num_levels = x_batch.shape[2]
-                static_topo_expanded = static_topo.unsqueeze(2).expand(-1, -1, num_levels, -1)
-                x_input = torch.cat([x_batch, static_topo_expanded], dim=1)
-            else:
-                x_input = x_batch
-
-            pred = model(x_input, edge_index)
+            a_pred = model(x_input, edge_index)
 
             loss, metrics = criterion(
-                pred=pred,
-                target=y_batch,
+                pred=a_pred,
+                target=target_a0,
                 edge_index=edge_index,
                 graph_mesh_ops=graph_mesh_ops,
                 valid_mask=valid_mask,
@@ -205,8 +208,8 @@ def train_epoch(
             std_p = getattr(criterion, "std_ln_p", 1.0)
             mu_p = getattr(criterion, "mu_ln_p", 0.0)
 
-            ln_T_phys = pred[:, 0, :, :].permute(0, 2, 1) * std_t + mu_t
-            ln_p_phys = pred[:, 6, :, :].permute(0, 2, 1) * std_p + mu_p
+            ln_T_phys = a_pred[:, 0, :, :].permute(0, 2, 1) * std_t + mu_t
+            ln_p_phys = a_pred[:, 6, :, :].permute(0, 2, 1) * std_p + mu_p
 
             t_k = torch.clamp(torch.exp(ln_T_phys), min=180.0, max=330.0)
             p_hpa = torch.clamp(torch.exp(ln_p_phys) / 100.0, min=0.01, max=1050.0)
@@ -217,11 +220,11 @@ def train_epoch(
                 conv_val = obs_conv_val.to(device, non_blocking=True)
                 if obs_conv_mask is not None:
                     conv_m = obs_conv_mask.to(device, non_blocking=True)
-                    loss_conv = torch.sum(((pred - conv_val) ** 2) * conv_m) / (torch.sum(conv_m) + 1e-8)
+                    loss_conv = torch.sum(((a_pred - conv_val) ** 2) * conv_m) / (torch.sum(conv_m) + 1e-8)
                 else:
-                    loss_conv = F.mse_loss(pred, conv_val)
+                    loss_conv = F.mse_loss(a_pred, conv_val)
             else:
-                loss_conv = F.mse_loss(pred[:, [0, 1, 2, 4, 6], :, :], y_batch[:, [0, 1, 2, 4, 6], :, :])
+                loss_conv = F.mse_loss(a_pred[:, [0, 1, 2, 4, 6], :, :], target_a0[:, [0, 1, 2, 4, 6], :, :])
 
             total_loss += (w_conv * loss_conv)
             metrics["loss_conv"] = loss_conv.item()
@@ -495,7 +498,7 @@ def train_epoch(
             sec_per_batch = elapsed_window / log_batch_freq if batch_idx % log_batch_freq == 0 else elapsed_window
             pct = (batch_idx / num_batches) * 100.0
             avg_batch_loss = running_loss / batch_idx
-            
+
             remaining_batches = num_batches - batch_idx
             eta_seconds = remaining_batches * sec_per_batch
             eta_hrs = eta_seconds / 3600.0
@@ -526,7 +529,7 @@ def train_model(cfg: dict):
     train_cfg = cfg["training"]
     loss_cfg = cfg["loss_weights"]
 
-    log_msg(f"[TRAIN] Initializing AIDA GNN Surrogate Training Pipeline")
+    log_msg(f"[TRAIN] Initializing AIDA GNN AI-DA Pipeline")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_msg(f"[TRAIN] Target Compute Device: {device}")
 
@@ -576,11 +579,10 @@ def train_model(cfg: dict):
 
     num_levels = mesh_cfg.get("num_levels", 32)
     num_layers = model_cfg.get("num_layers", 4)
-    in_vars = model_cfg.get("in_vars", 14)
     out_vars = model_cfg.get("out_vars", 7)
-    num_static_feats = model_cfg.get("num_static_feats", 4)
 
-    total_in_vars = in_vars + num_static_feats
+    # 25 Total Input Channels: B_0h (7) + Conv_Val (7) + Conv_Mask (7) + Static_Topo (4)
+    total_in_vars = 25
 
     log_msg("[MODEL] Constructing Icosahedral GNN Surrogate Model...")
     model = IcosahedralGNNSurrogate(

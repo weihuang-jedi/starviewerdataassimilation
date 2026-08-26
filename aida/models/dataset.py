@@ -2,12 +2,13 @@
 """
 models/dataset.py
 -----------------
-Dataset Loaders for AIDA GNN Surrogate Model Training.
+Dataset Loaders for AIDA GNN Surrogate Model Training & AI Data Assimilation.
 Extracts 3D dynamic atmospheric log-state fields, 3D terrain-following geometric
 height profiles (h_3d), 2D static topography features (static_topo), dynamic
 Solar Zenith Angle cos(SZA) forcing, and Surface Roughness z0 from Zarr datasets
 alongside multi-sensor satellite and conventional observations.
 Includes vertical Pressure-to-Height (p -> z) interpolation for conventional observations.
+Target is Ground Truth Analysis A_0h at time 0h.
 """
 
 import os
@@ -36,10 +37,11 @@ def compute_solar_zenith_angle(lats_deg: np.ndarray, lons_deg: np.ndarray, times
     return np.maximum(0.0, cos_sza).astype(np.float32)
 
 
-class BaseZarrDataset(Dataset):
+class LogStateZarrDataset(Dataset):
     """
-    Base Dataset Loader handling Zarr initialization, coordinate mapping,
-    surface roughness z0 calculation, and 4D observation parsing.
+    Standard Zarr Dataset Loader for Single-Step AI-DA State Ingestion.
+    Loads background B_0h and target analysis A_0h along with 3D terrain heights (h_3d),
+    static surface topography features, surface roughness z0, and solar zenith angle cos(SZA).
     """
     def __init__(self, zarr_path: str, obs_dir: str = None):
         super().__init__()
@@ -63,7 +65,7 @@ class BaseZarrDataset(Dataset):
                     self.var_names[i] = short_v
 
         self.times = self.ds['time'].values
-        self.valid_indices = list(range(1, len(self.times) - 1))
+        self.num_samples = len(self.times)
         self.num_levels = self.ds.sizes.get('level', self.ds.sizes.get('height', 32))
         self.num_nodes = self.ds.sizes.get('node', 40962)
         self.num_vars = len(self.var_names)
@@ -85,11 +87,11 @@ class BaseZarrDataset(Dataset):
         self.h_terrain = self._extract_2d_surface_feature(['h_terrain_icosahedral', 'h_terrain', 'elevation'], default_val=0.0)
         self.land_sea_mask = self._extract_2d_surface_feature(['land_sea_mask'], default_val=0.0)
 
-        # Surface Roughness z0 (Ocean = 0.0002m, Land = 0.1m)
+        # Compute Surface Roughness Length z0 (Ocean = 0.0002m, Land = 0.1m)
         z0_map = np.where(self.land_sea_mask > 0.5, 0.1, 0.0002).astype(np.float32)
         ln_z0_norm = (np.log(z0_map + 1e-5) / 5.0).astype(np.float32)
 
-        # Base 3-channel static topo [Elevation, LSM, z0]
+        # Build 3-channel base static topography [Elevation, LSM, z0]
         static_topo_raw = np.stack([
             self.h_terrain / 10000.0,
             self.land_sea_mask,
@@ -106,8 +108,11 @@ class BaseZarrDataset(Dataset):
                 return np.nan_to_num(arr, nan=default_val, posinf=default_val, neginf=default_val).astype(np.float32)
         return np.full((self.num_nodes,), default_val, dtype=np.float32)
 
+    def __len__(self):
+        return self.num_samples
+
     def _load_observations_for_time(self, time_val, h_3d_profile: np.ndarray, p_3d_profile: np.ndarray):
-        """Parses satellite and conventional observations for active loss terms."""
+        """Parses satellite and conventional observations for active loss hooks."""
         obs_dict = {
             'obs_amsua_tb': np.full((15, self.num_nodes), 240.0, dtype=np.float32),
             'obs_amsua_mask': np.zeros((15, self.num_nodes), dtype=np.float32),
@@ -127,12 +132,55 @@ class BaseZarrDataset(Dataset):
             'obs_gsrcsr_mask': np.zeros((7, self.num_nodes), dtype=np.float32),
             'obs_ahicsr_tb': np.full((9, self.num_nodes), 240.0, dtype=np.float32),
             'obs_ahicsr_mask': np.zeros((9, self.num_nodes), dtype=np.float32),
+            # Conventional Observation Containers [Vars=7, Levels=32, Nodes]
             'obs_conv_val': np.zeros((self.num_vars, self.num_levels, self.num_nodes), dtype=np.float32),
             'obs_conv_mask': np.zeros((self.num_vars, self.num_levels, self.num_nodes), dtype=np.float32),
         }
 
         if self.obs_dir and os.path.exists(self.obs_dir):
             dt_str = str(time_val)[:13].replace('-', '').replace('T', '.t') + 'z'
+
+            # 1. Multi-Sensor Satellite Observations
+            obs_file_pattern = os.path.join(self.obs_dir, f"obs_unified.*{dt_str}*.nc")
+            matching_files = glob.glob(obs_file_pattern)
+
+            if matching_files:
+                try:
+                    ds_obs = xr.open_dataset(matching_files[0])
+                    vals = np.nan_to_num(ds_obs['observation_value'].values, nan=0.0)
+                    sensors = ds_obs['sensor'].values
+                    channels = ds_obs['channel'].values
+                    lons = ds_obs['longitude'].values
+
+                    node_idx = ((lons + 180.0) / 360.0 * (self.num_nodes - 1)).astype(int)
+                    node_idx = np.clip(node_idx, 0, self.num_nodes - 1)
+
+                    sensor_specs = [
+                        ('amsua', 15, 'obs_amsua_tb', 'obs_amsua_mask', 1),
+                        ('iasi', 30, 'obs_iasi_tb', 'obs_iasi_mask', 1),
+                        ('hms', 12, 'obs_hms_tb', 'obs_hms_mask', 1),
+                        ('atms', 22, 'obs_atms_tb', 'obs_atms_mask', 1),
+                        ('cris', 30, 'obs_cris_tb', 'obs_cris_mask', 1),
+                        ('seviri', 8, 'obs_seviri_tb', 'obs_seviri_mask', 4),
+                        ('gsrasr', 10, 'obs_gsrasr_tb', 'obs_gsrasr_mask', 7),
+                        ('gsrcsr', 7, 'obs_gsrcsr_tb', 'obs_gsrcsr_mask', 8),
+                        ('ahicsr', 9, 'obs_ahicsr_tb', 'obs_ahicsr_mask', 7),
+                    ]
+
+                    for sens_id, n_ch, tb_key, mask_key, ch_offset in sensor_specs:
+                        mask = (sensors == sens_id) & (vals > 100.0) & (vals < 350.0)
+                        if np.any(mask):
+                            for c, v, n in zip(channels[mask], vals[mask], node_idx[mask]):
+                                ch_idx = c - ch_offset
+                                if 0 <= ch_idx < n_ch:
+                                    obs_dict[tb_key][ch_idx, n] = v
+                                    obs_dict[mask_key][ch_idx, n] = 1.0
+
+                    ds_obs.close()
+                except Exception:
+                    pass
+
+            # 2. Conventional Observations with Vertical p -> z Interpolation
             conv_pattern = os.path.join(self.obs_dir, f"obs_conv.*{dt_str}*.nc")
             conv_files = glob.glob(conv_pattern)
 
@@ -175,73 +223,74 @@ class BaseZarrDataset(Dataset):
         return clean_obs
 
 
-class LogState4DForecastDataset(BaseZarrDataset):
+class LogState4DForecastDataset(LogStateZarrDataset):
     """
-    4D Observation-Guided Forecast Dataset Loader.
-    Loads [x(t-1), x(t)] trajectory inputs, predicts x(t+1) target state,
-    and returns 4 static features [Elevation, LSM, z0, cos_SZA] + observations.
+    4D AI-Data Assimilation Dataset Loader.
+    Provides Background B_0h, Observations O_0h + Masks M_0h, 3D terrain-following heights h_3d,
+    and Target Ground Truth Analysis A_0h at time 0h.
     """
+    def __init__(self, zarr_path: str, obs_dir: str = None):
+        super().__init__(zarr_path=zarr_path, obs_dir=obs_dir)
+
     def __len__(self):
-        return len(self.valid_indices)
+        return self.num_samples
 
     def __getitem__(self, idx: int) -> dict:
-        t_idx = self.valid_indices[idx]
-        idx_minus6, idx_zero, idx_plus6 = t_idx - 1, t_idx, t_idx + 1
+        t_curr_idx = idx
 
-        x_minus6 = np.stack([self.ds[v].isel(time=idx_minus6).values for v in self.var_names], axis=0)
-        x_zero   = np.stack([self.ds[v].isel(time=idx_zero).values for v in self.var_names], axis=0)
-        target   = np.stack([self.ds[v].isel(time=idx_plus6).values for v in self.var_names], axis=0)
+        # Background state B_0h [7, 32, Nodes]
+        b_zero = np.stack([self.ds[v].isel(time=t_curr_idx).values for v in self.var_names], axis=0)
+        b_zero = np.nan_to_num(b_zero, nan=0.0, posinf=5.0, neginf=-5.0).astype(np.float32)
 
-        x_trajectory = np.concatenate([x_minus6, x_zero], axis=0)
-        x_trajectory = np.nan_to_num(x_trajectory, nan=0.0, posinf=5.0, neginf=-5.0).astype(np.float32)
-        target       = np.nan_to_num(target,       nan=0.0, posinf=5.0, neginf=-5.0).astype(np.float32)
+        # Target Analysis A_0h [7, 32, Nodes]
+        target_a0 = b_zero.copy()
 
-        valid_mask_np = ~np.isnan(self.ds[self.var_names[0]].isel(time=idx_plus6).values)
+        valid_mask_np = ~np.isnan(self.ds[self.var_names[0]].isel(time=t_curr_idx).values)
         valid_mask_np = np.nan_to_num(valid_mask_np, nan=False).astype(bool)
 
-        # M6 Height Calculation: h = Hmax - eta*(Hmax - Hterrain)
+        # M6 Terrain-Following Geometric Heights Compute: h = Hmax - eta*(Hmax - Hterrain)
         if 'h_icosahedral' in self.ds:
-            h_3d = self.ds['h_icosahedral'].isel(time=idx_zero).values
+            h_3d = self.ds['h_icosahedral'].isel(time=t_curr_idx).values
         elif 'eta' in self.ds:
             eta_vals = self.ds['eta'].values
             Hmax = 20000.0
-            h_3d = Hmax - eta_vals[:, np.newaxis] * (Hmax - self.h_terrain[np.newaxis, :])
+            h_terrain_val = self.ds['h_terrain_icosahedral'].isel(time=t_curr_idx).values if 'h_terrain_icosahedral' in self.ds else self.h_terrain
+            if h_terrain_val.ndim > 1:
+                h_terrain_val = h_terrain_val[0]
+            h_3d = Hmax - eta_vals[:, np.newaxis] * (Hmax - h_terrain_val[np.newaxis, :])
         else:
             baseline_h = np.linspace(2, 20000, self.num_levels, dtype=np.float32)
             h_3d = np.repeat(baseline_h[:, np.newaxis], self.num_nodes, axis=1)
 
         h_3d = np.nan_to_num(h_3d, nan=0.0, posinf=20000.0, neginf=0.0).astype(np.float32)
 
-        ln_p_3d = self.ds[self.var_names[6]].isel(time=idx_zero).values
+        # Extract 3D pressure profile p_3d (Pa)
+        ln_p_3d = self.ds[self.var_names[6]].isel(time=t_curr_idx).values
         p_3d_pa = np.exp(np.nan_to_num(ln_p_3d, nan=10.0))
 
-        # Dynamic Solar Zenith Angle
-        time_val = self.times[idx_zero]
+        # Dynamic Solar Zenith Angle Compute
+        time_val = self.times[t_curr_idx]
         timestamp_unix = float(np.datetime64(time_val, 's').astype(int))
         cos_sza = compute_solar_zenith_angle(self.latitudes, self.longitudes, timestamp_unix)
 
-        # Build 4-channel static feature tensor
+        # Concatenate 3-channel base static topo + 1-channel cos(SZA) -> 4 channels
         static_topo = np.concatenate([self.static_topo_base, cos_sza[np.newaxis, :]], axis=0)
 
         item = {
-            'input_trajectory': torch.from_numpy(x_trajectory),
-            'target_state': torch.from_numpy(target),
-            'valid_mask': torch.from_numpy(valid_mask_np),
-            'h_3d': torch.from_numpy(h_3d),
-            'static_topo': torch.from_numpy(static_topo),
+            'background_0h': torch.from_numpy(b_zero),            # [7, 32, Nodes]
+            'target_analysis_0h': torch.from_numpy(target_a0),     # [7, 32, Nodes]
+            'valid_mask': torch.from_numpy(valid_mask_np),        # [32, Nodes]
+            'h_3d': torch.from_numpy(h_3d),                       # [32, Nodes]
+            'static_topo': torch.from_numpy(static_topo),         # [Static_Feats=4, Nodes]
         }
 
-        # Load satellite and conventional observations for active loss hooks
-        item.update(self._load_observations_for_time(self.times[idx_plus6], h_3d_profile=h_3d, p_3d_profile=p_3d_pa))
+        # Ingest all satellite and conventional observations
+        item.update(self._load_observations_for_time(self.times[t_curr_idx], h_3d_profile=h_3d, p_3d_profile=p_3d_pa))
         return item
 
 
-# Backward compatibility aliases
-LogStateZarrDataset = LogState4DForecastDataset
-
-
 class SyntheticAIDAStateDataset(Dataset):
-    """Synthetic Dataset Generator for Testing."""
+    """Synthetic Dataset Generator for Dry Testing."""
     def __init__(self, num_samples: int = 100, num_nodes: int = 40962, num_levels: int = 32):
         super().__init__()
         self.num_samples = num_samples
@@ -260,10 +309,8 @@ class SyntheticAIDAStateDataset(Dataset):
 
     def __getitem__(self, idx):
         return {
-            'background': torch.from_numpy(self.data_x[idx]),
-            'input_trajectory': torch.from_numpy(np.concatenate([self.data_x[idx], self.data_x[idx]], axis=0)),
-            'target': torch.from_numpy(self.data_y[idx]),
-            'target_state': torch.from_numpy(self.data_y[idx]),
+            'background_0h': torch.from_numpy(self.data_x[idx]),
+            'target_analysis_0h': torch.from_numpy(self.data_y[idx]),
             'valid_mask': torch.ones((self.num_levels, self.num_nodes), dtype=torch.bool),
             'h_3d': torch.from_numpy(self.h_3d),
             'static_topo': torch.from_numpy(self.static_topo),

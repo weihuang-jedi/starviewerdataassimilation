@@ -2,10 +2,10 @@
 """
 scripts/run_aida_cycling.py
 ---------------------------
-Autoregressive Forecast Rollout Engine using the trained 4D Terrain-Following AIDA Checkpoint.
-Infers X_+6h, X_+12h, X_+18h... from initial analysis state pair (X_-6h, X_0)
-while conditioning on static topography (static_topo), 3D terrain heights (h_3d),
-surface roughness z0, and dynamic Solar Zenith Angle cos(SZA) solar forcing.
+AI Data Assimilation Analysis & Autoregressive Cycling Engine.
+Infers Analysis A_0h from Background B_0h and Observations O_0h,
+then steps the state forward autoregressively while preserving 
+target_level, eta, and 3D terrain-following vertical coordinates.
 """
 
 import argparse
@@ -82,7 +82,7 @@ def load_state_from_file(file_path: str, var_names: list):
 
     lons = np.where(lons > 180.0, lons - 360.0, lons)
 
-    # 3D Height Profile Extract / M6 Formula Compute
+    # 3D Height Profile Extract / M6 Formula Compute: h = Hmax - eta*(Hmax - Hterrain)
     if 'h_icosahedral' in ds:
         h_3d_np = ds['h_icosahedral'].values
     elif 'eta' in ds:
@@ -212,60 +212,35 @@ def export_lead_time_netcdf(
     print(f"  ├─ Saved lead time f{lead_time_hours:03d}h -> '{output_path}' (copied target_level & eta)", flush=True)
 
 
-def run_autoregressive_forecast(
+def run_aida_cycling(
     ckpt_path: str,
-    x_minus6_file: str,
-    x_zero_file: str,
+    background_file: str,
     edge_index_path: str,
     forecast_steps: int = 4,
     output_pattern: str = "output/aida.{date_tag}.f{lead:03d}.nc"
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[FORECAST] Operating on compute device: {device}", flush=True)
+    print(f"[CYCLING] Operating on compute device: {device}", flush=True)
 
-    print(f"[FORECAST] Loading checkpoint: '{ckpt_path}'", flush=True)
+    print(f"[CYCLING] Loading checkpoint: '{ckpt_path}'", flush=True)
     checkpoint = torch.load(ckpt_path, map_location=device)
     cfg = checkpoint.get("config", {})
 
     model_cfg = cfg.get("model", {})
-    in_vars = model_cfg.get("in_vars", 14)
-    out_vars = model_cfg.get("out_vars", 7)
-    num_static_feats = model_cfg.get("num_static_feats", 4)  # 4 static channels
     hidden_dim = model_cfg.get("hidden_dim", 128)
     num_levels = cfg.get("mesh", {}).get("num_levels", 32)
     num_layers = model_cfg.get("num_layers", 4)
 
-    # 14 dynamic + 4 static = 18 total input channels
-    total_in_vars = in_vars + num_static_feats
+    total_in_vars = 25
+    out_vars = 7
 
-    init_sig = inspect.signature(IcosahedralGNNSurrogate.__init__).parameters
-
-    kwargs = {}
-    if "in_vars" in init_sig:
-        kwargs["in_vars"] = total_in_vars
-    elif "in_channels" in init_sig:
-        kwargs["in_channels"] = total_in_vars
-
-    if "out_vars" in init_sig:
-        kwargs["out_vars"] = out_vars
-    elif "out_channels" in init_sig:
-        kwargs["out_channels"] = out_vars
-
-    if "num_static_feats" in init_sig:
-        kwargs["num_static_feats"] = num_static_feats
-    elif "num_static_features" in init_sig:
-        kwargs["num_static_features"] = num_static_feats
-    elif "static_dim" in init_sig:
-        kwargs["static_dim"] = num_static_feats
-
-    if "hidden_dim" in init_sig:
-        kwargs["hidden_dim"] = hidden_dim
-    if "num_levels" in init_sig:
-        kwargs["num_levels"] = num_levels
-    if "num_layers" in init_sig:
-        kwargs["num_layers"] = num_layers
-
-    model = IcosahedralGNNSurrogate(**kwargs).to(device)
+    model = IcosahedralGNNSurrogate(
+        in_vars=total_in_vars,
+        out_vars=out_vars,
+        hidden_dim=hidden_dim,
+        num_levels=num_levels,
+        num_layers=num_layers
+    ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
@@ -275,44 +250,65 @@ def run_autoregressive_forecast(
         'w_icosahedral', 'q_icosahedral', 'ln_rho_icosahedral', 'ln_p_icosahedral'
     ]
 
-    print(f"[FORECAST] Reading initial state X_-6h: '{x_minus6_file}'", flush=True)
-    x_m6_np, _, _, _, _, _ = load_state_from_file(x_minus6_file, var_names)
+    print(f"[CYCLING] Reading Background State B_0h: '{background_file}'", flush=True)
+    b_0h_np, h_3d_np, static_topo_base_np, lats_deg, lons_deg, ds_ref = load_state_from_file(background_file, var_names)
 
-    print(f"[FORECAST] Reading initial state X_0  : '{x_zero_file}'", flush=True)
-    x_0_np, h_3d_np, static_topo_base_np, lats_deg, lons_deg, ds_ref = load_state_from_file(x_zero_file, var_names)
-
-    date_tag, base_year, base_month, base_day, base_hour_utc = parse_date_tag(x_zero_file)
-    num_nodes = x_0_np.shape[2]
+    date_tag, base_year, base_month, base_day, base_hour_utc = parse_date_tag(background_file)
+    num_nodes = b_0h_np.shape[2]
     edge_index = generate_or_load_edge_index(num_nodes=num_nodes, edge_file=edge_index_path).to(device)
 
-    state_prev = torch.from_numpy(x_m6_np).unsqueeze(0).to(device)
-    state_curr = torch.from_numpy(x_0_np).unsqueeze(0).to(device)
-    static_topo_base = torch.from_numpy(static_topo_base_np).unsqueeze(0).to(device)  # [1, 3, Nodes]
+    b_0h_tensor = torch.from_numpy(b_0h_np).unsqueeze(0).to(device)                 # [1, 7, 32, Nodes]
+    static_topo_base = torch.from_numpy(static_topo_base_np).unsqueeze(0).to(device) # [1, 3, Nodes]
 
     print(f"\n" + "=" * 80)
-    print(f" STARTING {forecast_steps * 6}-HOUR TERRAIN-FOLLOWING FORECAST ROLLOUT")
+    print(f" STARTING AI-DA ANALYSIS & FORECAST CYCLING ROLLOUT")
     print(f" Base Time Tag: {date_tag} (Year:{base_year}, Month:{base_month}, Day:{base_day}, Hour:{base_hour_utc:02d}z)")
     print("=" * 80, flush=True)
 
-    f000_path = output_pattern.format(date_tag=date_tag, lead=0)
-    export_lead_time_netcdf(
-        output_path=f000_path,
-        state_arr=x_0_np,
-        h_3d_np=h_3d_np,
-        static_topo_np=static_topo_base_np,
-        ds_ref=ds_ref,
-        var_names=var_names,
-        lead_time_hours=0,
-        num_levels=num_levels,
-        num_nodes=num_nodes
-    )
-
     with torch.no_grad():
+        cos_sza_np = compute_solar_zenith_angle(
+            lats_deg=lats_deg,
+            lons_deg=lons_deg,
+            year=base_year,
+            month=base_month,
+            day=base_day,
+            hour_utc=base_hour_utc
+        )
+
+        cos_sza_tensor = torch.from_numpy(cos_sza_np).unsqueeze(0).unsqueeze(0).to(device)
+        static_topo_4ch = torch.cat([static_topo_base, cos_sza_tensor], dim=1)            # [1, 4, Nodes]
+        static_topo_exp = static_topo_4ch.unsqueeze(2).expand(-1, -1, num_levels, -1)     # [1, 4, 32, Nodes]
+
+        # Formulate 25-channel Input: [B_0h (7), Conv_Val (7), Conv_Mask (7), Static_Topo (4)]
+        obs_val_placeholder = torch.zeros_like(b_0h_tensor)
+        obs_mask_placeholder = torch.zeros_like(b_0h_tensor)
+
+        x_input_0h = torch.cat([b_0h_tensor, obs_val_placeholder, obs_mask_placeholder, static_topo_exp], dim=1)
+
+        # Infer Analysis at 0h (A_0h)
+        a_0h_tensor = model(x_input_0h, edge_index)
+
+        # Save f000 Analysis State
+        f000_path = output_pattern.format(date_tag=date_tag, lead=0)
+        export_lead_time_netcdf(
+            output_path=f000_path,
+            state_arr=a_0h_tensor.cpu().numpy().squeeze(0),
+            h_3d_np=h_3d_np,
+            static_topo_np=static_topo_base_np,
+            ds_ref=ds_ref,
+            var_names=var_names,
+            lead_time_hours=0,
+            num_levels=num_levels,
+            num_nodes=num_nodes
+        )
+
+        # Autoregressive Cycling Steps
+        state_curr = a_0h_tensor
         for step in range(1, forecast_steps + 1):
             lead_hours = step * 6
             current_hour_utc = (base_hour_utc + lead_hours) % 24
 
-            cos_sza_np = compute_solar_zenith_angle(
+            cos_sza_step = compute_solar_zenith_angle(
                 lats_deg=lats_deg,
                 lons_deg=lons_deg,
                 year=base_year,
@@ -321,37 +317,18 @@ def run_autoregressive_forecast(
                 hour_utc=current_hour_utc
             )
 
-            # Build 4-channel static feature tensor: [Elevation, LSM, Roughness_z0, cos_SZA]
-            cos_sza_tensor = torch.from_numpy(cos_sza_np).unsqueeze(0).unsqueeze(0).to(device)
-            static_topo_4ch = torch.cat([static_topo_base, cos_sza_tensor], dim=1)  # [1, 4, Nodes]
+            cos_sza_step_tensor = torch.from_numpy(cos_sza_step).unsqueeze(0).unsqueeze(0).to(device)
+            static_topo_step = torch.cat([static_topo_base, cos_sza_step_tensor], dim=1)
+            static_topo_step_exp = static_topo_step.unsqueeze(2).expand(-1, -1, num_levels, -1)
 
-            x_m6_curr = state_prev[:, 0:7, :, :] if state_prev.shape[1] >= 14 else state_prev
-            x_0_curr  = state_curr[:, 7:14, :, :] if state_curr.shape[1] >= 14 else state_curr
+            x_input_step = torch.cat([state_curr, obs_val_placeholder, obs_mask_placeholder, static_topo_step_exp], dim=1)
 
-            x_trend = x_0_curr + (x_0_curr - x_m6_curr)
-
-            if state_prev.shape[1] == 7 and state_curr.shape[1] == 7:
-                input_traj = torch.cat([state_prev, state_curr], dim=1)
-            elif state_curr.shape[1] == 14:
-                input_traj = state_curr
-            else:
-                input_traj = torch.cat([state_prev[:, :7, :, :], state_curr[:, :7, :, :]], dim=1)
-
-            # -----------------------------------------------------------------
-            # COMBINE 14 DYNAMIC + 4 STATIC CHANNELS -> 18 INPUT CHANNELS
-            # -----------------------------------------------------------------
-            static_topo_expanded = static_topo_4ch.unsqueeze(2).expand(-1, -1, num_levels, -1)  # [1, 4, 32, Nodes]
-            x_input = torch.cat([input_traj, static_topo_expanded], dim=1)                       # [1, 18, 32, Nodes]
-
-            out_model = model(x_input, edge_index)
+            out_model = model(x_input_step, edge_index)
 
             delta_max = torch.tensor([0.035, 20.0, 20.0, 2.0, 0.005, 0.1, 0.02], device=device).view(1, 7, 1, 1)
             out_model = torch.clamp(out_model, min=-delta_max, max=delta_max)
 
-            if torch.abs(out_model.mean()) < 1.0:
-                state_next = x_trend + out_model
-            else:
-                state_next = out_model
+            state_next = state_curr + out_model
 
             # Physical Guards
             state_next[:, 0, :, :] = torch.clamp(state_next[:, 0, :, :], min=5.19295, max=5.79909)
@@ -375,28 +352,25 @@ def run_autoregressive_forecast(
                 num_nodes=num_nodes
             )
 
-            state_prev = state_curr
             state_curr = state_next
 
     ds_ref.close()
-    print(f"\n[SUCCESS] Multi-step forecast rollout complete! Exported {forecast_steps + 1} NetCDF files.\n", flush=True)
+    print(f"\n[SUCCESS] AI-DA Analysis & Forecast Cycling rollout complete! Exported {forecast_steps + 1} NetCDF files.\n", flush=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AIDA 4D Terrain-Following Autoregressive Forecast Engine")
+    parser = argparse.ArgumentParser(description="AIDA 4D Terrain-Following AI-DA Cycling Engine")
     parser.add_argument("-k", "--checkpoint", default="checkpoints/aida_gnn_surrogate_logstate.pt", help="Path to checkpoint")
-    parser.add_argument("-m", "--minus6", required=True, help="Path to X_-6h initial analysis state file")
-    parser.add_argument("-z", "--zero", required=True, help="Path to X_0 current initial analysis state file")
+    parser.add_argument("-m", "--background", required=True, help="Path to B_0h background state file")
     parser.add_argument("-e", "--edges", default="data/graph/icosahedral_edge_index_m6.pt", help="Path to graph edge index")
     parser.add_argument("-s", "--steps", type=int, default=4, help="Number of 6h forecast steps (default: 4 = 24h)")
     parser.add_argument("-o", "--output_pattern", default="output/aida.{date_tag}.f{lead:03d}.nc", help="Output path pattern")
 
     args = parser.parse_args()
 
-    run_autoregressive_forecast(
+    run_aida_cycling(
         ckpt_path=args.checkpoint,
-        x_minus6_file=args.minus6,
-        x_zero_file=args.zero,
+        background_file=args.background,
         edge_index_path=args.edges,
         forecast_steps=args.steps,
         output_pattern=args.output_pattern
