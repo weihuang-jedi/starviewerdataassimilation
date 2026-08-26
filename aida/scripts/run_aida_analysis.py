@@ -2,21 +2,20 @@
 """
 scripts/run_aida_cycling.py
 ---------------------------
-AI Data Assimilation Analysis & Autoregressive Cycling Engine.
-Infers Analysis A_0h from Background B_0h and Observations O_0h,
-then steps the state forward autoregressively while preserving 
-target_level, eta, and 3D terrain-following vertical coordinates.
+Pure AI Data Assimilation (AI-DA) Analysis Engine.
+Infers Analysis A_0h from Background B_0h and Observations O_0h at time 0h,
+and outputs exclusively the single A_0h Analysis NetCDF state (f000).
 """
 
 import argparse
 import os
 import sys
 import re
+import glob
 import yaml
 import numpy as np
 import xarray as xr
 import torch
-import inspect
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -133,32 +132,76 @@ def load_state_from_file(file_path: str, var_names: list):
     return state_np, h_3d_np.astype(np.float32), static_topo_base, lats.astype(np.float32), lons.astype(np.float32), ds
 
 
+def load_observations_for_time(obs_dir: str, date_tag: str, num_vars: int, num_levels: int, num_nodes: int, p_3d_profile: np.ndarray):
+    """Loads conventional observation values and masks at time 0h onto mesh nodes."""
+    obs_val = np.zeros((num_vars, num_levels, num_nodes), dtype=np.float32)
+    obs_mask = np.zeros((num_vars, num_levels, num_nodes), dtype=np.float32)
+
+    if obs_dir and os.path.exists(obs_dir):
+        dt_str = date_tag.replace('-', '').replace('T', '.t') + 'z' if 't' not in date_tag else date_tag
+        conv_pattern = os.path.join(obs_dir, f"obs_conv.*{dt_str}*.nc")
+        conv_files = glob.glob(conv_pattern)
+
+        if conv_files:
+            try:
+                ds_conv = xr.open_dataset(conv_files[0])
+                c_lons = ds_conv['longitude'].values
+                c_pressures = ds_conv['pressure'].values
+                c_var_types = ds_conv['variable_type'].values
+                c_obs_vals = np.nan_to_num(ds_conv['observation_value'].values, nan=0.0)
+
+                c_node_idx = ((c_lons + 180.0) / 360.0 * (num_nodes - 1)).astype(int)
+                c_node_idx = np.clip(c_node_idx, 0, num_nodes - 1)
+
+                if np.nanmean(c_pressures) < 2000.0:
+                    c_pressures = c_pressures * 100.0
+
+                for p_obs, v_type, val, n_idx in zip(c_pressures, c_var_types, c_obs_vals, c_node_idx):
+                    if 0 <= v_type < num_vars and val != 0.0:
+                        node_p_profile = p_3d_profile[:, n_idx]
+                        if p_obs <= node_p_profile[0] and p_obs >= node_p_profile[-1]:
+                            log_p_node = np.log(np.clip(node_p_profile, 1.0, None))
+                            log_p_obs = np.log(np.clip(p_obs, 1.0, None))
+
+                            k_idx = int(np.interp(-log_p_obs, -log_p_node, np.arange(num_levels)))
+                            k_idx = np.clip(k_idx, 0, num_levels - 1)
+
+                            obs_val[v_type, k_idx, n_idx] = val
+                            obs_mask[v_type, k_idx, n_idx] = 1.0
+
+                ds_conv.close()
+                print(f"[AIDA] Ingested conventional observations from '{conv_files[0]}'", flush=True)
+            except Exception as e:
+                print(f"[WARNING] Failed reading observations: {e}", flush=True)
+
+    return obs_val, obs_mask
+
+
 def parse_date_tag(filename: str) -> tuple[str, int, int, int, int]:
     match = re.search(r'(\d{4})(\d{2})(\d{2})\.t(\d{2})z', os.path.basename(filename))
     if match:
         year, month, day, hour = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
         date_tag = match.group(0).replace('.nc', '')
         return date_tag, year, month, day, hour
-    return "forecast", 2026, 1, 1, 0
+    return "analysis", 2026, 1, 1, 0
 
 
-def export_lead_time_netcdf(
+def export_analysis_netcdf(
     output_path: str,
     state_arr: np.ndarray,
     h_3d_np: np.ndarray,
     static_topo_np: np.ndarray,
     ds_ref: xr.Dataset,
     var_names: list,
-    lead_time_hours: int,
     num_levels: int,
     num_nodes: int
 ):
-    """Saves forecast state as CF/UGRID NetCDF while copying target_level and eta from ds_ref."""
+    """Saves A_0h analysis state as CF/UGRID NetCDF while copying target_level and eta from ds_ref."""
     data_vars_out = {}
 
     for idx, var in enumerate(var_names):
         out_var_name = var if var.endswith("_icosahedral") else f"{var}_icosahedral"
-        var_attrs = {"long_name": f"Forecasted {var}", "mesh": "icosahedral_mesh"}
+        var_attrs = {"long_name": f"AI-DA Analysis {var}", "mesh": "icosahedral_mesh"}
         if out_var_name in ds_ref:
             var_attrs.update(ds_ref[out_var_name].attrs)
 
@@ -175,7 +218,6 @@ def export_lead_time_netcdf(
     data_vars_out["h_icosahedral"] = (["level", "node"], h_3d_np, h_attrs)
     data_vars_out["h_terrain_icosahedral"] = (["node"], static_topo_np[0] * 10000.0, {"units": "meters", "mesh": "icosahedral_mesh"})
 
-    # Preserve target_level and eta from reference file
     if "eta" in ds_ref:
         data_vars_out["eta"] = (["level"], ds_ref["eta"].values, ds_ref["eta"].attrs)
     if "target_level" in ds_ref:
@@ -200,29 +242,29 @@ def export_lead_time_netcdf(
         data_vars=data_vars_out,
         coords=coords_out,
         attrs={
-            "title": getattr(ds_ref, "title", "AIDA GNN 4D Terrain Weather Forecast"),
+            "title": "AIDA GNN 4D Terrain AI Data Assimilation Analysis State (A_0h)",
             "conventions": "CF-1.8 UGRID-1.0",
-            "forecast_lead_time_hours": lead_time_hours
+            "forecast_lead_time_hours": 0
         }
     )
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     ds_out.to_netcdf(output_path, format="NETCDF4")
     ds_out.close()
-    print(f"  ├─ Saved lead time f{lead_time_hours:03d}h -> '{output_path}' (copied target_level & eta)", flush=True)
+    print(f"  ├─ Successfully saved Analysis A_0h -> '{output_path}'", flush=True)
 
 
-def run_aida_cycling(
+def run_aida_analysis(
     ckpt_path: str,
     background_file: str,
     edge_index_path: str,
-    forecast_steps: int = 4,
-    output_pattern: str = "output/aida.{date_tag}.f{lead:03d}.nc"
+    obs_dir: str = None,
+    output_path: str = "output/aida_analysis.{date_tag}.nc"
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[CYCLING] Operating on compute device: {device}", flush=True)
+    print(f"[AIDA] Operating on compute device: {device}", flush=True)
 
-    print(f"[CYCLING] Loading checkpoint: '{ckpt_path}'", flush=True)
+    print(f"[AIDA] Loading trained checkpoint: '{ckpt_path}'", flush=True)
     checkpoint = torch.load(ckpt_path, map_location=device)
     cfg = checkpoint.get("config", {})
 
@@ -231,7 +273,7 @@ def run_aida_cycling(
     num_levels = cfg.get("mesh", {}).get("num_levels", 32)
     num_layers = model_cfg.get("num_layers", 4)
 
-    total_in_vars = 25
+    total_in_vars = 25  # [B_0h (7) + Obs_Val (7) + Obs_Mask (7) + Static_Topo (4)]
     out_vars = 7
 
     model = IcosahedralGNNSurrogate(
@@ -250,23 +292,41 @@ def run_aida_cycling(
         'w_icosahedral', 'q_icosahedral', 'ln_rho_icosahedral', 'ln_p_icosahedral'
     ]
 
-    print(f"[CYCLING] Reading Background State B_0h: '{background_file}'", flush=True)
+    print(f"[AIDA] Reading Background State B_0h: '{background_file}'", flush=True)
     b_0h_np, h_3d_np, static_topo_base_np, lats_deg, lons_deg, ds_ref = load_state_from_file(background_file, var_names)
 
     date_tag, base_year, base_month, base_day, base_hour_utc = parse_date_tag(background_file)
     num_nodes = b_0h_np.shape[2]
+    num_vars = b_0h_np.shape[0]
+
     edge_index = generate_or_load_edge_index(num_nodes=num_nodes, edge_file=edge_index_path).to(device)
 
+    # Extract 3D pressure profile (Pa) for vertical observation interpolation
+    ln_p_3d = b_0h_np[6, :, :]
+    p_3d_pa = np.exp(np.nan_to_num(ln_p_3d, nan=10.0))
+
+    # Load 0h Observations (Conv_Val + Conv_Mask)
+    obs_val_np, obs_mask_np = load_observations_for_time(
+        obs_dir=obs_dir,
+        date_tag=date_tag,
+        num_vars=num_vars,
+        num_levels=num_levels,
+        num_nodes=num_nodes,
+        p_3d_profile=p_3d_pa
+    )
+
     b_0h_tensor = torch.from_numpy(b_0h_np).unsqueeze(0).to(device)                 # [1, 7, 32, Nodes]
+    obs_val_tensor = torch.from_numpy(obs_val_np).unsqueeze(0).to(device)            # [1, 7, 32, Nodes]
+    obs_mask_tensor = torch.from_numpy(obs_mask_np).unsqueeze(0).to(device)           # [1, 7, 32, Nodes]
     static_topo_base = torch.from_numpy(static_topo_base_np).unsqueeze(0).to(device) # [1, 3, Nodes]
 
     print(f"\n" + "=" * 80)
-    print(f" STARTING AI-DA ANALYSIS & FORECAST CYCLING ROLLOUT")
-    print(f" Base Time Tag: {date_tag} (Year:{base_year}, Month:{base_month}, Day:{base_day}, Hour:{base_hour_utc:02d}z)")
+    print(f" EXECUTING AI-DATA ASSIMILATION: B_0h + O_0h -> A_0h")
+    print(f" Time Tag: {date_tag} (Year:{base_year}, Month:{base_month}, Day:{base_day}, Hour:{base_hour_utc:02d}z)")
     print("=" * 80, flush=True)
 
     with torch.no_grad():
-        cos_sza_np = compute_solar_zenith_angle(
+        cos_sza = compute_solar_zenith_angle(
             lats_deg=lats_deg,
             lons_deg=lons_deg,
             year=base_year,
@@ -275,105 +335,49 @@ def run_aida_cycling(
             hour_utc=base_hour_utc
         )
 
-        cos_sza_tensor = torch.from_numpy(cos_sza_np).unsqueeze(0).unsqueeze(0).to(device)
-        static_topo_4ch = torch.cat([static_topo_base, cos_sza_tensor], dim=1)            # [1, 4, Nodes]
-        static_topo_exp = static_topo_4ch.unsqueeze(2).expand(-1, -1, num_levels, -1)     # [1, 4, 32, Nodes]
+        cos_sza_tensor = torch.from_numpy(cos_sza).unsqueeze(0).unsqueeze(0).to(device)
+        static_topo_4ch = torch.cat([static_topo_base, cos_sza_tensor], dim=1)           # [1, 4, Nodes]
+        static_topo_exp = static_topo_4ch.unsqueeze(2).expand(-1, -1, num_levels, -1)   # [1, 4, 32, Nodes]
 
-        # Formulate 25-channel Input: [B_0h (7), Conv_Val (7), Conv_Mask (7), Static_Topo (4)]
-        obs_val_placeholder = torch.zeros_like(b_0h_tensor)
-        obs_mask_placeholder = torch.zeros_like(b_0h_tensor)
+        # Construct 25-Channel AI-DA Input
+        x_input_0h = torch.cat([b_0h_tensor, obs_val_tensor, obs_mask_tensor, static_topo_exp], dim=1)
 
-        x_input_0h = torch.cat([b_0h_tensor, obs_val_placeholder, obs_mask_placeholder, static_topo_exp], dim=1)
-
-        # Infer Analysis at 0h (A_0h)
+        # Infer Analysis State A_0h
         a_0h_tensor = model(x_input_0h, edge_index)
 
-        # Save f000 Analysis State
-        f000_path = output_pattern.format(date_tag=date_tag, lead=0)
-        export_lead_time_netcdf(
-            output_path=f000_path,
+        # Export Analysis NetCDF
+        out_file = output_path.format(date_tag=date_tag) if "{date_tag}" in output_path else output_path
+        export_analysis_netcdf(
+            output_path=out_file,
             state_arr=a_0h_tensor.cpu().numpy().squeeze(0),
             h_3d_np=h_3d_np,
             static_topo_np=static_topo_base_np,
             ds_ref=ds_ref,
             var_names=var_names,
-            lead_time_hours=0,
             num_levels=num_levels,
             num_nodes=num_nodes
         )
 
-        # Autoregressive Cycling Steps
-        state_curr = a_0h_tensor
-        for step in range(1, forecast_steps + 1):
-            lead_hours = step * 6
-            current_hour_utc = (base_hour_utc + lead_hours) % 24
-
-            cos_sza_step = compute_solar_zenith_angle(
-                lats_deg=lats_deg,
-                lons_deg=lons_deg,
-                year=base_year,
-                month=base_month,
-                day=base_day,
-                hour_utc=current_hour_utc
-            )
-
-            cos_sza_step_tensor = torch.from_numpy(cos_sza_step).unsqueeze(0).unsqueeze(0).to(device)
-            static_topo_step = torch.cat([static_topo_base, cos_sza_step_tensor], dim=1)
-            static_topo_step_exp = static_topo_step.unsqueeze(2).expand(-1, -1, num_levels, -1)
-
-            x_input_step = torch.cat([state_curr, obs_val_placeholder, obs_mask_placeholder, static_topo_step_exp], dim=1)
-
-            out_model = model(x_input_step, edge_index)
-
-            delta_max = torch.tensor([0.035, 20.0, 20.0, 2.0, 0.005, 0.1, 0.02], device=device).view(1, 7, 1, 1)
-            out_model = torch.clamp(out_model, min=-delta_max, max=delta_max)
-
-            state_next = state_curr + out_model
-
-            # Physical Guards
-            state_next[:, 0, :, :] = torch.clamp(state_next[:, 0, :, :], min=5.19295, max=5.79909)
-            state_next[:, 1, :, :] = torch.clamp(state_next[:, 1, :, :], min=-90.0, max=90.0)
-            state_next[:, 2, :, :] = torch.clamp(state_next[:, 2, :, :], min=-90.0, max=90.0)
-            state_next[:, 4, :, :] = torch.clamp(state_next[:, 4, :, :], min=0.0, max=0.035)
-            state_next[:, 6, :, :] = torch.clamp(state_next[:, 6, :, :], min=4.60517, max=11.58988)
-
-            next_np = state_next.cpu().numpy().squeeze(0)
-
-            step_path = output_pattern.format(date_tag=date_tag, lead=lead_hours)
-            export_lead_time_netcdf(
-                output_path=step_path,
-                state_arr=next_np,
-                h_3d_np=h_3d_np,
-                static_topo_np=static_topo_base_np,
-                ds_ref=ds_ref,
-                var_names=var_names,
-                lead_time_hours=lead_hours,
-                num_levels=num_levels,
-                num_nodes=num_nodes
-            )
-
-            state_curr = state_next
-
     ds_ref.close()
-    print(f"\n[SUCCESS] AI-DA Analysis & Forecast Cycling rollout complete! Exported {forecast_steps + 1} NetCDF files.\n", flush=True)
+    print(f"\n[SUCCESS] AI-DA Analysis step complete! Exported Analysis file.\n", flush=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AIDA 4D Terrain-Following AI-DA Cycling Engine")
-    parser.add_argument("-k", "--checkpoint", default="checkpoints/aida_gnn_surrogate_logstate.pt", help="Path to checkpoint")
-    parser.add_argument("-m", "--background", required=True, help="Path to B_0h background state file")
+    parser = argparse.ArgumentParser(description="AIDA 4D Terrain-Following AI Data Assimilation Engine (B_0h + O_0h -> A_0h)")
+    parser.add_argument("-k", "--checkpoint", default="checkpoints/aida_gnn_surrogate_logstate.pt", help="Path to trained model checkpoint")
+    parser.add_argument("-m", "--background", required=True, help="Path to B_0h background NetCDF/Zarr file")
+    parser.add_argument("-o_dir", "--obs_dir", default=None, help="Directory containing conventional observations")
     parser.add_argument("-e", "--edges", default="data/graph/icosahedral_edge_index_m6.pt", help="Path to graph edge index")
-    parser.add_argument("-s", "--steps", type=int, default=4, help="Number of 6h forecast steps (default: 4 = 24h)")
-    parser.add_argument("-o", "--output_pattern", default="output/aida.{date_tag}.f{lead:03d}.nc", help="Output path pattern")
+    parser.add_argument("-o", "--output", default="output/aida_analysis.{date_tag}.nc", help="Output Analysis NetCDF file path")
 
     args = parser.parse_args()
 
-    run_aida_cycling(
+    run_aida_analysis(
         ckpt_path=args.checkpoint,
         background_file=args.background,
         edge_index_path=args.edges,
-        forecast_steps=args.steps,
-        output_pattern=args.output_pattern
+        obs_dir=args.obs_dir,
+        output_path=args.output
     )
 
 

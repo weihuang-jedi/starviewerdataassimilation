@@ -15,7 +15,7 @@ set -x
 cd /scratch5/purged/Wei.Huang/src/starviewerdataassimilation/data
 
 totalyears=1
-startyear=2025
+startyear=2026
 #export res=1p00
 export res=0p25
 export fcst=f006

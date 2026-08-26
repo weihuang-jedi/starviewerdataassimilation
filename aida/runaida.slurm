@@ -58,8 +58,7 @@ GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate_epoch_004.pt"
 get_analysis_time ${START_YMD} ${START_HOUR} ${FCST_HOUR}
 
 background=../data/icosahedral-grid/icosahedral_logstate_m6.${START_YMD}.t${START_HOUR}z.0p25.f006.nc
-icosahedral_anal=output/global_icosahedral_m4.${ANALYS_YMD}.t${ANALYS_HOUR}z.1p00.anal.nc
-grid_anal=output/reconstructed_aida_analysis_${ANALYS_YMD}.t${ANALYS_HOUR}z.1p00.nc
+icosahedral_anal=output/global_icosahedral_m4.${ANALYS_YMD}.t${ANALYS_HOUR}z.0p25.f000.nc
 
 rm -f ${icosahedral_anal}
 rm -f ${grid_anal}
@@ -69,10 +68,8 @@ set -x
 
 PYTHONPATH=. python scripts/run_aida_cycling.py \
     --checkpoint ${GNN_CKPT} \
-    --minus6 ../data/icosahedral-truth/icosahedral_logstate_m6.20260105.t12z.0p25.f000.nc \
-    --zero ../data/icosahedral-truth/icosahedral_logstate_m6.20260105.t18z.0p25.f000.nc \
-    --steps 4 \
+    --background ${background} \
     --edges=../graph/graph-grid/icosahedral_edge_index_m6.pt \
-    --output_pattern output/aida.20260106.t00z.0p25.f{lead:03d}.nc
+    --output ${icosahedral_anal}
 
 exit 0
