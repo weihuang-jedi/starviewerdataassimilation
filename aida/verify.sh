@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -x
-
 aidahome=/scratch5/purged/Wei.Huang/src/starviewerdataassimilation
 datadir=/scratch5/purged/Wei.Huang/src/starviewerdataassimilation/data
 # 1. Change to working directory
@@ -11,10 +9,12 @@ cd ${aidahome}/aida
 source ${aidahome}/svg.env
 
 yyyymmdd=20260106
-analhour=00
+analhour=06
 res=0p25
 
-icosahedral_analysis=output/aida.${yyyymmdd}.t${analhour}z.${res}.f000.nc
+set -x
+
+icosahedral_analysis=output/global_icosahedral_m6.${yyyymmdd}.t${analhour}z.${res}.f000.nc
 gridanalysis=output/reconstructed_aida_analysis_${yyyymmdd}.t${analhour}z.${res}.nc
 
 if [ ! -f ${gridanalysis} ]; then

@@ -15,7 +15,13 @@ import os
 import sys
 import time
 import yaml
+import warnings
 from datetime import datetime
+
+# Prevent C-library threading deadlocks in NetCDF4/HDF5/Zarr
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -42,11 +48,15 @@ from models.gsrasr import DifferentiableGSRASROperator
 from models.gsrcsr import DifferentiableGSRCSROperator
 from models.ahicsr import DifferentiableAHICSROperator
 
+# Suppress PyTorch AMP deprecation warnings globally
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.cuda.amp")
+
 
 def log_msg(msg: str):
     """Timestamped log helper with immediate stdout flushing."""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now_str}] {msg}", flush=True)
+    sys.stdout.flush()
 
 
 def load_config(config_path: str) -> dict:
@@ -118,8 +128,15 @@ def train_epoch(
     batch_window_start = time.time()
     running_loss = 0.0
 
-    for batch_idx, batch_data in enumerate(dataloader, start=1):
+    dataloader_iter = iter(dataloader)
+
+    for batch_idx in range(1, num_batches + 1):
         batch_step_start = time.time()
+        
+        if batch_idx <= 3:
+            log_msg(f"  [TRACE] Fetching Batch {batch_idx}/{num_batches} from DataLoader...")
+
+        batch_data = next(dataloader_iter)
 
         if isinstance(batch_data, dict):
             b_zero = batch_data['background_0h'].to(device, non_blocking=True)
@@ -493,9 +510,9 @@ def train_epoch(
         batch_time = time.time() - batch_step_start
 
         # REAL-TIME INTRA-EPOCH STDOUT LOGGING
-        if batch_idx % log_batch_freq == 0 or batch_idx == num_batches:
+        if batch_idx % log_batch_freq == 0 or batch_idx == num_batches or batch_idx <= 5:
             elapsed_window = time.time() - batch_window_start
-            sec_per_batch = elapsed_window / log_batch_freq if batch_idx % log_batch_freq == 0 else elapsed_window
+            sec_per_batch = elapsed_window / max(1, log_batch_freq)
             pct = (batch_idx / num_batches) * 100.0
             avg_batch_loss = running_loss / batch_idx
 
@@ -556,8 +573,15 @@ def train_model(cfg: dict):
         lat_deg = torch.linspace(-90, 90, num_nodes)
         lon_deg = torch.linspace(-180, 180, num_nodes)
 
-    dataloader = DataLoader(dataset, batch_size=train_cfg["batch_size"], shuffle=True, pin_memory=True, num_workers=2)
-    log_msg(f"[TRAIN] DataLoader initialized. Total Samples: {len(dataset)} | Total Batches: {len(dataloader)}")
+    # CRITICAL FIX: num_workers=0 avoids NetCDF/Zarr C-library thread deadlocks
+    dataloader = DataLoader(
+        dataset,
+        batch_size=train_cfg["batch_size"],
+        shuffle=True,
+        pin_memory=True,
+        num_workers=0
+    )
+    log_msg(f"[TRAIN] DataLoader initialized (num_workers=0). Total Samples: {len(dataset)} | Total Batches: {len(dataloader)}")
 
     log_msg("[GRAPH] Loading precomputed edge topology...")
     edge_index = generate_or_load_edge_index(

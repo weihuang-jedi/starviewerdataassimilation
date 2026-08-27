@@ -255,7 +255,8 @@ class AIDASurrogateLoss(nn.Module):
             v_pred = pred_clean[:, 2, :, :]
 
             # Wrap in autocast(enabled=False) to ensure float32 autograd graph
-            with torch.cuda.amp.autocast(enabled=False):
+            # with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast('cuda', enabled=False):
                 p_pred_f32 = pred_clean[:, 6, :, :].float()
                 dp_dx, dp_dy = graph_mesh_ops(p_pred_f32)
 
