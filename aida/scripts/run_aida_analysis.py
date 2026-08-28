@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-scripts/run_aida_cycling.py
----------------------------
+scripts/run_aida_analysis.py
+----------------------------
 Pure AI Data Assimilation (AI-DA) Analysis Engine.
 Infers Analysis A_0h from Background B_0h and Observations O_0h at time 0h,
-and outputs exclusively the single A_0h Analysis NetCDF state (f000).
+and outputs exclusively the single A_0h Analysis NetCDF state.
 """
 
 import argparse

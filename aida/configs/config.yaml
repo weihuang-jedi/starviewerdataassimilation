@@ -17,7 +17,7 @@ model:
   num_layers: 4
 
 training:
-  epochs: 5
+  epochs: 8
   batch_size: 1
   accum_steps: 16
   use_amp: true
@@ -25,7 +25,7 @@ training:
   weight_decay: 0.0001
   log_interval: 1
   save_interval: 2
-  # resume_checkpoint: "checkpoints/aida_gnn_surrogate_logstate_epoch_012.pt"
+  resume_checkpoint: "checkpoints/aida_gnn_surrogate_logstate_epoch_004.pt"
 
 loss_weights:
   w_mse: 1.0
@@ -36,8 +36,8 @@ loss_weights:
   lambda_thermal: 0.1
   lambda_pbl_drag: 0.05
   lambda_lapse_rate: 0.02
-  w_rad: 0.00
-  w_rad_amsua: 0.00
+  w_rad: 0.05
+  w_rad_amsua: 0.05
   w_rad_iasi: 0.00
   w_rad_hms: 0.00
   w_rad_atms: 0.00

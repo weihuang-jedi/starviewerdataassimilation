@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=aida_cycling
+#SBATCH --job-name=aida_analysis
 #SBATCH --account=epic
 #SBATCH --mem=192G
 #SBATCH --nodes=1
@@ -53,7 +53,7 @@ get_analysis_time() {
 
 #GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate.pt"
 #GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate_epoch_002.pt"
-GNN_CKPT="checkpoints/aida_gnn_surrogate_latest_batch.pt"
+GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate_epoch_004.pt"
 
 get_analysis_time ${START_YMD} ${START_HOUR} ${FCST_HOUR}
 

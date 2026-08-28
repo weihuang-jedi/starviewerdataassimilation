@@ -93,10 +93,11 @@ class ScalableAIDAProcessor(nn.Module):
     """
     Scalable High-Capacity GNN Atmospheric Surrogate Model.
     Uses dynamic edge embedding initialization, chunked MLPs, and gradient checkpointing.
+    Supports 25-channel AI-Data Assimilation input.
     """
     def __init__(
         self,
-        in_vars: int = 18,
+        in_vars: int = 25,
         out_vars: int = 7,
         hidden_dim: int = 128,
         edge_dim: int = 64,
