@@ -51,9 +51,9 @@ get_analysis_time() {
     echo "ANALYS_HOUR: $ANALYS_HOUR"
 }
 
-#GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate.pt"
+GNN_CKPT="checkpoints/aida_gnn_surrogate_latest_batch.pt"
 #GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate_epoch_002.pt"
-GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate_epoch_004.pt"
+#GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate_epoch_004.pt"
 
 get_analysis_time ${START_YMD} ${START_HOUR} ${FCST_HOUR}
 

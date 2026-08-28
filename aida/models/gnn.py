@@ -91,9 +91,8 @@ class EdgeNodeGNNBlock(nn.Module):
 
 class ScalableAIDAProcessor(nn.Module):
     """
-    Scalable High-Capacity GNN Atmospheric Surrogate Model.
-    Uses dynamic edge embedding initialization, chunked MLPs, and gradient checkpointing.
-    Supports 25-channel AI-Data Assimilation input.
+    Scalable High-Capacity GNN Atmospheric Model.
+    Predicts residual analysis increments delta_A.
     """
     def __init__(
         self,
@@ -133,6 +132,10 @@ class ScalableAIDAProcessor(nn.Module):
             nn.Conv2d(hidden_dim // 2, out_vars, kernel_size=1)
         )
 
+        # Near-zero initialization for residual increment prediction
+        nn.init.normal_(self.decoder[-1].weight, std=1e-4)
+        nn.init.zeros_(self.decoder[-1].bias)
+
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         h = self.encoder(x)
         num_edges = edge_index.shape[1]
@@ -144,13 +147,8 @@ class ScalableAIDAProcessor(nn.Module):
             else:
                 h, edge_attr = layer(h, edge_index, edge_attr)
 
-        out = self.decoder(h)
-
-        # Humidity softplus constraint
-        q_constrained = F.softplus(out[:, self.q_idx:self.q_idx+1, :, :]) + self.q_floor
-        out = torch.cat([out[:, :self.q_idx, :, :], q_constrained, out[:, self.q_idx+1:, :, :]], dim=1)
-
-        return out
+        delta_a = self.decoder(h)
+        return delta_a
 
 
 # Alias ScalableAIDAProcessor to IcosahedralGNNSurrogate for backward compatibility

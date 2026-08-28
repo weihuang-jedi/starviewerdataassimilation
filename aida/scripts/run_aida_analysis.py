@@ -3,8 +3,8 @@
 scripts/run_aida_analysis.py
 ----------------------------
 Pure AI Data Assimilation (AI-DA) Analysis Engine.
-Infers Analysis A_0h from Background B_0h and Observations O_0h at time 0h,
-and outputs exclusively the single A_0h Analysis NetCDF state.
+Predicts analysis increment delta_A from Background B_0h and Observations O_0h at time 0h,
+reconstructs Analysis A_0h = B_0h + delta_A, and exports the NetCDF analysis state.
 """
 
 import argparse
@@ -81,7 +81,6 @@ def load_state_from_file(file_path: str, var_names: list):
 
     lons = np.where(lons > 180.0, lons - 360.0, lons)
 
-    # 3D Height Profile Extract / M6 Formula Compute: h = Hmax - eta*(Hmax - Hterrain)
     if 'h_icosahedral' in ds:
         h_3d_np = ds['h_icosahedral'].values
     elif 'eta' in ds:
@@ -100,7 +99,6 @@ def load_state_from_file(file_path: str, var_names: list):
     if h_3d_np.ndim == 3:
         h_3d_np = h_3d_np[0]
 
-    # Surface Features
     if 'h_terrain_icosahedral' in ds:
         h_terrain = ds['h_terrain_icosahedral'].values
     elif 'elevation' in ds:
@@ -118,11 +116,9 @@ def load_state_from_file(file_path: str, var_names: list):
     if ls_mask.ndim > 1:
         ls_mask = ls_mask[0]
 
-    # Surface Roughness z0
     z0_map = np.where(ls_mask > 0.5, 0.1, 0.0002).astype(np.float32)
     ln_z0_norm = (np.log(z0_map + 1e-5) / 5.0).astype(np.float32)
 
-    # Base static topo: 3 channels [Elevation, LSM, z0]
     static_topo_base = np.stack([
         h_terrain.astype(np.float32) / 10000.0,
         ls_mask.astype(np.float32),
@@ -301,11 +297,9 @@ def run_aida_analysis(
 
     edge_index = generate_or_load_edge_index(num_nodes=num_nodes, edge_file=edge_index_path).to(device)
 
-    # Extract 3D pressure profile (Pa) for vertical observation interpolation
     ln_p_3d = b_0h_np[6, :, :]
     p_3d_pa = np.exp(np.nan_to_num(ln_p_3d, nan=10.0))
 
-    # Load 0h Observations (Conv_Val + Conv_Mask)
     obs_val_np, obs_mask_np = load_observations_for_time(
         obs_dir=obs_dir,
         date_tag=date_tag,
@@ -321,7 +315,7 @@ def run_aida_analysis(
     static_topo_base = torch.from_numpy(static_topo_base_np).unsqueeze(0).to(device) # [1, 3, Nodes]
 
     print(f"\n" + "=" * 80)
-    print(f" EXECUTING AI-DATA ASSIMILATION: B_0h + O_0h -> A_0h")
+    print(f" EXECUTING AI-DATA ASSIMILATION: A_0h = B_0h + delta_A")
     print(f" Time Tag: {date_tag} (Year:{base_year}, Month:{base_month}, Day:{base_day}, Hour:{base_hour_utc:02d}z)")
     print("=" * 80, flush=True)
 
@@ -339,11 +333,12 @@ def run_aida_analysis(
         static_topo_4ch = torch.cat([static_topo_base, cos_sza_tensor], dim=1)           # [1, 4, Nodes]
         static_topo_exp = static_topo_4ch.unsqueeze(2).expand(-1, -1, num_levels, -1)   # [1, 4, 32, Nodes]
 
-        # Construct 25-Channel AI-DA Input
+        # 25-Channel Input: [B_0h (7), Obs_Val (7), Obs_Mask (7), Static_Topo (4)]
         x_input_0h = torch.cat([b_0h_tensor, obs_val_tensor, obs_mask_tensor, static_topo_exp], dim=1)
 
-        # Infer Analysis State A_0h
-        a_0h_tensor = model(x_input_0h, edge_index)
+        # Predict analysis increment delta_A and form A_0h = B_0h + delta_A
+        delta_a = model(x_input_0h, edge_index)
+        a_0h_tensor = b_0h_tensor + delta_a
 
         # Export Analysis NetCDF
         out_file = output_path.format(date_tag=date_tag) if "{date_tag}" in output_path else output_path
@@ -363,7 +358,7 @@ def run_aida_analysis(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AIDA 4D Terrain-Following AI Data Assimilation Engine (B_0h + O_0h -> A_0h)")
+    parser = argparse.ArgumentParser(description="AIDA 4D Terrain-Following AI Data Assimilation Engine")
     parser.add_argument("-k", "--checkpoint", default="checkpoints/aida_gnn_surrogate_logstate.pt", help="Path to trained model checkpoint")
     parser.add_argument("-m", "--background", required=True, help="Path to B_0h background NetCDF/Zarr file")
     parser.add_argument("-o_dir", "--obs_dir", default=None, help="Directory containing conventional observations")

@@ -4,7 +4,7 @@ train_aida_surrogate.py
 -----------------------
 AIDA GNN AI-Data Assimilation Training Script for Icosahedral Atmospheric Grids.
 Combines Background B_0h, Observations O_0h + Masks M_0h, and 4 Static Features
-to train the GNN model to produce Analysis A_0h at time 0h.
+to predict residual analysis increments delta_A such that A_0h = B_0h + delta_A.
 Supports differentiable AMSU-A, IASI, HMS, ATMS, CrIS, and SEVIRI radiance loss
 integration with gradient accumulation and Automatic Mixed Precision (AMP) for memory optimization.
 Enhanced with real-time intra-epoch stdout progress flushing and periodic batch checkpointing.
@@ -109,7 +109,8 @@ def train_epoch(
     checkpoint_path: str,
     accum_steps: int = 8,
     log_batch_freq: int = 10,
-    save_batch_freq: int = 100
+    save_batch_freq: int = 100,
+    verbose_trace: bool = True
 ):
     model.train()
     epoch_losses = {}
@@ -132,8 +133,8 @@ def train_epoch(
 
     for batch_idx in range(1, num_batches + 1):
         batch_step_start = time.time()
-        
-        if batch_idx <= 3:
+
+        if verbose_trace and batch_idx <= 3:
             log_msg(f"  [TRACE] Fetching Batch {batch_idx}/{num_batches} from DataLoader...")
 
         batch_data = next(dataloader_iter)
@@ -204,9 +205,10 @@ def train_epoch(
         # 25-Channel AI-DA Input Tensor
         x_input = torch.cat([b_zero, conv_v, conv_m, static_topo_exp], dim=1)
 
-        # AUTOMATIC MIXED PRECISION FORWARD PASS
+        # RESIDUAL INCREMENT FORWARD PASS: A_0h = B_0h + delta_A
         with torch.amp.autocast('cuda', enabled=(device.type == "cuda"), dtype=amp_dtype):
-            a_pred = model(x_input, edge_index)
+            delta_a = model(x_input, edge_index)
+            a_pred = b_zero + delta_a
 
             loss, metrics = criterion(
                 pred=a_pred,
@@ -488,7 +490,6 @@ def train_epoch(
             optimizer.zero_grad()
             continue
 
-        # Scale loss for gradient accumulation & AMP backward
         loss_accum = total_loss / accum_steps
         scaler.scale(loss_accum).backward()
 
@@ -509,8 +510,7 @@ def train_epoch(
 
         batch_time = time.time() - batch_step_start
 
-        # REAL-TIME INTRA-EPOCH STDOUT LOGGING
-        if batch_idx % log_batch_freq == 0 or batch_idx == num_batches or batch_idx <= 5:
+        if batch_idx % log_batch_freq == 0 or batch_idx == num_batches or batch_idx <= 3:
             elapsed_window = time.time() - batch_window_start
             sec_per_batch = elapsed_window / max(1, log_batch_freq)
             pct = (batch_idx / num_batches) * 100.0
@@ -528,7 +528,6 @@ def train_epoch(
             )
             batch_window_start = time.time()
 
-        # SUB-EPOCH PERIODIC CHECKPOINTING
         if batch_idx % save_batch_freq == 0:
             base_dir = os.path.dirname(checkpoint_path) or "checkpoints"
             latest_batch_ckpt = os.path.join(base_dir, "aida_gnn_surrogate_latest_batch.pt")
@@ -573,7 +572,6 @@ def train_model(cfg: dict):
         lat_deg = torch.linspace(-90, 90, num_nodes)
         lon_deg = torch.linspace(-180, 180, num_nodes)
 
-    # CRITICAL FIX: num_workers=0 avoids NetCDF/Zarr C-library thread deadlocks
     dataloader = DataLoader(
         dataset,
         batch_size=train_cfg["batch_size"],
@@ -605,7 +603,6 @@ def train_model(cfg: dict):
     num_layers = model_cfg.get("num_layers", 4)
     out_vars = model_cfg.get("out_vars", 7)
 
-    # 25 Total Input Channels: B_0h (7) + Conv_Val (7) + Conv_Mask (7) + Static_Topo (4)
     total_in_vars = 25
 
     log_msg("[MODEL] Constructing Icosahedral GNN Surrogate Model...")
@@ -638,7 +635,6 @@ def train_model(cfg: dict):
     criterion = AIDASurrogateLoss(num_levels=num_levels, **loss_cfg).to(device)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
 
-    # Radiance Operators
     amsua_op = DifferentiableAMSUAOperator().to(device)
     amsua_obs_err = torch.tensor([2.5, 2.2, 1.2, 0.6, 0.3, 0.25, 0.25, 0.25, 0.25, 0.35, 0.55, 0.8, 1.2, 1.8, 3.5], dtype=torch.float32, device=device)
 
@@ -718,7 +714,8 @@ def train_model(cfg: dict):
             checkpoint_path=checkpoint_path,
             accum_steps=accum_steps,
             log_batch_freq=log_batch_freq,
-            save_batch_freq=save_batch_freq
+            save_batch_freq=save_batch_freq,
+            verbose_trace=False
         )
 
         if epoch % log_interval == 0 or epoch == epochs:
