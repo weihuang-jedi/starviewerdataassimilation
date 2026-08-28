@@ -5,7 +5,7 @@ utils/plot_aida_increments.py
 AIDA Diagnostic Plotter: 3x6 Multi-Variable Panel Plot for Native Icosahedral Grids.
 Rows (Top-to-Bottom): Background (B0h), AIDA Analysis (A0h), Analysis Increment (A - B)
 Columns (Left-to-Right): State Variables (t, p, u, v, w, q)
-Uses tripcolor with face_nodes triangle connectivity to render native unstructured mesh data directly.
+Uses tripcolor with masked anti-meridian crossing triangles to eliminate horizontal stripes across Asia/Pacific.
 """
 
 import argparse
@@ -46,12 +46,10 @@ def unnormalize_var_slice(var_name: str, raw_slice: np.ndarray) -> np.ndarray:
     mean_val = np.nanmean(raw_slice)
     
     if var_name == "t":
-        # Convert ln(T) -> Kelvin
         if mean_val < 10.0:
             return np.exp(raw_slice)
         return raw_slice
     elif var_name == "p":
-        # Convert ln(P) -> Pa -> hPa
         if mean_val < 15.0:
             return np.exp(raw_slice) / 100.0
         elif mean_val > 10000.0:
@@ -85,8 +83,20 @@ def main():
     else:
         raise KeyError("[ERROR] Required 'face_nodes' triangulation connectivity array missing from NetCDF files!")
 
-    # Build Matplotlib Triangulation Object
+    # -------------------------------------------------------------------------
+    # CRITICAL FIX: MASK TRIANGLES CROSSING THE 180° ANTI-MERIDIAN (DATE LINE)
+    # -------------------------------------------------------------------------
+    tri_lons = lons_clean[triangles]  # [Num_Faces, 3]
+    # If longitude span within a triangle exceeds 180 deg, it crosses the Date Line
+    lon_diff_01 = np.abs(tri_lons[:, 0] - tri_lons[:, 1])
+    lon_diff_12 = np.abs(tri_lons[:, 1] - tri_lons[:, 2])
+    lon_diff_20 = np.abs(tri_lons[:, 2] - tri_lons[:, 0])
+
+    crossing_mask = (lon_diff_01 > 180.0) | (lon_diff_12 > 180.0) | (lon_diff_20 > 180.0)
+
+    # Build Matplotlib Triangulation and apply anti-meridian mask
     triangulation = mtri.Triangulation(lons_clean, lats, triangles=triangles)
+    triangulation.set_mask(crossing_mask)
 
     # Determine vertical height level metadata
     if 'target_level' in ds_an:
@@ -128,17 +138,16 @@ def main():
 
     # Create 3x6 subplot layout
     fig, axes = plt.subplots(
-        3, 6, figsize=(24, 9),
+        3, 6, figsize=(24, 12),
         subplot_kw={'projection': proj},
         constrained_layout=True
     )
 
-    print(f"[AIDA PLOT] Generating 3x6 Native Icosahedral Panel (Height Index {args.height_idx} | Height: {actual_height:.1f} m)...", flush=True)
+    print(f"[AIDA PLOT] Generating 3x6 Masked Native Icosahedral Panel (Height Index {args.height_idx} | Height: {actual_height:.1f} m)...", flush=True)
 
     for col_idx, var in enumerate(var_order):
         meta = var_meta[var]
 
-        # Resolve NetCDF variable name in background and analysis datasets
         bg_key = next((k for k in var_key_map[var] if k in ds_bg), None)
         an_key = next((k for k in var_key_map[var] if k in ds_an), None)
 
@@ -146,16 +155,13 @@ def main():
             print(f"[WARNING] Variable '{var}' not found in NetCDF datasets. Skipping column {col_idx}...", flush=True)
             continue
 
-        # Extract 1D node arrays for target vertical level
         bg_raw = np.squeeze(ds_bg[bg_key].values[args.height_idx])
         an_raw = np.squeeze(ds_an[an_key].values[args.height_idx])
 
-        # Convert to true physical units
         bg_phys = unnormalize_var_slice(var, bg_raw)
         an_phys = unnormalize_var_slice(var, an_raw)
         inc_phys = an_phys - bg_phys
 
-        # Dynamic colormap limits
         vmin = min(np.nanmin(bg_phys), np.nanmin(an_phys))
         vmax = max(np.nanmax(bg_phys), np.nanmax(an_phys))
 
@@ -164,6 +170,24 @@ def main():
             max_abs_inc = 0.1
 
         print(f" -> [{meta['name']}] B0h range: [{np.nanmin(bg_phys):.2f}, {np.nanmax(bg_phys):.2f}] | A0h range: [{np.nanmin(an_phys):.2f}, {np.nanmax(an_phys):.2f}] | Inc max: {max_abs_inc:.3e}", flush=True)
+
+        # var_order = ["t", "p", "u", "v", "w", "q"]
+        if var == 't':
+            max_abs_inc = 5.0
+        elif var == 'p':
+            max_abs_inc = 10.0
+        elif var == 'u':
+            max_abs_inc = 10.0
+        elif var == 'v':
+            max_abs_inc = 10.0
+        elif var == 'w':
+            max_abs_inc = 1.0
+            vmin = -2.0
+            vmax =  2.0
+        elif var == 'q':
+            max_abs_inc = 0.005
+            vmin = 0.0
+            vmax = 0.02
 
         col_data = [
             {"data": bg_phys, "cmap": meta["cmap"], "vmin": vmin, "vmax": vmax},
@@ -178,18 +202,16 @@ def main():
             ax.add_feature(cfeature.COASTLINE, linewidth=0.5, edgecolor='black')
             ax.add_feature(cfeature.BORDERS, linewidth=0.25, linestyle=':', edgecolor='gray')
 
-            # Render unstructured triangular mesh directly using tripcolor
+            # Render unstructured triangular mesh directly using tripcolor (Masked triangulation removes seam artifacts)
             tc = ax.tripcolor(
                 triangulation, p["data"],
                 cmap=p["cmap"], vmin=p["vmin"], vmax=p["vmax"],
                 transform=proj, shading='flat'
             )
 
-            # Column headers on top row
             if row_idx == 0:
                 ax.set_title(f"{meta['long_name']} ({meta['name']})\n[{meta['units']}]", fontsize=13, fontweight='bold', pad=10)
 
-            # Row headers on left-most column
             if col_idx == 0:
                 ax.text(
                     -0.08, 0.5, row_titles[row_idx],
@@ -197,7 +219,6 @@ def main():
                     va='center', ha='right', rotation=90
                 )
 
-            # Colorbars
             if row_idx == 1:
                 cbar = fig.colorbar(tc, ax=[axes[0, col_idx], axes[1, col_idx]], orientation='horizontal', pad=0.03, shrink=0.85)
                 cbar.ax.tick_params(labelsize=8)
@@ -219,7 +240,7 @@ def main():
 
     ds_bg.close()
     ds_an.close()
-    print(f"[AIDA SUCCESS] Saved Native Icosahedral 3x6 Panel Plot to: '{args.output}'", flush=True)
+    print(f"[AIDA SUCCESS] Saved Clean Native Icosahedral 3x6 Panel Plot to: '{args.output}'", flush=True)
 
 
 if __name__ == "__main__":
