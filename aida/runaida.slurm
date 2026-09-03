@@ -7,7 +7,7 @@
 ##SBATCH --partition=u1-h100
 ##SBATCH --gres=gpu:h100:1
 ##SBATCH --qos=gpuwf
-#SBATCH --time=02:30:00
+#SBATCH --time=00:30:00
 #SBATCH --output=log.analysis_%J.out
 #SBATCH --export=NONE
 
@@ -51,9 +51,10 @@ get_analysis_time() {
     echo "ANALYS_HOUR: $ANALYS_HOUR"
 }
 
-GNN_CKPT="checkpoints/aida_gnn_surrogate_latest_batch.pt"
+#GNN_CKPT="checkpoints/aida_gnn_surrogate_latest_batch.pt"
 #GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate_epoch_002.pt"
 #GNN_CKPT="checkpoints/aida_gnn_surrogate_logstate_epoch_004.pt"
+ GNN_CKPT="saved_checkpoints/aida_gnn_surrogate_logstate_2.pt"
 
 get_analysis_time ${START_YMD} ${START_HOUR} ${FCST_HOUR}
 

@@ -178,12 +178,16 @@ def main():
             max_abs_inc = 10.0
         elif var == 'u':
             max_abs_inc = 10.0
+            vmin = -30.0
+            vmax =  30.0
         elif var == 'v':
             max_abs_inc = 10.0
+            vmin = -30.0
+            vmax =  30.0
         elif var == 'w':
-            max_abs_inc = 1.0
-            vmin = -2.0
-            vmax =  2.0
+            max_abs_inc = 0.5
+            vmin = -1.0
+            vmax =  1.0
         elif var == 'q':
             max_abs_inc = 0.005
             vmin = 0.0
