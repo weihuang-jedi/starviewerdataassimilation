@@ -1,3 +1,6 @@
 log.*
 graph
+gribfiles
+icosahedral-grid
+terrain-regular-grid
 icosahedral_logstate.zarr

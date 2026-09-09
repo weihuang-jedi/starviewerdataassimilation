@@ -200,7 +200,7 @@ def plot_analysis_matrix(nc_path: str, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="AIDA 3D-Var Matrix Triangulation Plotter")
-    parser.add_argument("--input", type=str, default="output/global_icosahedral_m4.20250106.t06z.1p00.anal.nc", help="Input analysis NetCDF path")
+    parser.add_argument("--input", type=str, default="output/aida.20250106.t00z.0p25.f000.nc", help="Input analysis NetCDF path")
     parser.add_argument("--output", type=str, default="output/aida_3dvar_matrix.png", help="Output PNG file path")
     args = parser.parse_args()
 

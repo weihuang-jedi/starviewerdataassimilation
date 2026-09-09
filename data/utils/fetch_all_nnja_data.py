@@ -22,7 +22,7 @@ import pandas as pd
 import xarray as xr
 import requests
 
-YEAR = 2024
+YEAR = 2025
 OUTPUT_DIR = f"all_NNJA_data_{YEAR}"
 CYCLES = ["00", "06", "12", "18"]
 

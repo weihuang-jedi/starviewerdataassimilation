@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def plot_vertical_metrics(csv_path: str, output_dir: str):
+def plot_vertical_metrics(csv_path: str, output_dir: str, show = False):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"[ERROR] Verification CSV not found at: '{csv_path}'")
 
@@ -26,7 +26,10 @@ def plot_vertical_metrics(csv_path: str, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
 
     # Set up Matplotlib style
-    plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+    # plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+    # Safe Matplotlib style selection in utils/plot_vertical_profiles.py
+    style_name = 'seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default'
+    plt.style.use(style_name)
     
     # -------------------------------------------------------------------------
     # Plot 1: Combined Vertical Profiles (3 Subplots per Variable)
@@ -67,7 +70,8 @@ def plot_vertical_metrics(csv_path: str, output_dir: str):
         plt.tight_layout()
         out_single_path = os.path.join(output_dir, f"vertical_profile_{var}.png")
         plt.savefig(out_single_path, dpi=300)
-        plt.show()
+        if show:
+            plt.show()
         plt.close()
         print(f"  -> Saved vertical profile for '{var}' to: '{out_single_path}'")
 
@@ -138,9 +142,10 @@ def main():
         default="output/plots/profiles",
         help="Output directory for generated plots"
     )
+    parser.add_argument("-s", "--show", action="store_true", help="Display plot interactively")
     args = parser.parse_args()
 
-    plot_vertical_metrics(args.csv, args.outdir)
+    plot_vertical_metrics(args.csv, args.outdir, args.show)
 
 
 if __name__ == "__main__":

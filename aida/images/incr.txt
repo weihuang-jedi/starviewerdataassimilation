@@ -1,0 +1,12 @@
+(anemoi) [Wei.Huang@ufe01 aida]$ plot_aida_increments.sh
++ background=../data/icosahedral-truth/icosahedral_logstate_m6.20260106.t06z.0p25.f000.nc
++ python utils/plot_aida_increments.py -b ../data/icosahedral-truth/icosahedral_logstate_m6.20260106.t06z.0p25.f000.nc -a output/global_icosahedral_m6.20260106.t06z.0p25.f000.nc -idx 10 -o output/plots -s
+[AIDA PLOT] Generating 3x6 Masked Native Icosahedral Panel (Height Index 10 | Height: 500.0 m)...
+ -> [T] B0h range: [232.27, 315.67] | A0h range: [232.23, 315.81] | Inc max: 2.276e+00
+ -> [P] B0h range: [898.30, 984.62] | A0h range: [898.06, 984.67] | Inc max: 4.167e+00
+ -> [U] B0h range: [-55.22, 36.83] | A0h range: [-56.20, 37.49] | Inc max: 7.478e+00
+ -> [V] B0h range: [-31.62, 33.83] | A0h range: [-32.45, 34.80] | Inc max: 1.480e+01
+ -> [W] B0h range: [-3.12, 6.56] | A0h range: [-2.92, 6.47] | Inc max: 1.159e+00
+ -> [Q] B0h range: [0.00, 0.02] | A0h range: [0.00, 0.02] | Inc max: 2.683e-03
+[AIDA SUCCESS] Saved Clean Native Icosahedral 3x6 Panel Plot to: 'output/plots'
+

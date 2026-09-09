@@ -2,10 +2,11 @@
 
 set -x
 
-#  -b ../data/regular_truth/gfs.20240106.t06z.1p00.f000.nc \
+background=../data/icosahedral-truth/icosahedral_logstate_m6.20260106.t06z.0p25.f000.nc
+#background=../data/icosahedral-grid/icosahedral_logstate_m6.20260102.t00z.0p25.f006.nc
 
 python utils/plot_aida_increments.py \
-   -b /scratch4/NAGAPE/epic/Wei.Huang/src/starviewerdataassimilation/data/regular_grid/gfs.20250106.t00z.1p00.f006.nc \
-   -a output/reconstructed_aida_analysis_20250106.t06z.1p00.nc \
-   -idx 10 -o output/plots
+   -b ${background} \
+   -a output/global_icosahedral_m6.20260106.t06z.0p25.f000.nc \
+   -idx 10 -o output/plots -s
 
